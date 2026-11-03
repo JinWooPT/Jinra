@@ -121,14 +121,14 @@ void JinraUpdater::Offer(const Jinra::UpdateRelease& release) {
 void JinraUpdater::Download(const Jinra::UpdateRelease& release) {
     if (active || !can_install())
         return;
-    const auto directory = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) +
-                           QStringLiteral("/jinra-updates");
+    const QString directory = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) +
+                              QStringLiteral("/jinra-updates");
     if (!QDir().mkpath(directory)) {
         QMessageBox::warning(window, tr("Jinra updates"),
                              tr("Could not create the download folder."));
         return;
     }
-    const auto filename = directory + QLatin1Char('/') + release.filename;
+    const QString filename = directory + QLatin1Char('/') + release.filename;
     auto state = std::make_shared<DownloadState>(filename);
     if (!state->file.open(QIODevice::WriteOnly)) {
         QMessageBox::warning(window, tr("Jinra updates"), tr("Could not save the installer."));
