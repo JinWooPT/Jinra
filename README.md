@@ -8,19 +8,24 @@ Donkey Kong Bananza rendering and performance work, and a new desktop interface.
 
 ## Testing scope — please read first
 
-**Donkey Kong Bananza is the only game tested with this version of Jinra.**
+**Donkey Kong Bananza is the only game validated for gameplay with this version
+of Jinra.**
 
 **The emulator has been optimized and tested on NVIDIA graphics cards under
 Windows. Results on AMD graphics cards are unknown: AMD compatibility,
 rendering quality, performance and stability have not been verified.**
 
 Other games, Intel graphics, other GPU configurations and other operating systems
-have not been validated by this project. The upstream project's compatibility
+have not been validated by this project. A preliminary Pokopia test reached
+character creation but crashed during the introductory cinematic with a Vulkan
+device-loss error. That crash is under investigation; Pokopia is not considered
+playable. The upstream project's compatibility
 reports and screenshots are not Jinra test results.
 
 | Game | Tested environment | Current scope |
 | --- | --- | --- |
 | Donkey Kong Bananza | Windows, NVIDIA GPU, Vulkan | Rendering fixes and performance improvements tested; optimization and stability work continue |
+| Pokopia | Preliminary Windows/NVIDIA test | Crashes during the introductory cinematic; not validated for gameplay |
 | All other games | Not tested with Jinra | Compatibility and performance unknown |
 
 **Stable 60 FPS is a development target, not a guarantee.** Slowdowns and stutter

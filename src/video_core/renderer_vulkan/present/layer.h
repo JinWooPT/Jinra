@@ -61,6 +61,8 @@ public:
                        const Tegra::FramebufferConfig& framebuffer,
                        const Layout::FramebufferLayout& layout);
 
+    void MarkPresentUse(size_t image_index);
+
 private:
     void CreateDescriptorPool(const Device& device);
     void CreateDescriptorSets(const Device& device, VkDescriptorSetLayout layout);
@@ -68,7 +70,7 @@ private:
     void CreateRawImages(const Device& device, const Tegra::FramebufferConfig& framebuffer);
 
     void RefreshResources(const Device& device, const Tegra::FramebufferConfig& framebuffer);
-    void SetAntiAliasPass(const Device& device);
+    void SetAntiAliasPass(const Device& device, VkExtent2D render_area);
 #ifdef HAS_RESHADE
     void SetPostProcessPass(const Device& device, bool is_applet);
 #endif
@@ -99,6 +101,7 @@ private:
     Service::android::PixelFormat pixel_format{};
 
     Settings::AntiAliasing anti_alias_setting{};
+    VkExtent2D anti_alias_extent{};
     std::variant<std::monostate, FXAA, SMAA> anti_alias{};
     std::variant<std::monostate, SGSR, FSR> sr_filter{};
 #ifdef HAS_RESHADE

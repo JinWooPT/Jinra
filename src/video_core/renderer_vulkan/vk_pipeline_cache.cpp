@@ -851,7 +851,9 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (pipeline->IsBuilt()) {
         return pipeline;
     }
-    if (!use_asynchronous_shaders) {
+    if (!use_asynchronous_shaders || (gpu_memory && gpu_memory->UsesNativeTiling())) {
+        // Native vertex stages can write indirect arguments; their draws must reach the
+        // worker, which already waits for pipeline compilation before executing them.
         return pipeline;
     }
     // If something is using depth, we can assume that games are not rendering anything which
@@ -866,8 +868,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (draw_state.index_buffer.count <= 6 || draw_state.vertex_buffer.count <= 6) {
         return pipeline;
     }
-    // The draw is dropped until the pipeline exists. Native draws are dropped on purpose here, so the
-    // rasterizer must not report them as failed native work.
+    // Optional legacy draws can be dropped until their pipeline exists.
     draw_deferred = true;
     return nullptr;
 }

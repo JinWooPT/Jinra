@@ -56,6 +56,10 @@ QString GetKeyName(int key_code) {
 
 QString GetButtonName(Common::Input::ButtonNames button_name) {
     switch (button_name) {
+    case Common::Input::ButtonNames::XboxLB: return QStringLiteral("LB");
+    case Common::Input::ButtonNames::XboxLT: return QStringLiteral("LT");
+    case Common::Input::ButtonNames::XboxRB: return QStringLiteral("RB");
+    case Common::Input::ButtonNames::XboxRT: return QStringLiteral("RT");
     case Common::Input::ButtonNames::ButtonLeft:
         return QObject::tr("Left");
     case Common::Input::ButtonNames::ButtonRight:

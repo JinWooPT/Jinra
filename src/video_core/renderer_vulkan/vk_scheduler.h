@@ -189,6 +189,10 @@ public:
         return *master_semaphore;
     }
 
+    // Recording-thread only: a queued native fence still needs its command list submitted.
+    void RequestDeferredFenceSubmission() { deferred_fence_submission = true; }
+    bool HasDeferredFenceSubmission() const { return deferred_fence_submission; }
+
     std::mutex submit_mutex;
 
 private:
@@ -344,6 +348,7 @@ private:
     std::mutex queue_mutex;
     std::condition_variable_any event_cv;
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
+    bool deferred_fence_submission{};
     std::jthread worker_thread;
 
     std::chrono::steady_clock::duration frame_interval{};

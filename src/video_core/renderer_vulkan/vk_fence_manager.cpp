@@ -7,6 +7,7 @@
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/native_fence_submission.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
@@ -23,7 +24,11 @@ void InnerFence::Queue() {
     }
     // Get the current tick so we can wait for it
     wait_tick = scheduler.CurrentTick();
-    scheduler.Flush();
+    if (VideoCommon::NativeFenceSubmissionDeferred()) {
+        scheduler.RequestDeferredFenceSubmission();
+    } else {
+        scheduler.Flush();
+    }
 }
 
 bool InnerFence::IsSignaled() const {
@@ -37,7 +42,13 @@ void InnerFence::Wait() {
     if (is_stubbed) {
         return;
     }
-    scheduler.Wait(wait_tick);
+    if (VideoCommon::NativeFenceSubmissionDeferred()) {
+        // Only the recording thread may submit. Wait for the actual GPU timeline value,
+        // including when the command list containing it has not been submitted yet.
+        scheduler.GetMasterSemaphore().Wait(wait_tick);
+    } else {
+        scheduler.Wait(wait_tick);
+    }
 }
 
 FenceManager::FenceManager(VideoCore::RasterizerInterface& rasterizer_, Tegra::GPU& gpu_,

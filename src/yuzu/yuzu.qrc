@@ -4,6 +4,12 @@ SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
 <RCC>
+    <qresource prefix="/jinra">
+        <file alias="xbox.png">../../dist/controllers/xbox.png</file>
+        <file alias="dualsense.png">../../dist/controllers/dualsense.png</file>
+        <file alias="icon.png">../../dist/jinra.png</file>
+        <file alias="style.qss">jinra.qss</file>
+    </qresource>
     <qresource prefix="/img">
         <file alias="eden.ico">../../dist/eden.ico</file>
     </qresource>

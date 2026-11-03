@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 namespace Tegra {
 struct NativeSemaphoreWait {
@@ -21,6 +22,12 @@ struct NativeSemaphoreWait {
         case 8: return (current & value) != 0;
         default: return false;
         }
+    }
+
+    template <typename Read>
+    bool MatchesPendingOrRead(std::optional<std::uint32_t> pending, Read&& read) const {
+        // Queued releases already satisfy GPU-to-GPU dependencies in host queue order.
+        return (pending && Matches(*pending)) || Matches(read());
     }
 };
 

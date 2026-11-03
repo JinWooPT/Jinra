@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "video_core/native_diagnostics.h"
+#include <chrono>
 #include <cstdlib>
 
 #include "common/assert.h"
@@ -43,12 +44,36 @@ bool DiagGpuSemaphoreEnabled() {
     return enabled;
 }
 
+bool PendingAcquireFirst() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NATIVE_PENDING_ACQUIRE_FIRST");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+bool AsyncAcquireWait() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NATIVE_ASYNC_ACQUIRE_WAIT");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
 u32 ReadNativeSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active() && !split.OnBackThread()) {
+        u32 value{};
+        split.Defer([&dma_pusher, address, &value] { value = ReadNativeSemaphoreWord(dma_pusher, address); });
+        split.Drain();
+        return value;
+    }
     const auto cpu_address = dma_pusher.memory_manager.GpuToCpuAddress(address);
     if (cpu_address && dma_pusher.rasterizer->MustFlushRegion(*cpu_address, sizeof(u32), VideoCommon::CacheType::BufferCache)) {
         dma_pusher.rasterizer->FlushRegion(*cpu_address, sizeof(u32), VideoCommon::CacheType::BufferCache);
         const u32 value = dma_pusher.memory_manager.Read<u32>(address);
-        LOG_WARNING(HW_GPU, "Native semaphore buffer readback: address={:#x}, current={}", address, value);
+        if (VideoCommon::NativeVerboseRuntimeDiagnosticsEnabled()) {
+            LOG_WARNING(HW_GPU, "Native semaphore buffer readback: address={:#x}, current={}", address, value);
+        }
         VideoCommon::TraceNativeQuery(6, dma_pusher.memory_manager.GetID(), address, *cpu_address, 0, value, 0);
         return value;
     }
@@ -175,7 +200,16 @@ bool Puller::CanResumeNativeAcquire(DmaPusher& dma_pusher) const {
     if (dma_pusher.memory_manager.IsShuttingDown()) {
         return false;
     }
-    if (native_acquire->Matches(ReadNativeSemaphoreWord(dma_pusher, native_acquire->address))) {
+    if (PendingAcquireFirst()) {
+        const auto cpu_address = dma_pusher.memory_manager.GpuToCpuAddress(native_acquire->address);
+        const auto pending = cpu_address ? dma_pusher.rasterizer->PendingSemaphoreRelease(*cpu_address)
+                                         : std::nullopt;
+        if (native_acquire->MatchesPendingOrRead(pending, [&] {
+                return ReadNativeSemaphoreWord(dma_pusher, native_acquire->address);
+            })) {
+            return true;
+        }
+    } else if (native_acquire->Matches(ReadNativeSemaphoreWord(dma_pusher, native_acquire->address))) {
         return true;
     }
     const auto cpu_address = dma_pusher.memory_manager.GpuToCpuAddress(native_acquire->address);
@@ -187,13 +221,16 @@ bool Puller::CanResumeNativeAcquire(DmaPusher& dma_pusher) const {
 bool Puller::ResumeNativeAcquire(DmaPusher& dma_pusher) {
     if (!native_acquire) return true;
     if (!CanResumeNativeAcquire(dma_pusher)) return false;
-    LOG_WARNING(HW_GPU, "Native channel resumed after semaphore: channel={}, address={:#x}, current={}, required={}",
-                dma_pusher.channel_state.bind_id, native_acquire->address,
-                dma_pusher.memory_manager.Read<u32>(native_acquire->address), native_acquire->value);
-    VideoCommon::TraceNativeQuery(5, dma_pusher.memory_manager.GetID(), native_acquire->address,
-        dma_pusher.memory_manager.GpuToCpuAddress(native_acquire->address).value_or(0),
-        dma_pusher.memory_manager.Read<u32>(native_acquire->address), native_acquire->value,
-        native_acquire->operation | (dma_pusher.channel_state.bind_id << 8));
+    if (VideoCommon::NativeVerboseRuntimeDiagnosticsEnabled()) {
+        const u32 current = dma_pusher.memory_manager.Read<u32>(native_acquire->address);
+        LOG_WARNING(HW_GPU, "Native channel resumed after semaphore: channel={}, address={:#x}, current={}, required={}",
+                    dma_pusher.channel_state.bind_id, native_acquire->address, current,
+                    native_acquire->value);
+        VideoCommon::TraceNativeQuery(5, dma_pusher.memory_manager.GetID(), native_acquire->address,
+            dma_pusher.memory_manager.GpuToCpuAddress(native_acquire->address).value_or(0),
+            current, native_acquire->value,
+            native_acquire->operation | (dma_pusher.channel_state.bind_id << 8));
+    }
     native_acquire.reset();
     return true;
 }
@@ -213,6 +250,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         });
+        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+            split.NoteRelease(sequence_address);
+        }
     } else {
         // An acquire reads what earlier work released: let the split's back thread finish it.
         // A GEQUAL acquire that guest memory already meets needs no wait: the counters only
@@ -228,7 +268,27 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         do {
             u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
             if (dma_pusher.channel_state.native_abi) {
-                word = ReadNativeSemaphoreWord(dma_pusher, regs.semaphore_address.SemaphoreAddress());
+                if (PendingAcquireFirst()) {
+                    const auto address = regs.semaphore_address.SemaphoreAddress();
+                    const auto cpu_address = dma_pusher.memory_manager.GpuToCpuAddress(address);
+                    const auto pending = cpu_address ? dma_pusher.rasterizer->PendingSemaphoreRelease(*cpu_address)
+                                                     : std::nullopt;
+                    const NativeSemaphoreWait wait{address, regs.semaphore_sequence, static_cast<u32>(op)};
+                    bool read = false;
+                    if (wait.MatchesPendingOrRead(pending, [&] {
+                            read = true;
+                            return word = ReadNativeSemaphoreWord(dma_pusher, address);
+                        })) {
+                        static u32 logs{};
+                        if (!read && logs++ < 8) {
+                            LOG_INFO(HW_GPU, "Native acquire used queued release without readback: address={:#x} value={} operation={}", address, *pending, static_cast<u32>(op));
+                        }
+                        break;
+                    }
+                }
+                if (!PendingAcquireFirst()) {
+                    word = ReadNativeSemaphoreWord(dma_pusher, regs.semaphore_address.SemaphoreAddress());
+                }
                 const auto ready = [&] {
                     if (op == GpuSemaphoreOperation::AcquireEqual) return word == regs.semaphore_sequence;
                     if (op == GpuSemaphoreOperation::AcquireGequal) return word >= regs.semaphore_sequence;
@@ -252,7 +312,32 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                     }
                 }
                 if (!ready()) {
-                    dma_pusher.rasterizer->ReleaseFences(true);
+                    static const bool statistics = std::getenv("EDEN_NATIVE_ACQUIRE_WAIT_STATS") != nullptr;
+                    const auto begin = statistics ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
+                    OnBack([rasterizer = dma_pusher.rasterizer] {
+                        if (AsyncAcquireWait()) {
+                            // Commit pending callbacks, then let other channels supply the
+                            // missing release. The acquire still retains its real predicate.
+                            rasterizer->SignalReference();
+                        } else {
+                            rasterizer->ReleaseFences(true);
+                        }
+                    });
+                    DrainBack();
+                    if (statistics) {
+                        static u64 calls{}, elapsed_ns{};
+                        static auto last = std::chrono::steady_clock::now();
+                        const auto now = std::chrono::steady_clock::now();
+                        ++calls;
+                        elapsed_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - begin).count());
+                        if (now - last >= std::chrono::seconds{10}) {
+                            LOG_INFO(HW_GPU, "Native acquire completion: async={} calls={} total_ms={:.3f}",
+                                     AsyncAcquireWait(), calls, elapsed_ns / 1e6);
+                            calls = elapsed_ns = 0;
+                            last = now;
+                        }
+                    }
                     word = ReadNativeSemaphoreWord(dma_pusher, regs.semaphore_address.SemaphoreAddress());
                     static u32 native_wait_traces{};
                     if (ready() && VideoCommon::NativeDrawDiagnosticsEnabled() && native_wait_traces++ < 8) {
@@ -266,12 +351,14 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                         LOG_ERROR(HW_GPU, "Unsupported native semaphore operation {}", static_cast<u32>(op));
                     } else {
                         native_acquire = NativeSemaphoreWait{regs.semaphore_address.SemaphoreAddress(), regs.semaphore_sequence, static_cast<u32>(op)};
-                        VideoCommon::TraceNativeQuery(4, dma_pusher.memory_manager.GetID(), native_acquire->address,
-                            dma_pusher.memory_manager.GpuToCpuAddress(native_acquire->address).value_or(0),
-                            word, native_acquire->value, native_acquire->operation |
-                            (dma_pusher.channel_state.bind_id << 8));
-                        LOG_WARNING(HW_GPU, "Native channel suspended for semaphore: channel={}, address={:#x}, current={}, required={}",
-                                    dma_pusher.channel_state.bind_id, native_acquire->address, word, native_acquire->value);
+                        if (VideoCommon::NativeVerboseRuntimeDiagnosticsEnabled()) {
+                            VideoCommon::TraceNativeQuery(4, dma_pusher.memory_manager.GetID(), native_acquire->address,
+                                dma_pusher.memory_manager.GpuToCpuAddress(native_acquire->address).value_or(0),
+                                word, native_acquire->value, native_acquire->operation |
+                                (dma_pusher.channel_state.bind_id << 8));
+                            LOG_WARNING(HW_GPU, "Native channel suspended for semaphore: channel={}, address={:#x}, current={}, required={}",
+                                        dma_pusher.channel_state.bind_id, native_acquire->address, word, native_acquire->value);
+                        }
                     }
                 }
                 break;

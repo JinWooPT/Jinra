@@ -78,6 +78,10 @@ constexpr int default_mouse_update_timeout = 5;
 class RenderWidget : public QWidget {
 public:
     explicit RenderWidget(GRenderWindow* parent) : QWidget(parent) {
+        if (qEnvironmentVariableIsSet("EDEN_BACKGROUND_TEST")) {
+            setAttribute(Qt::WA_DontShowOnScreen);
+            setAttribute(Qt::WA_ShowWithoutActivating);
+        }
         setAttribute(Qt::WA_NativeWindow);
         setAttribute(Qt::WA_PaintOnScreen);
         if (QtCommon::GetWindowSystemType() == Core::Frontend::WindowSystemType::Wayland) {
@@ -118,6 +122,10 @@ struct NullRenderWidget : public RenderWidget {
 GRenderWindow::GRenderWindow(MainWindow* parent,
                              std::shared_ptr<InputCommon::InputSubsystem> input_subsystem_)
     : QWidget(parent), input_subsystem{std::move(input_subsystem_)} {
+    if (qEnvironmentVariableIsSet("EDEN_BACKGROUND_TEST")) {
+        setAttribute(Qt::WA_DontShowOnScreen);
+        setAttribute(Qt::WA_ShowWithoutActivating);
+    }
     setWindowTitle(QStringLiteral("Eden %1 | %2-%3")
                        .arg(QString::fromUtf8(Common::g_build_name),
                             QString::fromUtf8(Common::g_scm_branch),

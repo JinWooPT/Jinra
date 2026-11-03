@@ -291,7 +291,7 @@ struct LowAddrInfo {
 };
 
 /// Tries to track the first 32-bits of a global memory instruction
-std::optional<LowAddrInfo> TrackLowAddress(IR::Inst* inst) {
+std::optional<LowAddrInfo> TrackLowAddress(const IR::Inst* inst) {
     // The first argument is the low level GPU pointer to the global memory instruction
     const IR::Value addr{inst->Arg(0)};
     if (addr.IsImmediate()) {
@@ -686,6 +686,138 @@ void Replace(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
 
 void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program, const HostTranslateInfo& host_info) {
     StorageInfo info;
+    const bool straight_line = program.syntax_list.empty() ? program.post_order_blocks.size() == 1 :
+        std::ranges::all_of(program.syntax_list, [](const auto& node) {
+            return node.type == IR::AbstractSyntaxNode::Type::Block || node.type == IR::AbstractSyntaxNode::Type::Return;
+        });
+    if (env.HasNativeRegisterCopies() && env.ShaderStage() == Stage::VertexB && straight_line) {
+        const IR::Inst* loaded_pointer = nullptr;
+        u32 fields = 0;
+        bool valid = true;
+        for (IR::Block* block : program.post_order_blocks) {
+            for (IR::Inst& inst : block->Instructions()) {
+                if (!IsGlobalMemoryWrite(inst)) {
+                    if (inst.MayHaveSideEffects() && inst.GetOpcode() != IR::Opcode::Prologue &&
+                        inst.GetOpcode() != IR::Opcode::Epilogue && inst.GetOpcode() != IR::Opcode::Reference &&
+                        inst.GetOpcode() != IR::Opcode::DeviceMemoryBarrier) {
+                        valid = false;
+                    }
+                    continue;
+                }
+                const auto low = TrackLowAddress(&inst);
+                if (inst.GetOpcode() != IR::Opcode::WriteGlobal32 || !low ||
+                    !inst.Arg(1).IsImmediate() || low->imm_offset < 0 ||
+                    low->imm_offset > 16 || (low->imm_offset & 3)) {
+                    valid = false;
+                    continue;
+                }
+                const u32 field = static_cast<u32>(low->imm_offset) / 4;
+                if (fields & (1U << field)) valid = false;
+                const auto value = low->value;
+                if (value.IsImmediate() || inst.Arg(1).U32() != (field == 1 ? 1U : 0U)) {
+                    valid = false;
+                    continue;
+                }
+                const auto* extract = value.InstRecursive();
+                if (extract->GetOpcode() != IR::Opcode::CompositeExtractU32x2 ||
+                    !extract->Arg(1).IsImmediate() || extract->Arg(1).U32() != 0 ||
+                    extract->Arg(0).IsImmediate()) {
+                    valid = false;
+                    continue;
+                }
+                const auto* pointer = extract->Arg(0).InstRecursive();
+                if (pointer->GetOpcode() != IR::Opcode::LoadGlobal64 ||
+                    (loaded_pointer && loaded_pointer != pointer)) {
+                    valid = false;
+                    continue;
+                }
+                auto address = inst.Arg(0);
+                if (address.InstRecursive()->GetOpcode() == IR::Opcode::IAdd64) {
+                    address = address.InstRecursive()->Arg(0);
+                }
+                const auto* packed = address.IsImmediate() ? nullptr : address.InstRecursive();
+                const auto* pair = packed && packed->GetOpcode() == IR::Opcode::PackUint2x32 &&
+                                           !packed->Arg(0).IsImmediate()
+                                       ? packed->Arg(0).InstRecursive() : nullptr;
+                const auto* high = pair && pair->GetOpcode() == IR::Opcode::CompositeConstructU32x2 &&
+                                          !pair->Arg(1).IsImmediate()
+                                       ? pair->Arg(1).InstRecursive() : nullptr;
+                if (!high || high->GetOpcode() != IR::Opcode::CompositeExtractU32x2 ||
+                    high->Arg(0).IsImmediate() || high->Arg(0).InstRecursive() != pointer ||
+                    !high->Arg(1).IsImmediate() || high->Arg(1).U32() != 1) {
+                    valid = false;
+                    continue;
+                }
+                loaded_pointer = pointer;
+                fields |= 1U << field;
+            }
+        }
+        if (valid && fields == 31 && loaded_pointer) {
+            const auto table = TrackLowAddress(loaded_pointer);
+            const auto root = table ? Track(table->value, nullptr, &env) : std::nullopt;
+            bool vertex_index = false;
+            IR::Value base_low;
+            IR::Value byte_offset;
+            const auto is_cbuf = [&](const IR::Value& value, u32 offset) {
+                if (!root || value.IsImmediate()) return false;
+                const auto* node = value.InstRecursive();
+                return node->GetOpcode() == IR::Opcode::GetCbufU32 &&
+                       node->Arg(0).IsImmediate() && node->Arg(1).IsImmediate() &&
+                       node->Arg(0).U32() == root->index && node->Arg(1).U32() == offset;
+            };
+            if (root && table->imm_offset == 0 && !table->value.IsImmediate()) {
+                const auto* add = table->value.InstRecursive();
+                if (add->GetOpcode() == IR::Opcode::IAdd32) {
+                    for (size_t side = 0; side < 2; ++side) {
+                        if (!is_cbuf(add->Arg(side), root->offset) || add->Arg(1 - side).IsImmediate()) continue;
+                        const auto* shift = add->Arg(1 - side).InstRecursive();
+                        if (shift->GetOpcode() != IR::Opcode::ShiftLeftLogical32 ||
+                            !shift->Arg(1).IsImmediate() || shift->Arg(1).U32() != 3 ||
+                            shift->Arg(0).IsImmediate()) continue;
+                        const auto* attr = shift->Arg(0).InstRecursive();
+                        if (attr->GetOpcode() == IR::Opcode::GetAttributeU32 &&
+                            attr->Arg(0).Attribute() == IR::Attribute::VertexId) {
+                            vertex_index = true;
+                            base_low = add->Arg(side);
+                            byte_offset = add->Arg(1 - side);
+                        }
+                    }
+                }
+            }
+            bool high_carry = false;
+            const auto same_value = [](const IR::Value& lhs, const IR::Value& rhs) {
+                return lhs.IsImmediate() || rhs.IsImmediate() ? lhs == rhs :
+                    lhs.InstRecursive() == rhs.InstRecursive();
+            };
+            if (vertex_index && !loaded_pointer->Arg(0).IsImmediate()) {
+                const auto* packed = loaded_pointer->Arg(0).InstRecursive();
+                if (packed->GetOpcode() == IR::Opcode::PackUint2x32 && !packed->Arg(0).IsImmediate()) {
+                    const auto* pair = packed->Arg(0).InstRecursive();
+                    if (pair->GetOpcode() == IR::Opcode::CompositeConstructU32x2 && !pair->Arg(1).IsImmediate()) {
+                        const auto* add = pair->Arg(1).InstRecursive();
+                        if (add->GetOpcode() == IR::Opcode::IAdd32) {
+                            for (size_t side = 0; side < 2; ++side) {
+                                if (!is_cbuf(add->Arg(side), root->offset + 4) || add->Arg(1 - side).IsImmediate()) continue;
+                                const auto* select = add->Arg(1 - side).InstRecursive();
+                                if (select->GetOpcode() != IR::Opcode::SelectU32 || !select->Arg(1).IsImmediate() ||
+                                    !select->Arg(2).IsImmediate() || select->Arg(1).U32() != 1 || select->Arg(2).U32() != 0 ||
+                                    select->Arg(0).IsImmediate()) continue;
+                                const auto* compare = select->Arg(0).InstRecursive();
+                                high_carry |= compare->GetOpcode() == IR::Opcode::ULessThan &&
+                                    same_value(compare->Arg(0), table->value) &&
+                                    (same_value(compare->Arg(1), base_low) || same_value(compare->Arg(1), byte_offset));
+                            }
+                        }
+                    }
+                }
+            }
+            if (root && vertex_index && high_carry && root->index < Info::MAX_CBUFS && root->offset <= 0xfff8) {
+                program.info.native_indirect_reset_cbuf = root->index;
+                program.info.native_indirect_reset_offset = root->offset;
+                LOG_INFO(Shader, "Native indirect argument initializer: c{}[{:#x}]", root->index, root->offset);
+            }
+        }
+    }
     for (IR::Block* const block : program.post_order_blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (!IsGlobalMemory(inst)) {

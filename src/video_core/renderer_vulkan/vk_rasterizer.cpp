@@ -57,6 +57,8 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/native_cpu_read_window.h"
+#include "video_core/native_readback_epoch.h"
 
 namespace Vulkan {
 
@@ -346,7 +348,7 @@ void LogFrameDraw(const Tegra::Engines::Maxwell3D& maxwell3d, bool is_indexed, b
 } // Anonymous namespace
 
 template <typename Func>
-void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+void RasterizerVulkan::PrepareDraw(bool is_indexed, u32 direct_instance_count, Func&& draw_func) {
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -392,6 +394,81 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         // A draw withheld for an asynchronous pipeline build is not a failure of the native work.
         submitted = pipeline_cache.TakeDeferredDraw();
         return;
+    }
+    // Execute the native pointer-table initializer before its indirect arguments are consumed.
+    const auto& reset = pipeline->VertexStageInfo();
+    if (reset.native_indirect_reset_cbuf < maxwell3d->state.shader_stages[0].const_buffers.size() && !is_indexed) {
+        VideoCommon::Nx2Profile::Scope initializer_scope{VideoCommon::Nx2Profile::Zone::NativeInitializer};
+        const auto& draw = maxwell3d->draw_manager.draw_state;
+        const auto& cb = maxwell3d->state.shader_stages[0].const_buffers[reset.native_indirect_reset_cbuf];
+        const u32 count = draw.vertex_buffer.count;
+        if (cb.enabled && cb.size >= reset.native_indirect_reset_offset + 8 && count <= 65536) {
+            GPUVAddr table{};
+            gpu_memory->ReadBlock(cb.address + reset.native_indirect_reset_offset, &table, sizeof(table));
+            std::vector<u32> offsets;
+            offsets.reserve(count);
+            for (u32 i = 0; i < count; ++i) {
+                offsets.push_back((draw.vertex_buffer.first + i) << 3);
+            }
+            std::ranges::sort(offsets);
+            offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+            std::vector<GPUVAddr> destinations;
+            destinations.reserve(offsets.size());
+            bool valid = table != 0;
+            for (size_t begin = 0; valid && begin < offsets.size();) {
+                size_t end = begin + 1;
+                while (end < offsets.size() && u64{offsets[end - 1]} + 8 == offsets[end]) ++end;
+                std::vector<GPUVAddr> entries(end - begin);
+                const GPUVAddr address = table + offsets[begin];
+                const size_t bytes = entries.size() * sizeof(GPUVAddr);
+                if (address < table || !gpu_memory->IsFullyMappedRange(address, bytes)) {
+                    valid = false;
+                    break;
+                }
+                gpu_memory->ReadBlock(address, entries.data(), bytes);
+                for (const GPUVAddr destination : entries) {
+                    if (!destination || !gpu_memory->IsFullyMappedRange(destination, 20)) {
+                        valid = false;
+                        break;
+                    }
+                    destinations.push_back(destination);
+                }
+                begin = end;
+            }
+            if (!valid) {
+                report_failure("unmapped indirect argument initializer");
+                return;
+            }
+            std::ranges::sort(destinations);
+            destinations.erase(std::unique(destinations.begin(), destinations.end()), destinations.end());
+            const std::array<u32, 5> initial{0, 1, 0, 0, 0};
+            const std::span<const u8> bytes{reinterpret_cast<const u8*>(initial.data()), sizeof(initial)};
+            {
+                VideoCommon::Nx2Profile::Scope writes_scope{VideoCommon::Nx2Profile::Zone::NativeInitializerWrites};
+                for (const GPUVAddr destination : destinations) {
+                    AccelerateInlineToMemory(destination, bytes.size(), bytes);
+                }
+            }
+            static u32 logs{};
+            const auto& regs = maxwell3d->regs;
+            const bool stores_only = reset.stores.mask.none() && !reset.stores_indexed_attributes &&
+                regs.transform_feedback_enabled == 0 &&
+                !regs.IsShaderConfigEnabled(0) && !regs.IsShaderConfigEnabled(2) &&
+                !regs.IsShaderConfigEnabled(3) && !regs.IsShaderConfigEnabled(4);
+            static const bool software_only = [] {
+                const char* value = std::getenv("EDEN_NATIVE_INDIRECT_INIT_SOFTWARE");
+                return !value || value[0] != '0';
+            }();
+            const bool complete_in_software = software_only &&
+                maxwell3d->GetNativeMacroEngine().native_turing && stores_only && direct_instance_count != 0;
+            if (logs++ < 16) LOG_INFO(Render_Vulkan, "Native indirect initializer executed: indexed={} count={} table={:#x} destinations={} raster={} tf={} stores_only={} direct_instances={} state_instances={} complete_in_software={}", is_indexed, count, table, destinations.size(), regs.rasterize_enable, regs.transform_feedback_enabled, stores_only, direct_instance_count, draw.instance_count, complete_in_software);
+            if (complete_in_software) {
+                // The strict shader matcher proves all its writes were emulated above.
+                // It produces no vertex outputs, feedback or additional vertex-stage effects.
+                submitted = true;
+                return;
+            }
+        }
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     buffer_cache.runtime.BeginStorageBatch(maxwell3d->GetNativeMacroEngine().native_turing);
@@ -727,6 +804,27 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    const auto& direct_draw = maxwell3d->draw_manager.draw_state;
+    const bool empty_draw = instance_count == 0 ||
+        (is_indexed ? direct_draw.index_buffer.count : direct_draw.vertex_buffer.count) == 0;
+    static const bool empty_statistics = std::getenv("EDEN_NATIVE_EMPTY_DRAW_STATS") != nullptr;
+    if (empty_statistics) {
+        static u64 calls{}, empty{};
+        ++calls;
+        empty += empty_draw;
+        if ((calls & 16383) == 0) {
+            LOG_INFO(HW_GPU, "Direct draw counts: total={} empty={}", calls, empty);
+        }
+    }
+    static const bool avoid_empty = [] {
+        const char* value = std::getenv("EDEN_NATIVE_EMPTY_DRAW_FASTPATH");
+        return value && value[0] == '1';
+    }();
+    // Direct draws with no vertices or instances run no shader invocations.
+    // GPU-indirect draws have a separate path and must read their actual argument buffer.
+    if (avoid_empty && maxwell3d->GetNativeMacroEngine().native_turing && empty_draw) {
+        return;
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
@@ -837,7 +935,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      regs.blend.enable[0], seen.size());
         }
     }
-    PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
+    PrepareDraw(is_indexed, instance_count, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
@@ -873,7 +971,7 @@ void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
-    PrepareDraw(params.is_indexed, [this, &params] {
+    PrepareDraw(params.is_indexed, 0, [this, &params] {
         const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
         const auto& buffer = indirect_buffer.first;
         const auto& offset = indirect_buffer.second;
@@ -1335,12 +1433,76 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
 }
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    if (VideoCommon::NativeReactiveReadbackEnabled() &&
+        Settings::values.use_reactive_flushing.GetValue() && size &&
+        Tegra::g_native_channels.load(std::memory_order_relaxed)) {
+        {
+            std::scoped_lock lock{texture_cache.mutex};
+            if (const auto area = texture_cache.GetFlushArea(addr, size)) return *area;
+        }
+        const DAddr first = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+        const DAddr end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
+        std::scoped_lock lock{buffer_cache.mutex};
+        static std::atomic<bool> logged{};
+        if (!logged.load(std::memory_order_relaxed) && !logged.exchange(true, std::memory_order_relaxed)) {
+            LOG_INFO(HW_GPU, "Native reactive buffer readback enabled; cached CPU hints expire on GPU writes");
+        }
+        return {.start_address = first, .end_address = end,
+                .preemtive = !buffer_cache.IsRegionGpuModified(first, end - first)};
+    }
+    static const u64 read_window = [] {
+        const char* value = std::getenv("EDEN_NATIVE_CPU_READ_WINDOW_BYTES");
+        if (!value) return u64{Core::DEVICE_PAGESIZE};
+        const u64 bytes = std::strtoull(value, nullptr, 0);
+        return bytes >= 64 && bytes < Core::DEVICE_PAGESIZE && (bytes & (bytes - 1)) == 0
+                   ? bytes : u64{Core::DEVICE_PAGESIZE};
+    }();
+    if (read_window < Core::DEVICE_PAGESIZE && size && size <= 8 &&
+        Tegra::g_native_channels.load(std::memory_order_relaxed)) {
+        std::optional<VideoCore::RasterizerDownloadArea> texture_area;
+        {
+            std::scoped_lock lock{texture_cache.mutex};
+            texture_area = texture_cache.GetFlushArea(addr, size);
+        }
+        if (texture_area) {
+            const DAddr first = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+            const u64 bytes = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE) - first;
+            std::scoped_lock lock{buffer_cache.mutex};
+            buffer_cache.NoteCpuRead(first, bytes);
+            return *texture_area;
+        }
+        static thread_local VideoCommon::NativeCpuReadWindow policy;
+        const auto area = policy.Select(addr, size, read_window, Core::DEVICE_PAGESIZE);
+        bool dirty;
+        {
+            std::scoped_lock lock{buffer_cache.mutex};
+            buffer_cache.NoteCpuRead(area.first, area.end - area.first);
+            dirty = buffer_cache.IsRegionGpuModified(area.first, area.end - area.first);
+        }
+        // A newly visited subrange may have been written before it entered read history.
+        // Download it now; subsequent fence copies keep every byte of this hint up to date.
+        static std::atomic<bool> logged{};
+        if (!logged.load(std::memory_order_relaxed) && !logged.exchange(true)) {
+            LOG_INFO(HW_GPU, "Native CPU read window enabled: scalar_window={} first_hint={} reactive={}",
+                     read_window, area.end - area.first, dirty);
+        }
+        return {.start_address = area.first, .end_address = area.end, .preemtive = !dirty};
+    }
     {
         // Guest CPU reads of buffer memory decide which GPU-written buffer data is copied back.
-        std::scoped_lock lock{buffer_cache.mutex};
-        buffer_cache.NoteCpuRead(Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
-                                 Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE) -
-                                     Common::AlignDown(addr, Core::DEVICE_PAGESIZE));
+        const DAddr first = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+        const u64 bytes = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE) - first;
+        static const bool separate_history = [] {
+            const char* value = std::getenv("EDEN_NATIVE_READ_HISTORY_LOCK");
+            return value && value[0] == '1';
+        }();
+        if (separate_history && Tegra::g_native_channels.load(std::memory_order_relaxed)) {
+            // History has its own lock; recording a CPU read must not wait for a GPU download.
+            buffer_cache.NoteCpuReadConcurrent(first, bytes);
+        } else {
+            std::scoped_lock lock{buffer_cache.mutex};
+            buffer_cache.NoteCpuRead(first, bytes);
+        }
     }
     {
         std::scoped_lock lock{texture_cache.mutex};
@@ -1581,7 +1743,7 @@ void RasterizerVulkan::TiledCacheBarrier() {
 }
 
 void RasterizerVulkan::FlushCommands() {
-    if (draw_counter == 0) {
+    if (draw_counter == 0 && !scheduler.HasDeferredFenceSubmission()) {
         return;
     }
     draw_counter = 0;

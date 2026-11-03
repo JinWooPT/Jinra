@@ -12,7 +12,21 @@ if (YUZU_USE_BUNDLED_QT AND LINUX)
     set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin/lib/")
 endif()
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
+file(STRINGS "${PROJECT_SOURCE_DIR}/VERSION" JINRA_VERSION LIMIT_COUNT 1)
+configure_file(jinra_build_version.h.in jinra_build_version.h @ONLY)
+option(JINRA_UPDATE_TESTS "Build the focused Jinra release/update tests" OFF)
+if(JINRA_UPDATE_TESTS)
+    find_package(Catch2 REQUIRED)
+    add_executable(jinra_update_tests ../tests/common/jinra_update.cpp updater/jinra_release.cpp)
+    target_link_libraries(jinra_update_tests PRIVATE Catch2::Catch2WithMain Qt6::Core)
+    target_include_directories(jinra_update_tests PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    target_compile_features(jinra_update_tests PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(jinra_update_tests PRIVATE /Zc:preprocessor /permissive-)
+        target_compile_definitions(jinra_update_tests PRIVATE NOMINMAX)
+    endif()
+endif()
 
 add_executable(yuzu
     Info.plist
@@ -227,6 +241,7 @@ add_executable(yuzu
     data_dialog.h data_dialog.cpp data_dialog.ui
     data_widget.ui
     ryujinx_dialog.h ryujinx_dialog.cpp ryujinx_dialog.ui
+    jinra_home.cpp jinra_home.h
     main_window.h main_window.cpp main.ui
 
     configuration/system/new_user_dialog.h configuration/system/new_user_dialog.cpp configuration/system/new_user_dialog.ui
@@ -235,11 +250,13 @@ add_executable(yuzu
 
     render/performance_overlay.h render/performance_overlay.cpp render/performance_overlay.ui
     updater/update_dialog.h updater/update_dialog.cpp updater/update_dialog.ui
+    updater/jinra_updater.h updater/jinra_updater.cpp
+    updater/jinra_release.h updater/jinra_release.cpp
     game/common.h
     game/carousel.h game/carousel.cpp
 )
 
-set_target_properties(yuzu PROPERTIES OUTPUT_NAME "eden")
+set_target_properties(yuzu PROPERTIES OUTPUT_NAME "jinra")
 
 if (YUZU_CRASH_DUMPS)
     target_sources(yuzu PRIVATE
@@ -403,7 +420,7 @@ endif()
 
 target_link_libraries(yuzu PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(yuzu PRIVATE common core input_common frontend_common network video_core qt_common)
-target_link_libraries(yuzu PRIVATE Boost::headers Qt6::Widgets Qt6::Charts Qt6::Concurrent)
+target_link_libraries(yuzu PRIVATE Boost::headers Qt6::Widgets Qt6::Charts Qt6::Concurrent Qt6::Network)
 target_link_libraries(yuzu PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
 if (ENABLE_OPENGL)
     target_link_libraries(yuzu PRIVATE glad)
@@ -433,7 +450,7 @@ endif()
 
 if (WIN32 AND NOT YUZU_USE_BUNDLED_QT)
     set(YUZU_EXE_DIR "$<TARGET_FILE_DIR:yuzu>")
-    add_custom_command(TARGET yuzu POST_BUILD COMMAND ${WINDEPLOYQT_EXECUTABLE} "${YUZU_EXE_DIR}/eden.exe" --dir "${YUZU_EXE_DIR}" --libdir "${YUZU_EXE_DIR}" --plugindir "${YUZU_EXE_DIR}/plugins" --no-compiler-runtime --no-opengl-sw --no-system-d3d-compiler --no-translations --verbose 0)
+    add_custom_command(TARGET yuzu POST_BUILD COMMAND ${WINDEPLOYQT_EXECUTABLE} "$<TARGET_FILE:yuzu>" --dir "${YUZU_EXE_DIR}" --libdir "${YUZU_EXE_DIR}" --plugindir "${YUZU_EXE_DIR}/plugins" --no-compiler-runtime --no-opengl-sw --no-system-d3d-compiler --no-translations --verbose 0)
 endif()
 
 if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64)

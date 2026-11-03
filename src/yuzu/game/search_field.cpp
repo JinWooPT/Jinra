@@ -84,7 +84,7 @@ void GameListSearchField::setFocus() {
 GameListSearchField::GameListSearchField(GameList* parent) : QWidget{parent} {
     auto* const key_release_eater = new KeyReleaseEater(parent, this);
     layout_filter = new QHBoxLayout;
-    layout_filter->setContentsMargins(8, 8, 8, 8);
+    layout_filter->setContentsMargins(0, 0, 0, 0);
     label_filter = new QLabel;
     edit_filter = new QLineEdit;
     edit_filter->clear();
@@ -108,6 +108,9 @@ GameListSearchField::GameListSearchField(GameList* parent) : QWidget{parent} {
     layout_filter->addWidget(button_filter_close);
     setLayout(layout_filter);
     RetranslateUI();
+    label_filter->hide();
+    label_filter_result->hide();
+    button_filter_close->hide();
 }
 
 void GameListSearchField::changeEvent(QEvent* event) {
@@ -120,5 +123,5 @@ void GameListSearchField::changeEvent(QEvent* event) {
 
 void GameListSearchField::RetranslateUI() {
     label_filter->setText(tr("Filter:"));
-    edit_filter->setPlaceholderText(tr("Enter pattern to filter"));
+    edit_filter->setPlaceholderText(tr("Search games"));
 }

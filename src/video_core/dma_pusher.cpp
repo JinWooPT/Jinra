@@ -131,6 +131,15 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
+        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active() && split.AccurateReads()) {
+            // The back owns the caches. Complete GPU-generated command words there before
+            // parsing their CPU copy; method processing can still overlap between entries.
+            split.Defer([memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
+                         bytes = size_t{header.size} * sizeof(u32)] {
+                memory->FlushRegion(address, bytes);
+            });
+            split.Drain();
+        }
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;

@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
@@ -22,9 +24,33 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/texture_cache/util.h"
+#include "video_core/nx2.h"
 
 namespace Vulkan {
 namespace {
+bool NativeUsageRangeCacheEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NATIVE_USAGE_RANGE_CACHE");
+        return value && value[0] == '1';
+    }();
+    if (!enabled || !Tegra::g_native_channels.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    static const bool activated = [] {
+        LOG_INFO(HW_GPU, "Native usage range cache enabled");
+        return true;
+    }();
+    return activated;
+}
+
+bool NativeMappedReadbackEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NATIVE_MAPPED_READBACK");
+        return value && value[0] == '1';
+    }();
+    return enabled && Tegra::g_native_channels.load(std::memory_order_relaxed);
+}
+
 VkBufferCopy MakeBufferCopy(const VideoCommon::BufferCopy& copy) {
     return VkBufferCopy{
         .srcOffset = copy.src_offset,
@@ -84,6 +110,14 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    if (NativeMappedReadbackEnabled()) {
+        if (auto mapped = memory_allocator.TryCreateMappedDeviceBuffer(buffer_ci, sparse_alignment)) {
+            static u32 logs{};
+            if (logs++ < 3) LOG_INFO(Render_Vulkan, "Native mapped device buffer: bytes={} type={}",
+                                   size, mapped.Location().memory_type);
+            return mapped;
+        }
+    }
     if (sparse_alignment > 1) {
         return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal, sparse_alignment);
     }
@@ -110,7 +144,7 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
       scheduler{&runtime.scheduler},
       buffer{CreateBuffer(*device, runtime.memory_allocator, SizeBytes(),
                           runtime.SparseAlignmentFor(sparse_compatible_))},
-      tracker{SizeBytes()} {
+      tracker{SizeBytes(), NativeUsageRangeCacheEnabled()} {
     sparse_compatible = sparse_compatible_;
     if (runtime.device.HasDebuggingToolAttached()) {
         buffer.SetObjectNameEXT(fmt::format("Buffer {:#x}", CpuAddr()).c_str());
@@ -435,6 +469,56 @@ void BufferCacheRuntime::Finish() {
     scheduler.Finish();
 }
 
+std::span<const u8> BufferCacheRuntime::ReadMappedBuffer(
+    Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies) {
+    if (!NativeMappedReadbackEnabled()) return {};
+    const auto mapped = buffer.MappedReadback();
+    if (mapped.empty()) return {};
+    for (const auto& copy : copies) {
+        if (copy.src_offset > mapped.size() || copy.size > mapped.size() - copy.src_offset) return {};
+    }
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        const VkMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                               0, barrier);
+    });
+    // The cache lock prevents later guest commands from overwriting these bytes.
+    // Host-coherent memory still needs the device barrier and completed submission.
+    scheduler.Finish();
+    static const bool verify = [] {
+        const char* value = std::getenv("EDEN_NATIVE_MAPPED_READBACK_VERIFY");
+        return value && value[0] == '1';
+    }();
+    if (verify) {
+        u64 size{};
+        std::vector<VideoCommon::BufferCopy> reference_copies;
+        for (const auto& copy : copies) {
+            reference_copies.push_back({copy.src_offset, size, copy.size});
+            size += Common::AlignUp(copy.size, u64{64});
+        }
+        auto staging = DownloadStagingBuffer(size);
+        for (auto& copy : reference_copies) copy.dst_offset += staging.offset;
+        CopyBuffer(staging.buffer, buffer, reference_copies, true);
+        scheduler.Finish();
+        for (const auto& copy : reference_copies) {
+            const bool same = std::memcmp(mapped.data() + copy.src_offset,
+                staging.mapped_span.data() + copy.dst_offset - staging.offset, copy.size) == 0;
+            ASSERT_MSG(same, "Mapped native readback differs from staged readback");
+            if (!same) throw std::runtime_error("Mapped native readback differs from staged readback");
+        }
+    }
+    static u64 reads{};
+    if ((reads++ & 1023) == 0) {
+        LOG_INFO(Render_Vulkan, "Native mapped readbacks: completed={} verify={}", reads, verify);
+    }
+    return mapped;
+}
+
 bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
                                           std::span<const VideoCommon::BufferCopy> copies) {
     if (Settings::values.disable_buffer_reorder) {
@@ -547,11 +631,12 @@ void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t si
 }
 
 void BufferCacheRuntime::FlushStorageWrites() {
-    const bool scatter = std::any_of(storage_batch.begin(), storage_batch.end(),
+    const auto active = storage_batch.Active();
+    const bool scatter = std::any_of(active.begin(), active.end(),
         [](const auto& entry) { return entry.written && !entry.ref.sparse; });
     if (scatter) {
         PreCopyBarrier();
-        for (const auto& entry : storage_batch) {
+        for (const auto& entry : active) {
             if (!entry.written || entry.ref.sparse) continue;
             VkDeviceSize source_offset = 0;
             for (const auto& source : entry.sources) {
@@ -567,7 +652,7 @@ void BufferCacheRuntime::FlushStorageWrites() {
         }
         PostCopyBarrier();
     }
-    storage_batch.clear();
+    storage_batch.Reset(retain_storage_batch);
 }
 
 bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written, u32 offset, u32 size) {
@@ -575,15 +660,29 @@ bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written, u
         if (multi_range_sources.empty() || !multi_range_total ||
             offset % GetStorageBufferAlignment() || u64{offset} + size > multi_range_total)
             throw Shader::RuntimeError("Invalid grouped storage view");
-        auto entry = std::find_if(storage_batch.begin(), storage_batch.end(),
+        const auto active = storage_batch.Active();
+        auto found = std::find_if(active.begin(), active.end(),
             [&](const auto& candidate) { return candidate.key == key; });
-        if (entry == storage_batch.end()) {
+        StorageBatchEntry* entry = found == active.end() ? nullptr : &*found;
+        if (!entry) {
             const MultiRangeRef ref = multi_range_buffers.Get(device, scheduler, memory_allocator,
                 key, multi_range_sources, multi_range_total);
             if (ref.handle == VK_NULL_HANDLE) throw Shader::RuntimeError("Grouped storage allocation failed");
-            storage_batch.push_back({key, ref,
-                std::vector<MultiRangeSource>(multi_range_sources.begin(), multi_range_sources.end()), is_written});
-            entry = std::prev(storage_batch.end());
+            entry = &storage_batch.Append();
+            entry->key = key;
+            entry->ref = ref;
+            entry->sources.assign(multi_range_sources.begin(), multi_range_sources.end());
+            entry->written = is_written;
+            static const bool statistics = std::getenv("EDEN_NATIVE_GATHER_STATS") != nullptr;
+            if (statistics) {
+                static u64 groups{}, sparse{}, readonly{}, regions{}, bytes{};
+                ++groups; sparse += ref.sparse; readonly += !is_written;
+                regions += multi_range_sources.size();
+                if (!ref.sparse) bytes += multi_range_total;
+                if (groups == 1 || groups == 1024 || (groups & 65535) == 0) {
+                    LOG_INFO(HW_GPU, "Storage group counts: total={} sparse={} readonly={} regions={} gathered_bytes={}", groups, sparse, readonly, regions, bytes);
+                }
+            }
             if (!ref.sparse) {
                 PreCopyBarrier();
                 VkDeviceSize destination_offset = 0;

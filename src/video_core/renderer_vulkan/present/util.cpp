@@ -196,12 +196,13 @@ vk::ImageView CreateWrappedImageView(const Device& device, vk::Image& image, VkF
 }
 
 vk::RenderPass CreateWrappedRenderPass(const Device& device, VkFormat format,
-                                       VkImageLayout initial_layout) {
+                                       VkImageLayout initial_layout, bool clear) {
     const VkAttachmentDescription attachment{
         .flags = VK_ATTACHMENT_DESCRIPTION_MAY_ALIAS_BIT,
         .format = format,
         .samples = VK_SAMPLE_COUNT_1_BIT,
-        .loadOp = initial_layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+        .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR :
+                  initial_layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
                                                               : VK_ATTACHMENT_LOAD_OP_LOAD,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
         .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
@@ -701,6 +702,7 @@ void ClearColorImage(vk::CommandBuffer& cmdbuf, VkImage image) {
 
 void BeginRenderPass(vk::CommandBuffer& cmdbuf, VkRenderPass render_pass, VkFramebuffer framebuffer,
                      VkExtent2D extent) {
+    const VkClearValue clear{};
     const VkRenderPassBeginInfo renderpass_bi{
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .pNext = nullptr,
@@ -710,8 +712,8 @@ void BeginRenderPass(vk::CommandBuffer& cmdbuf, VkRenderPass render_pass, VkFram
             .offset{},
             .extent = extent,
         },
-        .clearValueCount = 0,
-        .pClearValues = nullptr,
+        .clearValueCount = 1,
+        .pClearValues = &clear,
     };
     cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
 

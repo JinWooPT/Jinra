@@ -24,6 +24,7 @@
 #include "video_core/cdma_pusher.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/native_readback_reason.h"
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
@@ -63,7 +64,12 @@ struct GPU::Impl {
         , is_async{is_async_}
     {}
 
-    ~Impl() = default;
+    ~Impl() {
+        NotifyShutdown();
+        // Renderer teardown submits its last command buffer. State tracking still
+        // refers to the bound channel, so keep channels alive until it completes.
+        renderer.reset();
+    }
 
     std::shared_ptr<Control::ChannelState> CreateChannel(s32 channel_id) {
         auto channel_state = std::make_shared<Tegra::Control::ChannelState>(channel_id);
@@ -134,6 +140,7 @@ struct GPU::Impl {
     template <typename Func>
     [[nodiscard]] u64 RequestSyncOperation(Func&& action) {
         std::unique_lock lck{sync_request_mutex};
+        if (sync_requests_closing) return 0;
         const u64 fence = ++last_sync_fence;
         sync_requests.emplace_back(std::forward<Func>(action));
         return fence;
@@ -146,7 +153,9 @@ struct GPU::Impl {
 
     void WaitForSyncOperation(const u64 fence) {
         std::unique_lock lck{sync_request_mutex};
-        sync_request_cv.wait(lck, [this, fence] { return CurrentSyncRequestFence() >= fence; });
+        sync_request_cv.wait(lck, [this, fence] {
+            return CurrentSyncRequestFence() >= fence || sync_requests_stopped;
+        });
     }
 
     void WaitForIdle() {
@@ -157,8 +166,35 @@ struct GPU::Impl {
 
     /// Tick pending requests within the GPU.
     void TickWork() {
+        static const bool queue_statistics = [] {
+            const char* value = std::getenv("EDEN_NATIVE_SYNC_QUEUE_STATS");
+            return value && value[0] == '1';
+        }();
         std::unique_lock lck{sync_request_mutex};
-        while (!sync_requests.empty()) {
+        if (queue_statistics) {
+            ++sync_queue_ticks;
+            sync_queue_empty += sync_requests.empty();
+            if ((sync_queue_ticks & 4095) == 0) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - sync_queue_report >= std::chrono::seconds{10}) {
+                    u64 multiple{};
+                    for (size_t depth = 2; depth < sync_queue_pops.size(); ++depth)
+                        multiple += sync_queue_pops[depth];
+                    LOG_INFO(HW_GPU, "Native sync queue: ticks={} empty={} single={} multiple={} max_depth={}",
+                             sync_queue_ticks, sync_queue_empty, sync_queue_pops[1], multiple,
+                             sync_queue_max_depth);
+                    sync_queue_ticks = sync_queue_empty = sync_queue_max_depth = 0;
+                    sync_queue_pops.fill(0);
+                    sync_queue_report = now;
+                }
+            }
+        }
+        while (!sync_requests.empty() && !sync_requests_closing) {
+            if (queue_statistics) {
+                const auto depth = sync_requests.size();
+                ++sync_queue_pops[depth < sync_queue_pops.size() ? depth : sync_queue_pops.size() - 1];
+                if (depth > sync_queue_max_depth) sync_queue_max_depth = depth;
+            }
             auto request = std::move(sync_requests.front());
             sync_requests.pop_front();
             sync_request_mutex.unlock();
@@ -187,7 +223,19 @@ struct GPU::Impl {
     }
 
     void NotifyShutdown() {
+        {
+            std::scoped_lock lock{sync_request_mutex};
+            sync_requests_closing = true;
+        }
         gpu_thread.NotifyShutdown();
+        {
+            std::scoped_lock lock{sync_request_mutex};
+            // Callbacks can borrow their caller's stack. Retire the GPU thread
+            // before releasing waiters, then discard work that cannot run anymore.
+            sync_requests.clear();
+            sync_requests_stopped = true;
+        }
+        sync_request_cv.notify_all();
         std::unique_lock lk{sync_mutex};
         shutting_down.store(true, std::memory_order::relaxed);
         sync_cv.notify_all();
@@ -230,6 +278,7 @@ struct GPU::Impl {
                      reads.load(std::memory_order_relaxed));
         }
         const u64 fence = RequestSyncOperation([this, &raster_area]() {
+            const VideoCommon::NativeReadbackScope scope{VideoCommon::NativeReadbackReason::GuestRead};
             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
         });
         gpu_thread.TickGPU(is_async);
@@ -243,6 +292,7 @@ struct GPU::Impl {
             VideoCore::RasterizerInterface* rasterizer = renderer->ReadRasterizer();
             if (!rasterizer->TryCacheInvalidation(addr, size)) {
                 const u64 fence = RequestSyncOperation([rasterizer, addr, size] {
+                    const VideoCommon::NativeReadbackScope scope{VideoCommon::NativeReadbackReason::PreserveWrite};
                     rasterizer->FlushRegion(addr, size, VideoCommon::CacheType::BufferCache);
                     rasterizer->OnCacheInvalidation(addr, size);
                 });
@@ -355,6 +405,11 @@ struct GPU::Impl {
     u64 last_sync_fence{};
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
+    bool sync_requests_closing{};
+    bool sync_requests_stopped{};
+    u64 sync_queue_ticks{}, sync_queue_empty{}, sync_queue_max_depth{};
+    std::array<u64, 9> sync_queue_pops{};
+    std::chrono::steady_clock::time_point sync_queue_report{std::chrono::steady_clock::now()};
 
     const bool is_async;
 

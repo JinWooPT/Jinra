@@ -58,7 +58,7 @@ void GameGrid::UpdateIconSize() {
     const u32 icon_size = UISettings::values.game_icon_size.GetValue();
 
     int heightMargin = 0;
-    int widthMargin = 80;
+    int widthMargin = 32;
 
     if (UISettings::values.show_game_name) {
         switch (icon_size) {

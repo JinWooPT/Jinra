@@ -51,6 +51,8 @@ enum class Zone : u32 {
     Method,       ///< Engine method calls (what a split GPU thread's back half would run)
     SplitDrain,   ///< Split GPU thread: the front waits for the back (gpu_split.h)
     SplitWait,    ///< Split GPU thread: the back waits for work
+    NativeInitializer,
+    NativeInitializerWrites,
     Count,
 };
 
@@ -61,7 +63,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "sync descriptors", "read handles", "fill image views", "texture buffers", "update buffers",
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
-    "fence skipped", "method", "split drain", "split wait",
+    "fence skipped", "method", "split drain", "split wait", "native initializer",
+    "native initializer writes",
 };
 
 // Read once at startup: Enabled() runs several times per method write (no guard to check).
@@ -69,6 +72,18 @@ inline const bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
 
 inline bool Enabled() {
     return g_enabled;
+}
+
+inline const u64 g_zone_mask = [] {
+    const char* value = std::getenv("EDEN_NX2_GPU_PROFILE_MASK");
+    if (!value) return ~u64{0};
+    char* end{};
+    const u64 mask = std::strtoull(value, &end, 0);
+    return end != value && *end == '\0' ? mask : ~u64{0};
+}();
+
+inline bool ZoneEnabled(Zone zone) {
+    return (g_zone_mask & (u64{1} << static_cast<u32>(zone))) != 0;
 }
 
 // Nanoseconds; from the host's own counter where the wall clock reads it directly (the zones
@@ -89,7 +104,7 @@ inline thread_local ThreadData t_data;
 
 class Scope {
 public:
-    explicit Scope(Zone zone_) : zone{zone_}, enabled{Enabled()} {
+    explicit Scope(Zone zone_) : zone{zone_}, enabled{Enabled() && ZoneEnabled(zone_)} {
         if (!enabled) {
             return;
         }

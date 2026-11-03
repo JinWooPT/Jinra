@@ -4,7 +4,9 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <memory>
+#include <QIcon>
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -65,6 +67,10 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
     Settings::SetConfiguringGlobal(true);
 
     ui->setupUi(this);
+    setWindowTitle(QStringLiteral("Jinra — Settings"));
+    setWindowIcon(QIcon(QStringLiteral(":/img/eden.ico")));
+    ui->selectorList->setMinimumWidth(140);
+    ui->selectorList->setMaximumWidth(160);
 
     ui->tabWidget->addTab(applets_tab.get(), tr("Applets"));
     ui->tabWidget->addTab(audio_tab.get(), tr("Audio"));
@@ -118,6 +124,10 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
 }
 
 ConfigureDialog::~ConfigureDialog() = default;
+
+void ConfigureDialog::SelectCategory(int index) {
+    ui->selectorList->setCurrentRow(std::clamp(index, 0, ui->selectorList->count() - 1));
+}
 
 void ConfigureDialog::SetConfiguration() {}
 

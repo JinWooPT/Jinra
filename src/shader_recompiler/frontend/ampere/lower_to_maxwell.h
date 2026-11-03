@@ -593,6 +593,21 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             }
             break;
         }
+        case 0x234: { // HSETP2, register sources and independent or horizontal half predicates.
+            const u32 combine = insn.Bits(69, 2);
+            if (insn.Bits(16, 8) || insn.Bits(64, 5) || combine > 2 ||
+                insn.Bits(91, 1) || (insn.words[1] & 0x0fffff00U))
+                return fail(index, "native register half predicate mode");
+            const auto a = half_source(0), b = half_source(1);
+            emit(0x5d20000000000000ULL | predicate | (u64{insn.Bits(81, 3)} << 3) |
+                 insn.Bits(84, 3) | (u64{insn.Bits(80, 1)} << 6) | (u64{a.reg} << 8) |
+                 (u64{b.reg} << 20) | (u64{b.swizzle} << 28) | (u64{b.absolute} << 30) |
+                 (u64{b.negate} << 31) | (u64{insn.Bits(76, 4)} << 35) |
+                 (u64{insn.Bits(87, 4)} << 39) | (u64{a.negate} << 43) |
+                 (u64{a.absolute} << 44) | (u64{combine} << 45) | (u64{a.swizzle} << 47) |
+                 (u64{insn.Bits(71, 1)} << 49));
+            break;
+        }
         case 0x434: { // HSETP2.GEU.AND, packed immediate and independent half predicates.
             constexpr u32 variable = (0x3fU << 17) | (3U << 10);
             if (insn.Bits(16, 8) || (insn.words[2] & ~variable) != 0x0380e000U ||
@@ -2921,8 +2936,9 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         case 0x207: case 0x807: case 0xa07:
         case 0x208: case 0x808: case 0xa08: { // Bitwise SEL / FSEL
             // FSEL carries abs/neg on both selected operands (bits 73/72 and 62/63, as for FADD).
-            // Off by default until it is proven not to change FastFusion colours: EDEN_NATIVE_LOWER_ENABLE=audit_fsel.
-            const bool floating = (opcode & 0x1ff) == 0x8 && LowerGroupEnabled("audit_fsel");
+            // Apply the floating modifiers before selection, including when the source aliases
+            // the destination. Losing a negation can move an entire mesh outside the viewport.
+            const bool floating = (opcode & 0x1ff) == 0x8;
             const u32 a = operand(0, floating), b = operand(1, floating);
             emit(base(0x5ca0000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) |
                 (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));
@@ -3580,6 +3596,8 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             if (s64{index} * 16 + 16 + relative != 0)
                 return fail(index, "native return relative base");
             for (const auto& relocation : relocations) {
+                // A verified call can enter a stub consisting only of the upper-link setup and RET.
+                if (relocation.call && relocation.target == active_entry) continue;
                 if ((inplace_link && relocation.target > upper_link_setup && relocation.target < index &&
                      relocation.output_index < result.source_instruction_offsets[upper_link_setup]) ||
                     (inplace_link && relocation.target > active_entry && relocation.target < index &&

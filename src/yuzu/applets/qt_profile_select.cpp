@@ -16,7 +16,6 @@
 #include <QVBoxLayout>
 #include "common/fs/path_util.h"
 #include "common/string_util.h"
-#include "core/constants.h"
 #include "core/core.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "yuzu/applets/qt_profile_select.h"
@@ -42,12 +41,10 @@ QPixmap GetIcon(Common::UUID uuid) {
     QPixmap icon{GetImagePath(uuid)};
 
     if (!icon) {
-        icon.fill(Qt::black);
-        icon.loadFromData(Core::Constants::ACCOUNT_BACKUP_JPEG.data(),
-                          static_cast<u32>(Core::Constants::ACCOUNT_BACKUP_JPEG.size()));
+        icon.load(QStringLiteral(":/jinra/icon.png"));
     }
 
-    return icon.scaled(64, 64, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    return icon;
 }
 } // Anonymous namespace
 

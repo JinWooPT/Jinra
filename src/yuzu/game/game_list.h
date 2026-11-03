@@ -71,6 +71,8 @@ public:
 
     QString GetLastFilterResultItem() const;
     void ClearFilter();
+    QWidget* TakeSearchField();
+    void SetCollectionFilter(int collection);
     void SetFilterFocus();
     void SetFilterVisible(bool visibility);
     bool IsEmpty() const;
@@ -94,6 +96,8 @@ public slots:
     void OnPopulate();
 
 signals:
+    void GameHighlighted(const QModelIndex& index);
+    void FilterCountChanged(int visible, int total);
     void BootGame(const QString& game_path, StartGameType type);
     void GameChosen(const QString& game_path, const u64 title_id = 0);
     void OpenFolderRequested(u64 program_id, GameListOpenTarget target,
@@ -164,6 +168,8 @@ private:
     const PlayTime::PlayTimeManager& play_time_manager;
     Core::System& system;
 
+    int collection_filter{};
+    QString filtered_game_path;
     bool m_isTreeMode = true;
     QAbstractItemView* m_currentView = nullptr;
 };

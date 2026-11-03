@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <QApplication>
+#include <QTimer>
 #include "startup_checks.h"
 
 #if YUZU_ROOM
@@ -180,6 +181,7 @@ int main(int argc, char* argv[]) {
 #endif
 
     QApplication app(argc, argv);
+    QGuiApplication::setApplicationDisplayName(QStringLiteral("Jinra"));
 
 #ifdef _WIN32
     OverrideWindowsFont();
@@ -203,6 +205,11 @@ int main(int argc, char* argv[]) {
     MainWindow main_window{has_broken_vulkan};
     // After settings have been loaded by GMainWindow, apply the filter
     main_window.show();
+    if (qEnvironmentVariableIsSet("EDEN_BACKGROUND_TEST")) {
+        const int seconds = qEnvironmentVariableIntValue("EDEN_BG_TEST_SECONDS");
+        QTimer::singleShot((seconds >= 30 && seconds <= 600 ? seconds : 120) * 1000,
+                           &main_window, [&main_window] { main_window.close(); });
+    }
 
     app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window, &MainWindow::OnAppFocusStateChanged);
     return app.exec();

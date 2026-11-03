@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <variant>
+#include <cstdlib>
+#include "common/logging.h"
 #include "video_core/present.h"
 #include "video_core/renderer_vulkan/present/anti_alias_pass.h"
 /* X11 defines */
@@ -101,7 +103,18 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
                                             Service::Nvnflinger::LayerStackId::Recording)) == 0;
 
     RefreshResources(device, framebuffer);
-    SetAntiAliasPass(device);
+    SetAntiAliasPass(device, VkExtent2D{scaled_width, scaled_height});
+    static const bool source_diagnostic = std::getenv("EDEN_PRESENT_SOURCE_DIAGNOSTIC") != nullptr;
+    if (source_diagnostic) {
+        static u32 reports{};
+        if (reports++ < 16) {
+            LOG_INFO(Render_Vulkan,
+                     "Present source: guest={}x{} texture={}x{} scaled={}x{} aa={}x{} accelerated={}",
+                     framebuffer.width, framebuffer.height, texture_width, texture_height,
+                     scaled_width, scaled_height, anti_alias_extent.width, anti_alias_extent.height,
+                     use_accelerated);
+        }
+    }
 #ifdef HAS_RESHADE
     SetPostProcessPass(device, is_applet);
 #endif
@@ -109,9 +122,6 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
     // Finish any pending renderpass
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Wait(resource_ticks[image_index]);
-    SCOPE_EXIT {
-        resource_ticks[image_index] = scheduler.CurrentTick();
-    };
 
     if (!use_accelerated) {
         UpdateRawImage(framebuffer, image_index);
@@ -155,6 +165,10 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
 
     UpdateDescriptorSet(device, source_image_view, sampler, image_index);
     *out_descriptor_set = descriptor_sets[image_index];
+}
+
+void Layer::MarkPresentUse(size_t image_index) {
+    resource_ticks[image_index] = scheduler.CurrentTick();
 }
 
 void Layer::CreateDescriptorPool(const Device& device) {
@@ -201,26 +215,30 @@ void Layer::RefreshResources(const Device& device, const Tegra::FramebufferConfi
         return;
     }
 
+    ReleaseRawImages();
+    anti_alias.emplace<std::monostate>();
+    anti_alias_extent = {};
     raw_width = framebuffer.width;
     raw_height = framebuffer.height;
     pixel_format = framebuffer.pixel_format;
-    anti_alias.emplace<std::monostate>();
-
-    ReleaseRawImages();
     CreateStagingBuffer(device, framebuffer);
     CreateRawImages(device, framebuffer);
 }
 
-void Layer::SetAntiAliasPass(const Device& device) {
-    if (!std::holds_alternative<std::monostate>(anti_alias) && anti_alias_setting == filters.get_anti_aliasing())
+void Layer::SetAntiAliasPass(const Device& device, VkExtent2D render_area) {
+    if (anti_alias_setting == filters.get_anti_aliasing() &&
+        anti_alias_extent.width == render_area.width &&
+        anti_alias_extent.height == render_area.height) {
         return;
+    }
+
+    // Images and descriptors from the old pass may still be used by other frame slots.
+    for (const u64 tick : resource_ticks) {
+        scheduler.Wait(tick);
+    }
 
     anti_alias_setting = filters.get_anti_aliasing();
-
-    const VkExtent2D render_area{
-        .width = Settings::values.resolution_info.ScaleUp(raw_width),
-        .height = Settings::values.resolution_info.ScaleUp(raw_height),
-    };
+    anti_alias_extent = render_area;
 
     switch (anti_alias_setting) {
     case Settings::AntiAliasing::Fxaa:

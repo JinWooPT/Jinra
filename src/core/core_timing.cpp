@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -77,6 +78,10 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
             Common::SetCurrentThreadToPerformanceCores();
             on_thread_init();
             has_started = true;
+#ifdef _WIN32
+            const char* wait_mode = std::getenv("EDEN_HOST_TIMING_KERNEL_WAIT");
+            const bool kernel_wait = wait_mode && wait_mode[0] == '1';
+#endif
 
             // base frequency in MHz: 1ns (10^-9) = 1GHz (10^9)
             while (!stop_token.stop_requested()) {
@@ -86,6 +91,12 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                         // There are more events left in the queue, wait until the next event.
                         auto const wait_time = *next_time - GetGlobalTimeNs().count();
                         if (wait_time > 0) {
+#ifdef _WIN32
+                            if (kernel_wait) {
+                                event.WaitUntil(std::chrono::steady_clock::now() +
+                                                std::chrono::nanoseconds(wait_time));
+                            } else
+#endif
                             event.WaitFor(std::chrono::nanoseconds(wait_time));
                         }
                     } else {

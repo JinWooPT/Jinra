@@ -403,6 +403,48 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
                       location, device.GetDispatchLoader());
 }
 
+vk::Buffer MemoryAllocator::TryCreateMappedDeviceBuffer(const VkBufferCreateInfo& ci,
+                                                        VkDeviceSize min_alignment) const {
+    constexpr VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    u32 compatible_types{};
+    for (u32 type = 0; type < properties.memoryTypeCount; ++type) {
+        if ((properties.memoryTypes[type].propertyFlags & required) == required) {
+            compatible_types |= 1u << type;
+        }
+    }
+    compatible_types &= valid_memory_types;
+    if (!compatible_types) return {};
+    const VmaAllocationCreateInfo allocation_ci{
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT |
+                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .requiredFlags = required,
+        .preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        .memoryTypeBits = compatible_types,
+    };
+    VkBuffer handle{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo info{};
+    const VkResult result = vmaCreateBufferWithAlignment(
+        allocator, &ci, &allocation_ci, std::max(VkDeviceSize{1}, min_alignment),
+        &handle, &allocation, &info);
+    if (result != VK_SUCCESS) return {};
+    if (!info.pMappedData) {
+        vmaDestroyBuffer(allocator, handle, allocation);
+        return {};
+    }
+    const vk::MemoryLocation location{
+        .memory = info.deviceMemory,
+        .offset = info.offset,
+        .memory_type = info.memoryType,
+    };
+    vk::Buffer buffer{handle, *device.GetLogical(), allocator, allocation,
+                      std::span{static_cast<u8*>(info.pMappedData), static_cast<size_t>(ci.size)},
+                      true, location, device.GetDispatchLoader()};
+    return buffer;
+}
+
 MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsage usage)
 {
     const auto vma_usage = MemoryUsageVma(usage);

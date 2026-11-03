@@ -298,6 +298,11 @@ enum class ButtonNames {
     ButtonForward,
     ButtonTask,
     ButtonExtra,
+
+    XboxLB,
+    XboxLT,
+    XboxRB,
+    XboxRT,
 };
 
 // Callback data consisting of an input type and the equivalent data status

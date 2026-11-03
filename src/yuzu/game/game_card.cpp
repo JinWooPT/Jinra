@@ -23,15 +23,15 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
     const QRect cardRect = getCardRect(option, index);
 
     QPalette palette = option.palette;
-    QColor backgroundColor = palette.window().color();
-    QColor borderColor = palette.dark().color();
-    QColor textColor = palette.text().color();
+    QColor backgroundColor = QColor("#111b2c");
+    QColor borderColor = QColor("#24344c");
+    QColor textColor = QColor("#e8f1fc");
 
     // highlight on select or hover
     if (option.state & QStyle::State_Selected) {
-        backgroundColor = palette.highlight().color();
-        borderColor = palette.highlight().color().lighter(150);
-        textColor = palette.highlightedText().color();
+        backgroundColor = QColor("#162f4c");
+        borderColor = QColor("#278dff");
+        textColor = QColor("#ffffff");
     } else if (option.state & QStyle::State_MouseOver) {
         backgroundColor = backgroundColor.lighter(120);
     }

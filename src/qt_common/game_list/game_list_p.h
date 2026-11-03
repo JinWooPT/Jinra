@@ -118,7 +118,7 @@ public:
         if (!picture.loadFromData(picture_data.data(), static_cast<u32>(picture_data.size()))) {
             picture = GetDefaultIcon(size);
         }
-        picture = picture.scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        // Retain source pixels for high-DPI views; scale only at paint time.
 
         setData(picture, Qt::DecorationRole);
     }

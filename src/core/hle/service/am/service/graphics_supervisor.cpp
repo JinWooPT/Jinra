@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <limits>
+#include "video_core/native_diagnostics.h"
 #include "core/hle/service/am/service/native_video_layout.h"
 #include "core/hle/service/am/service/native_video_decoder.h"
 #include <algorithm>
@@ -944,8 +945,10 @@ private:
             });
             system.CoreTiming().ScheduleLoopingEvent(std::chrono::milliseconds{1}, std::chrono::milliseconds{1}, m_release_poll);
         }
-        LOG_INFO(Service_AM, "Native image queued for display: image={}, slot={}, fence={}/{}, dimensions={}x{}",
-                 image->id, slot, fence_id, packet[24], native->width, native->height);
+        if (VideoCommon::NativeVerboseRuntimeDiagnosticsEnabled()) {
+            LOG_INFO(Service_AM, "Native image queued for display: image={}, slot={}, fence={}/{}, dimensions={}x{}",
+                     image->id, slot, fence_id, packet[24], native->width, native->height);
+        }
         R_SUCCEED();
     }
     void PresentClientBuffer(HLERequestContext& ctx) {

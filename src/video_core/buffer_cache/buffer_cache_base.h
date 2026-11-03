@@ -33,6 +33,7 @@
 #include "common/slot_vector.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
+#include "video_core/buffer_cache/mapped_prefix_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/dirty_flags.h"
@@ -40,6 +41,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/native_readback_epoch.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
 
@@ -322,6 +324,7 @@ public:
 
     /// Pop asynchronous downloads
     void PopAsyncFlushes();
+    void PopAsyncFlushes(size_t count);
     void PopAsyncBuffers();
 
     bool DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount);
@@ -334,6 +337,7 @@ public:
     /// The guest CPU reads [addr, addr + size) (pages its reads are tracked on): without
     /// AsyncBufferDownloads, GPU writes there are still copied back at fences from now on.
     void NoteCpuRead(DAddr addr, size_t size);
+    void NoteCpuReadConcurrent(DAddr addr, size_t size);
 
     /// Return true when a region is registered on the cache
     [[nodiscard]] bool IsRegionRegistered(DAddr addr, size_t size);
@@ -565,13 +569,20 @@ private:
     /// Copying every GPU-written range back instead (each written native storage binding is an
     /// 8 MiB window) dropped it from 60 to about 42 frames a second.
     Common::RangeSet<DAddr> cpu_read_ranges;
+    std::mutex cpu_read_ranges_mutex;
 
     /// Queues the parts of a GPU write to [addr, addr + size) that are copied back at the next fence.
     void QueueDownload(DAddr addr, u64 size) {
+        if (NativeReactiveReadbackEnabled() && Settings::values.use_reactive_flushing.GetValue() &&
+            gpu_memory && gpu_memory->UsesNativeTiling()) {
+            native_readback_epoch.Invalidate();
+            return;
+        }
         if (AsyncBufferDownloads()) {
             uncommitted_gpu_modified_ranges.Add(addr, size);
             return;
         }
+        std::scoped_lock history_lock{cpu_read_ranges_mutex};
         cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr end) {
             uncommitted_gpu_modified_ranges.Add(start, end - start);
         });
@@ -605,6 +616,7 @@ private:
     mutable ::Common::unordered_map<u64, MappedPrefix> mapped_prefixes;
     /// Bumped by UnmapGPUMemory (any thread), whenever a GPU page's mapping type changes.
     std::atomic<u64> mapping_generation{1};
+    mutable MappedPrefixCache selective_prefixes{NativePrefixIntervalsEnabled()};
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
     u64 frame_tick = 0;

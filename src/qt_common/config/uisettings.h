@@ -61,17 +61,12 @@ enum class Theme {
     DarkColorful,
     MidnightBlue,
     MidnightBlueColorful,
+    Jinra,
 };
 
-static constexpr Theme default_theme{
-#ifdef _WIN32
-    Theme::DarkColorful
-#else
-    Theme::DefaultColorful
-#endif
-};
+static constexpr Theme default_theme{Theme::Jinra};
 
-using Themes = std::array<std::pair<const char*, const char*>, 6>;
+using Themes = std::array<std::pair<const char*, const char*>, 7>;
 extern const Themes themes;
 
 struct GameDir {
@@ -170,7 +165,7 @@ struct Values {
     bool game_dir_deprecated_deepscan;
     QVector<GameDir> game_dirs;
     QStringList recent_files;
-    Setting<std::string> language{linkage, {}, "language", Category::Paths};
+    Setting<std::string> language{linkage, "en", "language", Category::Paths};
 
     std::string theme;
 
@@ -205,11 +200,11 @@ struct Values {
 
     // Game List
     Setting<bool> show_add_ons{linkage, true, "show_add_ons", Category::UiGameList};
-    Setting<u32, true> game_icon_size{linkage, 64, 0, 512, "game_icon_size", Category::UiGameList};
+    Setting<u32, true> game_icon_size{linkage, 128, 0, 512, "game_icon_size", Category::UiGameList};
     Setting<u32, true> folder_icon_size{linkage, 48, 8, 512, "folder_icon_size", Category::UiGameList};
     Setting<u8> row_1_text_id{linkage, 3, "row_1_text_id", Category::UiGameList};
     Setting<u8> row_2_text_id{linkage, 2, "row_2_text_id", Category::UiGameList};
-    Setting<Settings::GameListMode> game_list_mode{linkage, Settings::GameListMode::TreeView, "game_list_mode", Category::UiGameList};
+    Setting<Settings::GameListMode> game_list_mode{linkage, Settings::GameListMode::GridView, "game_list_mode", Category::UiGameList};
     Setting<bool> show_game_name{linkage, true, "show_game_name", Category::UiGameList};
 
     std::atomic_bool is_game_list_reload_pending{false};

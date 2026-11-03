@@ -25,6 +25,8 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2.h"
+#include "video_core/native_fence_submission.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace VideoCommon {
@@ -112,7 +114,14 @@ public:
             func();
         }
         fences.push(std::move(new_fence));
-        if (should_flush) {
+        static const bool avoid_duplicate_flush = [] {
+            const char* value = std::getenv("EDEN_NATIVE_SINGLE_FENCE_FLUSH");
+            return value && value[0] == '1';
+        }();
+        // A non-stubbed Vulkan fence already submits the downloads when queued.
+        const bool already_flushed = (avoid_duplicate_flush || NativeFenceSubmissionDeferred()) &&
+            Traits::QUEUE_FENCE_FLUSHES_COMMANDS && Tegra::g_native_channels.load(std::memory_order_relaxed);
+        if (should_flush && !already_flushed) {
             rasterizer.FlushCommands();
         }
         if constexpr (can_async_check) {
@@ -144,6 +153,10 @@ public:
                 wait_cv.notify_all();
             });
             SignalFence(std::move(func));
+            if (Traits::QUEUE_FENCE_FLUSHES_COMMANDS && NativeFenceSubmissionDeferred()) {
+                // The waiter can run inside a command list, before its normal submission point.
+                rasterizer.FlushCommands();
+            }
             std::unique_lock lk(wait_mutex);
             wait_cv.wait(
                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
@@ -219,14 +232,12 @@ private:
         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
         Common::SetCurrentThreadToPerformanceCores();
 
-        // Every fence the host GPU has already passed is released together: Switch 2 titles
-        // signal thousands a second and the host GPU completes them in bursts, so each cache's
-        // lock is taken once per burst instead of once per fence (the GPU thread, which holds
-        // them for nearly every command, spun, slept and woke this thread for each one).
-        // EDEN_NX2_FENCE_BATCH=0: one fence at a time (for comparisons).
-        static const size_t MaxBatch = [] {
+        // Native terrain updates need their completion callbacks promptly. Large bursts keep
+        // the cache locked and delay the guest while it is waiting for the first result.
+        // EDEN_NX2_FENCE_BATCH=0/1 forces one completion or the legacy batch of 64.
+        static const size_t forced_batch = [] {
             const char* value = std::getenv("EDEN_NX2_FENCE_BATCH");
-            return value != nullptr && value[0] == '0' ? size_t{1} : size_t{64};
+            return value == nullptr ? size_t{0} : value[0] == '0' ? size_t{1} : size_t{64};
         }();
         struct Released {
             TFence fence;
@@ -234,7 +245,7 @@ private:
             u8 flushes;
         };
         std::vector<Released> batch;
-        batch.reserve(MaxBatch);
+        batch.reserve(64);
         const auto take_front = [&] {
             batch.push_back({std::move(fences.front()), std::move(pending_operations.front()),
                              pending_flushes.front()});
@@ -256,7 +267,9 @@ private:
             }
             {
                 std::unique_lock lock(guard);
-                while (batch.size() < MaxBatch && !fences.empty() &&
+                const size_t max_batch = forced_batch != 0 ? forced_batch :
+                    Tegra::g_native_channels.load(std::memory_order_relaxed) ? 1 : 64;
+                while (batch.size() < max_batch && !fences.empty() &&
                        (fences.front()->IsStubbed() || IsFenceSignaled(fences.front()))) {
                     take_front();
                 }
@@ -275,8 +288,13 @@ private:
             }
             if (buffer_pops != 0) {
                 std::scoped_lock lock{buffer_cache.mutex};
-                for (size_t i = 0; i < buffer_pops; ++i) {
-                    buffer_cache.PopAsyncFlushes();
+                static const bool coalesce = std::getenv("EDEN_NX2_COALESCE_DOWNLOADS") != nullptr;
+                if (coalesce && Tegra::g_native_channels.load(std::memory_order_relaxed)) {
+                    buffer_cache.PopAsyncFlushes(buffer_pops);
+                } else {
+                    for (size_t i = 0; i < buffer_pops; ++i) {
+                        buffer_cache.PopAsyncFlushes();
+                    }
                 }
             }
             // Queries and operations keep their per-fence order.

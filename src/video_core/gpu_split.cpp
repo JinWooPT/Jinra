@@ -82,6 +82,14 @@ void GpuSplit::CheckOwner(const char* where) {
 
 GpuSplit GpuSplit::instance;
 
+bool GpuSplit::AccurateReads() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NATIVE_ACCURATE_SPLIT");
+        return value && value[0] == '1';
+    }();
+    return enabled && Tegra::g_native_channels.load(std::memory_order_relaxed);
+}
+
 void GpuSplit::MaybeStart(Core::System& system_) {
     static const char mode = [] {
         const char* value = std::getenv("EDEN_NX2_SPLIT");
@@ -103,7 +111,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // mid-game: hand the engines back to the front (and start again when they allow it).
     const bool safe_reads = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh()
                                                           : Settings::IsDMALevelSafe();
-    const bool allowed = !safe_reads && !Settings::IsGPULevelHigh() &&
+    const bool allowed = (AccurateReads() || (!safe_reads && !Settings::IsGPULevelHigh())) &&
                          Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
     if (active && !allowed) {
         Drain();
@@ -201,6 +209,26 @@ void GpuSplit::Publish() {
     if (back_waiting.load(std::memory_order_seq_cst)) {
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
+    }
+}
+
+void GpuSplit::AwaitReleases(GPUVAddr address, u64 size) {
+    if (sent_releases.empty()) {
+        return;
+    }
+    const u64 done = consumed.load(std::memory_order_acquire);
+    bool wait = false;
+    for (auto it = sent_releases.begin(); it != sent_releases.end();) {
+        if (it->second <= done) {
+            it = sent_releases.erase(it);
+            continue;
+        }
+        wait |= it->first >= address && it->first < address + size;
+        ++it;
+    }
+    if (wait) {
+        Drain();
+        sent_releases.clear();
     }
 }
 

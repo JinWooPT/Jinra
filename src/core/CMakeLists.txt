@@ -1169,6 +1169,10 @@ add_library(core STATIC
     loader/nro.h
     loader/nso.cpp
     loader/nso.h
+    file_sys/nup_container.cpp
+    file_sys/nup_container.h
+    loader/nup.cpp
+    loader/nup.h
     loader/nsp.cpp
     loader/nsp.h
     loader/xci.cpp

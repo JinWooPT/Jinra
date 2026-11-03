@@ -40,8 +40,8 @@ private:
         // EventFilter in order to process systemkeys while editing the searchfield
         bool eventFilter(QObject* obj, QEvent* event) override;
     };
-    int visible;
-    int total;
+    int visible{};
+    int total{};
 
     QHBoxLayout* layout_filter = nullptr;
     QTreeView* tree_view = nullptr;

@@ -56,6 +56,7 @@ public:
     ~ConfigureDialog() override;
 
     void ApplyConfiguration();
+    void SelectCategory(int index);
 
 private slots:
     void OnLanguageChanged(const QString& locale);

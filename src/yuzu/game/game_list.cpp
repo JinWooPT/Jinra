@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2015 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <functional>
 #include <QAbstractItemView>
 #include <QApplication>
 #include <QDir>
@@ -32,6 +33,7 @@
 #include "qt_common/qt_common.h"
 #include "qt_common/util/game.h"
 #include "yuzu/game/carousel.h"
+#include "yuzu/game/common.h"
 #include "yuzu/game/game_grid.h"
 #include "yuzu/game/game_list.h"
 #include "yuzu/game/game_tree.h"
@@ -58,6 +60,13 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
     search_field = new GameListSearchField(this);
     layout->addWidget(search_field);
 
+    for (QAbstractItemView* view :
+         {static_cast<QAbstractItemView*>(tree_view), static_cast<QAbstractItemView*>(grid_view),
+          static_cast<QAbstractItemView*>(carousel_view)}) {
+        connect(view->selectionModel(), &QItemSelectionModel::currentChanged, this,
+                [this](const QModelIndex& index) { emit GameHighlighted(index); });
+    }
+
     controller_navigation = new ControllerNavigation(system.HIDCore(), this);
 
     SetupScrollAnimation();
@@ -69,7 +78,8 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
     connect(grid_view, &QListView::customContextMenuRequested, this, &GameList::PopupContextMenu);
 
     connect(carousel_view, &QListView::activated, this, &GameList::ValidateEntry);
-    connect(carousel_view, &QListView::customContextMenuRequested, this, &GameList::PopupContextMenu);
+    connect(carousel_view, &QListView::customContextMenuRequested, this,
+            &GameList::PopupContextMenu);
 
     connect(controller_navigation, &ControllerNavigation::TriggerKeyboardEvent, this,
             [this](Qt::Key key) {
@@ -114,7 +124,17 @@ void GameList::SetupViews() {
 }
 
 QString GameList::GetLastFilterResultItem() const {
-    return tree_view->GetLastFilterResultItem();
+    return filtered_game_path;
+}
+
+QWidget* GameList::TakeSearchField() {
+    layout->removeWidget(search_field);
+    return search_field;
+}
+
+void GameList::SetCollectionFilter(int collection) {
+    collection_filter = collection;
+    OnTextChanged(search_field->filterText());
 }
 
 void GameList::ClearFilter() {
@@ -210,7 +230,7 @@ void GameList::ResetViewMode() {
 
     m_currentView->setVisible(true);
     m_currentView->setEnabled(true);
-    layout->insertWidget(0, m_currentView);
+    layout->insertWidget(layout->indexOf(search_field) >= 0 ? 1 : 0, m_currentView);
 
     auto view = m_currentView->viewport();
     view->installEventFilter(this);
@@ -245,6 +265,51 @@ void GameList::OnTextChanged(const QString& new_text) {
     } else {
         grid_view->ApplyFilter(edit_filter_text, item_model);
     }
+    int total = 0, visible = 0;
+    QModelIndex first_visible;
+    const auto current = m_currentView->currentIndex().siblingAtColumn(0);
+    bool current_shown = false;
+    filtered_game_path.clear();
+    std::function<bool(const QModelIndex&)> filter_rows = [&](const QModelIndex& parent) {
+        bool any = false;
+        for (int row = 0; row < item_model->rowCount(parent); ++row) {
+            const auto index = item_model->index(row, 0, parent);
+            const auto* item = item_model->itemFromIndex(index);
+            bool shown = true;
+            if (item->type() == static_cast<int>(GameListItemType::Game)) {
+                ++total;
+                const auto path = index.data(GameListItemPath::FullPathRole).toString();
+                const auto id = index.data(GameListItemPath::ProgramIdRole).toULongLong();
+                shown =
+                    Yuzu::FilterMatches(edit_filter_text, item) &&
+                    (collection_filter != 1 || UISettings::values.recent_files.contains(path)) &&
+                    (collection_filter != 2 || UISettings::values.favorited_ids.contains(id));
+                if (shown) {
+                    ++visible;
+                    filtered_game_path = path;
+                    if (!first_visible.isValid())
+                        first_visible = index;
+                    if (index == current)
+                        current_shown = true;
+                }
+            } else if (item_model->hasChildren(index))
+                shown = filter_rows(index);
+            if (m_isTreeMode)
+                tree_view->setRowHidden(row, parent, !shown);
+            else if (!parent.isValid())
+                static_cast<QListView*>(m_currentView)->setRowHidden(row, !shown);
+            any |= shown;
+        }
+        return any;
+    };
+    filter_rows({});
+    if (!current_shown) {
+        m_currentView->setCurrentIndex(first_visible);
+        if (!first_visible.isValid())
+            emit GameHighlighted({});
+    }
+    search_field->setFilterResult(visible, total);
+    emit FilterCountChanged(visible, total);
 }
 
 void GameList::OnFilterCloseClicked() {
@@ -288,7 +353,8 @@ void GameList::OnPopulatingCompleted(const QStringList& watch_list) {
 
     QStringList to_remove, to_add;
 
-    const auto slice = [&](const QStringList& list, std::function<void(const QStringList&)> callback) {
+    const auto slice = [&](const QStringList& list,
+                           std::function<void(const QStringList&)> callback) {
         const int len = (std::min)(list.size(), LIMIT_WATCH_DIRECTORIES);
         for (int i = 0; i < len; i += SLICE_SIZE) {
             auto chunk = list.mid(i, SLICE_SIZE);
@@ -333,6 +399,7 @@ void GameList::OnPopulatingCompleted(const QStringList& watch_list) {
     item_model->sort(tree_view->header()->sortIndicatorSection(),
                      tree_view->header()->sortIndicatorOrder());
 
+    OnTextChanged(search_field->filterText());
     emit PopulatingCompleted();
 }
 

@@ -34,6 +34,7 @@
 #include "core/hle/dlss_trace.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
+#include "video_core/native_readback_epoch.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/rasterizer_download_area.h"
@@ -786,6 +787,16 @@ struct Memory::Impl {
         const size_t core = system.GetCurrentHostThreadID();
         auto& current_area = rasterizer_read_areas[core];
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            if (VideoCommon::NativeReactiveReadbackEnabled() &&
+                Settings::values.use_reactive_flushing.GetValue()) {
+                const u64 observed = VideoCommon::native_readback_epoch.Observe();
+                auto& hint = native_readback_hints[core];
+                if (hint.Contains(address, size, observed)) return;
+                current_area = system.GPU().OnCPURead(address, size);
+                // A write queued during the read must invalidate this hint too.
+                hint.Remember(current_area.start_address, current_area.end_address, observed);
+                return;
+            }
             const DAddr end_address = address + size;
             if (current_area.start_address <= address && end_address <= current_area.end_address)
                 [[likely]] {
@@ -864,6 +875,7 @@ struct Memory::Impl {
     Common::PageTable* current_page_table = nullptr;
 
     std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
+    std::array<VideoCommon::NativeReadbackHint, Core::Hardware::NUM_CPU_CORES> native_readback_hints{};
     std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;

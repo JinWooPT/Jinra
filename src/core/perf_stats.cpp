@@ -18,6 +18,7 @@
 #include "common/fs/path_util.h"
 #include "common/settings.h"
 #include "core/perf_stats.h"
+#include "common/input_replay_clock.h"
 
 using namespace std::chrono_literals;
 using DoubleSecs = std::chrono::duration<double, std::chrono::seconds::period>;
@@ -85,6 +86,7 @@ void PerfStats::EndSystemFrame() {
 
 void PerfStats::EndGameFrame() {
     game_frames.fetch_add(1, std::memory_order_relaxed);
+    Common::InputReplay::EndGameFrame();
 }
 
 double PerfStats::GetMeanFrametime() const {

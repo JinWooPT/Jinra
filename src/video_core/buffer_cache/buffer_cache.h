@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include <algorithm>
 #include <memory>
 #include <numeric>
@@ -16,12 +18,15 @@
 #include "common/range_sets.inc"
 #include "shader_recompiler/exception.h"
 #include "video_core/buffer_cache/storage_range_groups.h"
+#include "video_core/buffer_cache/download_copy_batches.h"
+#include "video_core/buffer_cache/completed_download_coverage.h"
 #include "video_core/buffer_cache/storage_buffer_size.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/gpu_write_watch.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/native_readback_reason.h"
 #include "video_core/texture_cache/util.h"
 
 namespace VideoCommon {
@@ -164,6 +169,7 @@ void BufferCache<P>::TickFrame() {
 template <class P>
 void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size) {
     mapping_generation.fetch_add(1, std::memory_order_release);
+    if (NativeSelectivePrefixCacheEnabled()) selective_prefixes.Invalidate(as_id, gpu_addr, size);
     if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
         virtual_ranges.Unmap(as_id, gpu_addr, size);
     }
@@ -735,7 +741,6 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
     runtime.PreCopyBarrier();
     for (auto& [copy, buffer_id] : downloads) {
         copy.dst_offset += download_staging.offset;
-        const std::array copies{copy};
         BufferCopy second_copy{copy};
         Buffer& buffer = slot_buffers[buffer_id];
         second_copy.src_offset = static_cast<size_t>(buffer.CpuAddr()) + copy.src_offset;
@@ -755,9 +760,13 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
         }
         async_downloads.Add(orig_device_addr, copy.size);
         buffer.MarkUsage(copy.src_offset, copy.size);
-        runtime.CopyBuffer(download_staging.buffer, buffer, copies, false);
         normalized_copies.push_back(second_copy);
     }
+    ForEachDownloadCopyBatch(
+        std::span<const std::pair<BufferCopy, BufferId>>{downloads.data(), downloads.size()},
+        [&](BufferId buffer_id, std::span<const BufferCopy> copies) {
+            runtime.CopyBuffer(download_staging.buffer, slot_buffers[buffer_id], copies, false);
+        });
     runtime.PostCopyBarrier();
     pending_downloads.emplace_back(std::move(normalized_copies));
     async_buffers.emplace_back(download_staging);
@@ -771,6 +780,65 @@ void BufferCache<P>::CommitAsyncFlushes() {
 template <class P>
 void BufferCache<P>::PopAsyncFlushes() {
     PopAsyncBuffers();
+}
+
+template <class P>
+void BufferCache<P>::PopAsyncFlushes(size_t count) {
+    if (count < 2) {
+        if (count) PopAsyncBuffers();
+        return;
+    }
+    struct Completed {
+        const Async_Buffer* buffer;
+        const boost::container::small_vector<BufferCopy, 4>* copies;
+    };
+    boost::container::small_vector<Completed, 16> completed;
+    auto copies = pending_downloads.begin();
+    for (size_t i = 0; i < count; ++i) {
+        if (async_buffers[i]) {
+            completed.push_back({&*async_buffers[i], &*copies++});
+        }
+    }
+    CompletedDownloadCoverage coverage;
+    u64 bytes_seen = 0;
+    u64 bytes_written = 0;
+    for (auto item = completed.rbegin(); item != completed.rend(); ++item) {
+        for (auto copy = item->copies->rbegin(); copy != item->copies->rend(); ++copy) {
+            const DAddr device_addr = static_cast<DAddr>(copy->src_offset);
+            const u8* source = item->buffer->mapped_span.data() + (copy->dst_offset - item->buffer->offset);
+            async_downloads.ForEachInRange(device_addr, copy->size, [&](DAddr start, DAddr end, s32) {
+                bytes_seen += end - start;
+                coverage.ForEachUncovered(start, end - start, [&](DAddr first, DAddr last) {
+                    device_memory.WriteBlockUnsafe(first, source + (first - device_addr), last - first);
+                    bytes_written += last - first;
+                });
+            });
+        }
+    }
+    // Retire every snapshot's tracking in the original order, including overwritten bytes.
+    for (size_t i = 0; i < count; ++i) {
+        if (async_buffers.front()) {
+            for (const auto& copy : pending_downloads.front()) {
+                async_downloads.Subtract(static_cast<DAddr>(copy.src_offset), copy.size,
+                    [&](DAddr start, DAddr end) { gpu_modified_ranges.Subtract(start, end - start); });
+            }
+            async_buffers_death_ring.emplace_back(*async_buffers.front());
+            pending_downloads.pop_front();
+        }
+        async_buffers.pop_front();
+    }
+    static const bool statistics = std::getenv("EDEN_NX2_DOWNLOAD_STATS") != nullptr;
+    if (statistics) {
+        static u64 seen{}, written{}, batches{};
+        static auto last = std::chrono::steady_clock::now();
+        seen += bytes_seen; written += bytes_written; ++batches;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last > std::chrono::seconds{10}) {
+            LOG_INFO(HW_GPU, "Completed download coalescing: batches={} input_bytes={} written_bytes={}", batches, seen, written);
+            seen = written = batches = 0;
+            last = now;
+        }
+    }
 }
 
 template <class P>
@@ -815,6 +883,12 @@ void BufferCache<P>::NoteCpuRead(DAddr addr, size_t size) {
     if (AsyncBufferDownloads()) {
         return;
     }
+    NoteCpuReadConcurrent(addr, size);
+}
+
+template <class P>
+void BufferCache<P>::NoteCpuReadConcurrent(DAddr addr, size_t size) {
+    std::scoped_lock history_lock{cpu_read_ranges_mutex};
     size_t covered = 0;
     cpu_read_ranges.ForEachInRange(addr, size, [&](DAddr start, DAddr end) { covered += end - start; });
     if (covered >= size) {
@@ -1140,7 +1214,7 @@ template <class P>
 void BufferCache<P>::PrepareGroupedStorage(std::span<const std::pair<Binding*, bool>> bindings,
                                            std::vector<MultiRangeSegment>& pool) {
     if constexpr (requires { runtime.UseGroupedStorage(); }) {
-        std::vector<StorageAddressRange> ranges;
+        boost::container::small_vector<StorageAddressRange, 16> ranges;
         ranges.reserve(bindings.size());
         for (const auto& [binding, written] : bindings) {
             if (binding->gpu_addr > std::numeric_limits<u64>::max() - binding->size)
@@ -1149,8 +1223,8 @@ void BufferCache<P>::PrepareGroupedStorage(std::span<const std::pair<Binding*, b
             binding->segment_count = binding->segment_offset = binding->segment_size = 0;
             binding->segment_written = false;
         }
-        std::vector<std::pair<VirtualSegments, bool>> physical_groups;
-        for (const auto& group : GroupStorageRanges(ranges)) {
+        boost::container::small_vector<std::pair<VirtualSegments, bool>, 4> physical_groups;
+        for (const auto& group : GroupStorageRanges(std::span{ranges.data(), ranges.size()})) {
             const u64 size = group.end - group.address;
             if (size > std::numeric_limits<u32>::max())
                 throw Shader::RuntimeError("Grouped storage range exceeds supported size");
@@ -1493,13 +1567,13 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
         }
         if constexpr (requires { runtime.UseGroupedStorage(); }) {
             if (runtime.UseGroupedStorage()) {
-                std::vector<std::pair<Binding*, bool>> bindings;
+                boost::container::small_vector<std::pair<Binding*, bool>, 16> bindings;
                 for (size_t stage = 0; stage < NUM_STAGES; ++stage)
                     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
                         bindings.emplace_back(&channel_state->storage_buffers[stage][index],
                             ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0);
                     });
-                PrepareGroupedStorage(bindings, graphics_segments);
+                PrepareGroupedStorage(std::span{bindings.data(), bindings.size()}, graphics_segments);
             }
         }
     });
@@ -1514,12 +1588,12 @@ void BufferCache<P>::DoUpdateComputeBuffers() {
         UpdateComputeTextureBuffers();
         if constexpr (requires { runtime.UseGroupedStorage(); }) {
             if (runtime.UseGroupedStorage()) {
-                std::vector<std::pair<Binding*, bool>> bindings;
+                boost::container::small_vector<std::pair<Binding*, bool>, 16> bindings;
                 ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
                     bindings.emplace_back(&channel_state->compute_storage_buffers[index],
                         ((channel_state->written_compute_storage_buffers >> index) & 1) != 0);
                 });
-                PrepareGroupedStorage(bindings, compute_segments);
+                PrepareGroupedStorage(std::span{bindings.data(), bindings.size()}, compute_segments);
             }
         }
     });
@@ -2184,6 +2258,33 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
 
 template <class P>
 void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64 size) {
+    const u64 requested_size = size;
+    static const bool statistics = std::getenv("EDEN_NATIVE_SYNC_READBACK_STATS") != nullptr;
+    static const u64 max_prefetch_request = [] {
+        const char* value = std::getenv("EDEN_NATIVE_READBACK_MAX_BYTES");
+        return value ? std::strtoull(value, nullptr, 10) : u64{Core::DEVICE_PAGESIZE};
+    }();
+    // Native indirect arguments are read a few words at a time. Download nearby
+    // GPU-modified ranges in the same buffer together, avoiding a queue wait for
+    // each argument. The existing download tracker still excludes CPU writes.
+    static const u64 native_window = [] {
+        const char* value = std::getenv("EDEN_NATIVE_READBACK_WINDOW_KIB");
+        const u64 kib = value ? std::strtoul(value, nullptr, 10) : 1024;
+        return kib == 64 || kib == 256 || kib == 1024 ? kib * 1024 : 0;
+    }();
+    if (native_window && gpu_memory && gpu_memory->UsesNativeTiling() && size <= max_prefetch_request &&
+        buffer.IsInBounds(device_addr, size) && IsRegionGpuModified(device_addr, size)) {
+        const auto begin = std::max(buffer.CpuAddr(), Common::AlignDown(device_addr, native_window));
+        const auto end = std::min(buffer.CpuAddr() + buffer.SizeBytes(),
+                                  Common::AlignUp(device_addr + size, native_window));
+        device_addr = begin;
+        size = end - begin;
+        static u32 logs{};
+        if (logs++ < 3) {
+            LOG_INFO(HW_GPU, "Native readback window: {} KiB, expanded device={:#x} size={}",
+                     native_window / 1024, device_addr, size);
+        }
+    }
     boost::container::small_vector<BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     u64 largest_copy = 0;
@@ -2213,7 +2314,50 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
         return;
     }
 
+    const auto report_wait = [&](std::chrono::steady_clock::time_point wait_begin) {
+        if (!statistics) return;
+        static std::array<u64, 5> requests{};
+        static std::array<u64, static_cast<size_t>(NativeReadbackReason::Count)> reason_requests{},
+            reason_bytes{}, reason_wait_ns{};
+        static u64 bytes{}, wait_ns{};
+        static auto report_begin = wait_begin;
+        const auto now = std::chrono::steady_clock::now();
+        ++requests[requested_size <= 64 ? 0 : requested_size <= 4096 ? 1 :
+                   requested_size <= 65536 ? 2 : requested_size <= 1048576 ? 3 : 4];
+        bytes += total_size_bytes;
+        wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(now - wait_begin).count();
+        const auto reason = static_cast<size_t>(native_readback_reason);
+        ++reason_requests[reason];
+        reason_bytes[reason] += total_size_bytes;
+        reason_wait_ns[reason] +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - wait_begin).count();
+        if (now - report_begin > std::chrono::seconds{10}) {
+            LOG_INFO(HW_GPU, "Native synchronous readbacks: <=64B={} <=4KiB={} <=64KiB={} <=1MiB={} larger={} bytes={} wait_ms={:.1f}",
+                requests[0], requests[1], requests[2], requests[3], requests[4], bytes, wait_ns / 1e6);
+            for (size_t origin = 0; origin < reason_requests.size(); ++origin) {
+                LOG_INFO(HW_GPU, "Native readback origin: origin={} requests={} bytes={} wait_ms={:.1f}",
+                    origin, reason_requests[origin], reason_bytes[origin], reason_wait_ns[origin] / 1e6);
+            }
+            reason_requests.fill(0); reason_bytes.fill(0); reason_wait_ns.fill(0);
+            requests.fill(0); bytes = wait_ns = 0; report_begin = now;
+        }
+    };
     if constexpr (USE_MEMORY_MAPS) {
+        if constexpr (requires { runtime.ReadMappedBuffer(buffer, std::span<const BufferCopy>{}); }) {
+            if (!buffer.MappedReadback().empty()) {
+                for (const auto& copy : copies) buffer.MarkUsage(copy.src_offset, copy.size);
+                const auto wait_begin = statistics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                const auto mapped = runtime.ReadMappedBuffer(buffer, std::span<const BufferCopy>{copies});
+                if (!mapped.empty()) {
+                    report_wait(wait_begin);
+                    for (const auto& copy : copies) {
+                        device_memory.WriteBlockUnsafe(buffer.CpuAddr() + copy.src_offset,
+                            mapped.data() + copy.src_offset, copy.size);
+                    }
+                    return;
+                }
+            }
+        }
         auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes);
         const u8* const mapped_memory = download_staging.mapped_span.data();
         const std::span<BufferCopy> copies_span(copies.data(), copies.data() + copies.size());
@@ -2223,7 +2367,9 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             buffer.MarkUsage(copy.src_offset, copy.size);
         }
         runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
+        const auto wait_begin = statistics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         runtime.Finish();
+        report_wait(wait_begin);
         for (const BufferCopy& copy : copies) {
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
             // Undo the modified offset
@@ -2312,6 +2458,23 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
 
 template <class P>
 u32 BufferCache<P>::MappedStoragePrefix(GPUVAddr gpu_addr, u32 size) const {
+    if (NativeSelectivePrefixCacheEnabled()) {
+        const u32 prefix = selective_prefixes.Query(gpu_memory->GetID(), gpu_addr, size, [&](GPUVAddr address, u32 bytes) {
+            if (gpu_memory->IsFullyMappedRange(address, bytes)) return bytes;
+            u32 mapped = 0;
+            for (const auto& [start, length] : gpu_memory->GetSubmappedRange(address, bytes)) {
+                if (start != address + mapped) break;
+                mapped += static_cast<u32>(length);
+            }
+            return mapped;
+        });
+        static const bool statistics = std::getenv("EDEN_NATIVE_PREFIX_CACHE_STATS") != nullptr;
+        if (statistics && ((selective_prefixes.Hits() + selective_prefixes.Walks() + selective_prefixes.RangeHits()) & 0x3ffff) == 1) {
+            LOG_INFO(HW_GPU, "Native selective prefix cache: hits={} walks={} invalidated={} intervals={}",
+                     selective_prefixes.Hits(), selective_prefixes.Walks(), selective_prefixes.Removed(), selective_prefixes.RangeHits());
+        }
+        return prefix;
+    }
     // Read before the walk: a mapping change during it leaves this entry stale, not wrong.
     const u64 generation = mapping_generation.load(std::memory_order_acquire);
     const u64 key = (static_cast<u64>(gpu_memory->GetID()) << 48) ^ gpu_addr;

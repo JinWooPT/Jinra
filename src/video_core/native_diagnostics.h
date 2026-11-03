@@ -9,6 +9,13 @@ inline bool NativeDrawDiagnosticsEnabled() {
     static const bool enabled = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
     return enabled;
 }
+inline bool NativeVerboseRuntimeDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NATIVE_VERBOSE_RUNTIME_LOGS");
+        return value && value[0] == '1';
+    }();
+    return enabled || NativeDrawDiagnosticsEnabled();
+}
 inline bool NativeFrameCaptureEnabled() {
     static const bool enabled = std::getenv("EDEN_NATIVE_FRAME_CAPTURE") != nullptr;
     return enabled;

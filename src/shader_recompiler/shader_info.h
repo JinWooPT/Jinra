@@ -350,6 +350,8 @@ struct Info {
     std::array<u32, MAX_CBUFS> constant_buffer_used_sizes{};
     u32 nvn_buffer_base{};
     std::bitset<16> nvn_buffer_used{};
+    u32 native_indirect_reset_cbuf{~0U};
+    u32 native_indirect_reset_offset{};
 
     bool requires_layer_emulation{};
     IR::Attribute emulated_layer{};

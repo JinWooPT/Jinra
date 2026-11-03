@@ -105,6 +105,10 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
 
         cmdbuf.EndRenderPass();
     });
+    // A later layer may flush during configuration, so stamp after the final draw.
+    for (auto& layer : layers) {
+        layer.MarkPresentUse(image_index);
+    }
 }
 
 VkDescriptorSetLayout WindowAdaptPass::GetDescriptorSetLayout() {

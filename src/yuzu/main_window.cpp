@@ -11,6 +11,7 @@
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
 #include "common/settings.h"
+#include "common/input_replay_clock.h"
 #include "common/settings_enums.h"
 #include "frontend_common/settings_generator.h"
 #include "render/performance_overlay.h"
@@ -22,6 +23,7 @@
 
 #include "common/fs/ryujinx_compat.h"
 #include "main_window.h"
+#include "yuzu/updater/jinra_updater.h"
 #include "network/network.h"
 #include "qt_common/discord/discord.h"
 #include "ui_main.h"
@@ -42,6 +44,7 @@
 #include "set_play_time_dialog.h"
 #include "util/util.h"
 #include "yuzu/game/game_list.h"
+#include "yuzu/jinra_home.h"
 
 #include "applets/qt_amiibo_settings.h"
 #include "applets/qt_controller.h"
@@ -359,6 +362,11 @@ inline static bool isDarkMode() {
 MainWindow::MainWindow(bool has_broken_vulkan)
     : ui{std::make_unique<Ui::MainWindow>()},
       input_subsystem{std::make_shared<InputCommon::InputSubsystem>()}, user_data_migrator{this} {
+    if (qEnvironmentVariableIsSet("EDEN_BACKGROUND_TEST")) {
+        setAttribute(Qt::WA_DontShowOnScreen);
+        setAttribute(Qt::WA_ShowWithoutActivating);
+        setWindowFlag(Qt::WindowDoesNotAcceptFocus);
+    }
     QtCommon::Init(this);
 
     Common::FS::CreateEdenPaths();
@@ -432,15 +440,11 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     show();
 
-#ifdef ENABLE_UPDATE_CHECKER
-    if (UISettings::values.check_for_updates) {
-        update_future = QtConcurrent::run(
-            []() -> std::optional<Common::Net::Release> { return UpdateChecker::GetUpdate(); });
-        update_watcher.connect(&update_watcher, &QFutureWatcher<QString>::finished, this,
-                               &MainWindow::OnEmulatorUpdateAvailable);
-        update_watcher.setFuture(update_future);
-    }
-#endif
+    auto* update_action = ui->menu_Help->addAction(tr("Check for updates..."));
+    auto* jinra_updater = new JinraUpdater(this, update_action,
+        [this] { return !emulation_running; }, [this] { OnSaveConfig(); close(); });
+    if (UISettings::values.check_for_updates)
+        QTimer::singleShot(5000, jinra_updater, [jinra_updater] { jinra_updater->Check(false); });
 
     // Setup content providers.
     QtCommon::SetupContentProviders();
@@ -921,11 +925,28 @@ void MainWindow::InitializeWidgets() {
 
     game_list = new GameList(QtCommon::vfs, QtCommon::provider.get(), *play_time_manager,
                              *QtCommon::system, this);
-    ui->horizontalLayout->addWidget(game_list);
-
     game_list_placeholder = new GameListPlaceholder(this);
-    ui->horizontalLayout->addWidget(game_list_placeholder);
     game_list_placeholder->setVisible(false);
+    jinra_home = new JinraHome(game_list, game_list_placeholder, input_subsystem.get(), this);
+    ui->horizontalLayout->addWidget(jinra_home);
+    connect(jinra_home, &JinraHome::AddDirectory, this, &MainWindow::OnGameListAddDirectory);
+    connect(jinra_home, &JinraHome::BootRequested, this, [this](const QString& path) {
+        BootGameFromList(path, StartGameType::Normal);
+    });
+    connect(jinra_home, &JinraHome::PropertiesRequested, this, [this](const QString& path) {
+        OnGameListOpenPerGameProperties(path.toStdString());
+    });
+    connect(jinra_home, &JinraHome::ConfigureRequested, this, [this](int category) {
+        jinra_configuration_category = category;
+        OnConfigure();
+        jinra_home->ReloadSettings();
+    });
+    connect(jinra_home, &JinraHome::LanguageRequested, this, &MainWindow::OnLanguageChanged);
+    connect(jinra_home, &JinraHome::SaveSettings, this, [this] {
+        QtCommon::system->ApplySettings();
+        UpdateStatusButtons();
+        OnSaveConfig();
+    });
 
     loading_screen = new LoadingScreen(this);
     loading_screen->hide();
@@ -1217,7 +1238,7 @@ void MainWindow::InitializeWidgets() {
 
     statusBar()->insertPermanentWidget(0, refresh_button);
 
-    statusBar()->setVisible(true);
+    statusBar()->setVisible(false);
     setStyleSheet(QStringLiteral("QStatusBar::item{border: none;}"));
 }
 
@@ -1392,7 +1413,7 @@ void MainWindow::RestoreUIState() {
     game_list->SetFilterVisible(ui->action_Show_Filter_Bar->isChecked());
 
     ui->action_Show_Status_Bar->setChecked(UISettings::values.show_status_bar.GetValue());
-    statusBar()->setVisible(ui->action_Show_Status_Bar->isChecked());
+    statusBar()->setVisible(emulation_running && ui->action_Show_Status_Bar->isChecked());
 
     ui->action_Show_Performance_Overlay->setChecked(
         UISettings::values.show_perf_overlay.GetValue());
@@ -1996,7 +2017,10 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
 
     // Update the GUI
     UpdateStatusButtons();
+    jinra_home->SetEmulating(true);
+    statusBar()->setVisible(ui->action_Show_Status_Bar->isChecked());
     if (ui->action_Single_Window_Mode->isChecked()) {
+        jinra_home->hide();
         game_list->hide();
         game_list_placeholder->hide();
     }
@@ -2152,6 +2176,9 @@ void MainWindow::OnEmulationStopped() {
     render_window->hide();
     loading_screen->hide();
     loading_screen->Clear();
+    jinra_home->SetEmulating(false);
+    statusBar()->hide();
+    jinra_home->show();
     if (game_list->IsEmpty()) {
         game_list_placeholder->show();
     } else {
@@ -3267,7 +3294,7 @@ void MainWindow::HideFullscreen() {
             show();
         }
 
-        statusBar()->setVisible(ui->action_Show_Status_Bar->isChecked());
+        statusBar()->setVisible(emulation_running && ui->action_Show_Status_Bar->isChecked());
         ui->menubar->show();
     } else {
         if (UsingExclusiveFullscreen()) {
@@ -3292,6 +3319,7 @@ void MainWindow::ToggleWindowMode() {
         if (emulation_running) {
             render_window->setVisible(true);
             render_window->setFocus();
+            jinra_home->hide();
             game_list->hide();
         }
 
@@ -3303,6 +3331,7 @@ void MainWindow::ToggleWindowMode() {
         if (emulation_running) {
             render_window->setVisible(true);
             render_window->RestoreGeometry();
+            jinra_home->show();
             game_list->show();
         }
     }
@@ -3413,6 +3442,8 @@ void MainWindow::OnConfigure() {
     connect(&configure_dialog, &ConfigureDialog::ExternalContentDirsChanged, this,
             &MainWindow::OnGameListRefresh);
 
+    configure_dialog.SelectCategory(jinra_configuration_category);
+    jinra_configuration_category = 0;
     const auto result = configure_dialog.exec();
     if (result != QDialog::Accepted && !UISettings::values.configuration_applied &&
         !UISettings::values.reset_to_defaults) {
@@ -3882,7 +3913,7 @@ void MainWindow::OnToggleFilterBar() {
 }
 
 void MainWindow::OnToggleStatusBar() {
-    statusBar()->setVisible(ui->action_Show_Status_Bar->isChecked());
+    statusBar()->setVisible(emulation_running && ui->action_Show_Status_Bar->isChecked());
 }
 
 void MainWindow::OnTogglePerfOverlay() {
@@ -4095,7 +4126,7 @@ void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view
 
     const auto override_title =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
-    const auto window_title = override_title.empty() ? yuzu_title : override_title;
+    const std::string window_title = "Jinra";
 
     if (title_name.empty()) {
         setWindowTitle(QString::fromStdString(window_title));
@@ -4178,6 +4209,12 @@ void MainWindow::UpdateStatusBar() {
     auto results = QtCommon::system->GetAndResetPerfStats();
     auto& shader_notify = QtCommon::system->GPU().ShaderNotify();
     const int shaders_building = shader_notify.ShadersBuilding();
+    if (qEnvironmentVariableIsSet("EDEN_MEASURE_PERF") || qEnvironmentVariableIsSet("EDEN_NX2_GPU_PROFILE")) {
+        LOG_INFO(Frontend, "Measured performance: fps={:.3f} system_fps={:.3f} frame_ms={:.3f} speed={:.3f} shaders={} bench_time={:.3f} frames={}",
+                 results.average_game_fps, results.system_fps, results.frametime * 1000.0,
+                 results.emulation_speed, shaders_building, Common::InputReplay::Time(),
+                 Common::InputReplay::frames.load(std::memory_order_relaxed));
+    }
 
     emit statsUpdated(results, shader_notify);
 
@@ -4673,7 +4710,7 @@ void MainWindow::UpdateUITheme() {
 #endif
 
     if (current_theme != default_theme) {
-        QString theme_uri{QStringLiteral(":%1/style.qss").arg(current_theme)};
+        QString theme_uri{current_theme == QStringLiteral("jinra") ? QStringLiteral(":/jinra/style.qss") : QStringLiteral(":%1/style.qss").arg(current_theme)};
         QFile f(theme_uri);
         if (!f.open(QFile::ReadOnly | QFile::Text)) {
             LOG_ERROR(Frontend, "Unable to open style \"{}\", fallback to the default theme",
@@ -4682,7 +4719,7 @@ void MainWindow::UpdateUITheme() {
         }
     }
 
-    QString theme_uri{QStringLiteral(":%1/style.qss").arg(current_theme)};
+    QString theme_uri{current_theme == QStringLiteral("jinra") ? QStringLiteral(":/jinra/style.qss") : QStringLiteral(":%1/style.qss").arg(current_theme)};
     QFile f(theme_uri);
     if (f.open(QFile::ReadOnly | QFile::Text)) {
         QTextStream ts(&f);

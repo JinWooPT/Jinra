@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <bit>
+#include <bitset>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -9,11 +10,22 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <random>
 #include <unordered_map>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/buffer_cache/storage_range_groups.h"
+#include "video_core/buffer_cache/download_copy_batches.h"
+#include "video_core/buffer_cache/reusable_storage_batch.h"
+#include "video_core/buffer_cache/completed_download_coverage.h"
+#include "video_core/buffer_cache/mapped_prefix_cache.h"
+#include "video_core/buffer_cache/usage_tracker.h"
+#include "video_core/packed_page_probe.h"
+#include "video_core/native_semaphore.h"
+#include "video_core/native_cpu_read_window.h"
+#include "video_core/native_readback_epoch.h"
+#include "video_core/native_method_batch.h"
 #include "video_core/shader_environment.h"
 #include "video_core/buffer_cache/storage_buffer_size.h"
 #include "shader_recompiler/environment.h"
@@ -442,6 +454,8 @@ struct ScalarNativeMachine {
                 result = std::isnan(a) || std::isnan(b) || a == b;
                 break;
             }
+            case IR::Opcode::FPOrdEqual16:
+                result = DecodeTestHalf(static_cast<u16>(arg(0))) == DecodeTestHalf(static_cast<u16>(arg(1))); break;
             case IR::Opcode::FPOrdEqual32: result = std::bit_cast<float>(static_cast<u32>(arg(0))) == std::bit_cast<float>(static_cast<u32>(arg(1))); break;
             case IR::Opcode::FPOrdLessThanEqual32: result = std::bit_cast<float>(static_cast<u32>(arg(0))) <= std::bit_cast<float>(static_cast<u32>(arg(1))); break;
             case IR::Opcode::FPOrdGreaterThanEqual32: result = std::bit_cast<float>(static_cast<u32>(arg(0))) >= std::bit_cast<float>(static_cast<u32>(arg(1))); break;
@@ -671,6 +685,57 @@ TEST_CASE("Native lowering rejects unsupported forms without a partial executabl
     REQUIRE(result.instructions.empty());
     REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell({}));
     REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(std::span{VertexTransform}.first(6)));
+}
+
+TEST_CASE("Geometry passthrough compiles every component of the last generic vector", "[native-shader]") {
+    const auto lowered = Shader::Ampere::LowerToMaxwell(std::span{VertexTransform}.last(1));
+    REQUIRE(lowered);
+    std::vector<u64> code(0x50 / 8);
+    for (const u64 word : lowered.instructions) {
+        if ((code.size() * 8) % 32 == 0) code.push_back(0);
+        code.push_back(word);
+    }
+    code.push_back(0);
+    class PassthroughEnvironment final : public EmptyEnvironment {
+    public:
+        explicit PassthroughEnvironment(const std::vector<u64>& code_) : code{code_} {
+            stage = Shader::Stage::Geometry;
+            sph.common0.geometry_passthrough.Assign(1);
+            sph.common2.threads_per_input_primitive.Assign(1);
+            sph.common3.output_topology.Assign(Shader::OutputTopology::TriangleStrip);
+            sph.common4.max_output_vertices.Assign(1);
+            gp_passthrough_mask.fill(~u32{0});
+            for (const auto base : {IR::Attribute::PositionX, IR::Attribute::Generic31X}) {
+                for (u32 component = 0; component < 4; ++component) {
+                    const u32 bit = static_cast<u32>(base) + component;
+                    gp_passthrough_mask[bit / 32] &= ~(u32{1} << (bit % 32));
+                }
+            }
+        }
+        u64 ReadInstruction(u32 address) override { return code.at(address / 8); }
+        const std::vector<u64>& code;
+    } env{code};
+    Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+    Shader::ObjectPool<IR::Inst> inst_pool;
+    Shader::ObjectPool<IR::Block> block_pool;
+    Shader::Maxwell::Flow::CFG cfg{env, flow_pool, 0x50};
+    Shader::HostTranslateInfo host;
+    host.support_geometry_shader_passthrough = false;
+    auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
+    REQUIRE(program.output_vertices == 3);
+    REQUIRE(program.info.loads.Generic(31));
+    REQUIRE(program.info.stores.Generic(31));
+    Shader::Profile profile;
+    profile.supported_spirv = 0x00010300;
+    profile.support_geometry_streams = true;
+    Shader::RuntimeInfo runtime;
+    runtime.input_topology = Shader::InputTopology::Triangles;
+    runtime.previous_stage_stores.mask.set();
+    Shader::Backend::Bindings bindings;
+    std::vector<u32> binary;
+    REQUIRE_NOTHROW(binary = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings));
+    REQUIRE(binary.size() > 5);
+    REQUIRE(binary.front() == 0x07230203);
 }
 
 
@@ -8806,6 +8871,31 @@ TEST_CASE("Native packed half predicates retain unordered thresholds and indepen
     REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
 }
 
+TEST_CASE("Bananza register half predicate compares both source lanes before updating its accumulator", "[native-shader]") {
+    const std::array<Native, 2> input{{
+        {{0x34007234, 0x30000034, 0x00702800, 0x000fe400}}, VertexTransform.back()}};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    const bool accumulator = GENERATE(false, true);
+    const std::array<u16, 9> halves{0, 0x8000, 0x3c00, 0xbc00, 0x7c00, 0xfc00, 0x7e01, 0xfe01, 1};
+    for (u16 low : halves) for (u16 high : halves) {
+        ScalarNativeMachine machine;
+        machine.regs.fill(0x12345678);
+        machine.regs[52] = low | (u32{high} << 16);
+        machine.predicates = {accumulator, true, false, true, false, true, false};
+        const auto original_regs = machine.regs;
+        auto expected = machine.predicates;
+        expected[0] = accumulator && DecodeTestHalf(low) == DecodeTestHalf(high);
+        machine.Execute(block);
+        REQUIRE(machine.predicates == expected);
+        REQUIRE(machine.regs == original_regs);
+    }
+    auto invalid = input;
+    invalid[0].words[2] |= 1;
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+}
+
 TEST_CASE("Native integer multiply preserves negated uniform operands and wrapping addends", "[native-shader]") {
     const bool uniform_addend = GENERATE(false, true);
     const u32 destination = GENERATE(0U, 1U, 5U);
@@ -9195,6 +9285,64 @@ TEST_CASE("Native pointer tracing rejects a nearer additive stride", "[native-sh
     for (const auto& inst : block.Instructions()) REQUIRE(inst.GetOpcode() != IR::Opcode::LoadGlobal32);
 }
 
+TEST_CASE("Native indirect argument initialization recognizes only the complete pointer table kernel", "[native-shader][native-indirect-reset]") {
+    class ResetEnvironment final : public EmptyEnvironment {
+    public:
+        ResetEnvironment(bool native, Shader::Stage shader_stage) : native_(native) { stage = shader_stage; }
+        bool HasNativeRegisterCopies() const override { return native_; }
+        bool IsCbufStorageBufferPointer(u32 bank, u32 offset) override { return bank == 0 && offset == 0x110; }
+    private:
+        bool native_;
+    };
+    for (u32 scenario = 0; scenario < 18; ++scenario) {
+        CAPTURE(scenario);
+        ResetEnvironment env{scenario != 9, scenario == 10 ? Shader::Stage::Compute : Shader::Stage::VertexB};
+        Shader::ObjectPool<IR::Inst> pool;
+        IR::Block block{pool};
+        IR::Block extra{pool};
+        IR::IREmitter ir{block};
+        if (scenario == 14) ir.DeviceMemoryBarrier();
+        const auto base = ir.GetCbuf(ir.Imm32(0U), ir.Imm32(0x110U));
+        const auto high = ir.GetCbuf(ir.Imm32(0U), ir.Imm32(scenario == 5 ? 0x118U : 0x114U));
+        const auto vertex = ir.GetAttributeU32(scenario == 2 ? IR::Attribute::InstanceId : IR::Attribute::VertexId);
+        const IR::U32 bytes{ir.ShiftLeftLogical(vertex, ir.Imm32(scenario == 3 ? 2U : 3U))};
+        const IR::U32 low{ir.IAdd(base, bytes)};
+        const IR::U32 carry{ir.Select(ir.ILessThan(low, base, false), ir.Imm32(1U), ir.Imm32(0U))};
+        const IR::U32 upper = scenario == 4 ? high : IR::U32{ir.IAdd(high, carry)};
+        const IR::U32 table_low = scenario == 15 ? IR::U32{ir.IAdd(low, ir.Imm32(0U))} : low;
+        const auto table = ir.PackUint2x32(ir.CompositeConstruct(table_low, upper));
+        const auto pointer = ir.LoadGlobal64(table);
+        const auto target = ir.PackUint2x32(ir.CompositeConstruct(ir.CompositeExtract(pointer, 0), ir.CompositeExtract(pointer, 1)));
+        const auto other = ir.LoadGlobal64(table);
+        for (u32 field = 0; field < (scenario == 6 ? 4U : 5U); ++field) {
+            const IR::U32 value = scenario == 8 && field == 0 ? ir.GetReg(IR::Reg::R1) :
+                ir.Imm32(field == 1 ? (scenario == 1 ? 2U : 1U) : 0U);
+            auto address = target;
+            if (scenario == 12 && field == 4) {
+                address = ir.PackUint2x32(ir.CompositeConstruct(ir.CompositeExtract(pointer, 0), ir.CompositeExtract(other, 1)));
+            }
+            ir.WriteGlobal32(IR::U64{ir.IAdd(address, ir.Imm64(u64{field} * 4))}, value);
+        }
+        if (scenario == 7) ir.WriteGlobal32(target, ir.Imm32(0U));
+        if (scenario == 11) ir.WorkgroupMemoryBarrier();
+        if (scenario >= 16) {
+            ir.SetAttribute(scenario == 16 ? IR::Attribute::PositionX : IR::Attribute::Generic0X,
+                            ir.Imm32(1.0f), ir.Imm32(0U));
+        }
+        IR::Program program;
+        program.stage = env.ShaderStage();
+        program.blocks = {&block};
+        program.post_order_blocks = {&block};
+        if (scenario == 13) program.post_order_blocks.push_back(&extra);
+        if (scenario == 15) Shader::Optimization::ConstantPropagationPass(env, program);
+        Shader::HostTranslateInfo host;
+        Shader::Optimization::GlobalMemoryToStorageBufferPass(env, program, host);
+        const bool valid_reset = scenario == 0 || scenario == 14 || scenario == 15;
+        REQUIRE((program.info.native_indirect_reset_cbuf != ~0U) == valid_reset);
+        if (valid_reset) REQUIRE(program.info.native_indirect_reset_offset == 0x110);
+    }
+}
+
 TEST_CASE("Native storage pointer classifications survive shader cache serialization", "[native-shader]") {
     class CacheEnvironment final : public VideoCommon::GenericEnvironment {
     public:
@@ -9235,6 +9383,42 @@ TEST_CASE("Native storage pointer classifications survive shader cache serializa
     REQUIRE(restored.ReadCbufValue(0, 0x168) == 0x12340000);
     REQUIRE(restored.WorkgroupSize() == std::array<u32, 3>{32, 2, 1});
     REQUIRE(restored.SharedMemorySize() == 4096);
+}
+
+TEST_CASE("Native floating selection applies source signs before choosing a value", "[native-shader][native-fsel]") {
+    const u32 form = GENERATE(1U, 4U, 5U);
+    const u32 destination = GENERATE(0U, 2U, 4U);
+    for (u32 modifiers = 0; modifiers < 16; ++modifiers) {
+        if (form == 4 && (modifiers & 12)) continue; // the immediate already contains its sign
+        for (bool predicate : {false, true}) for (bool inverted : {false, true}) {
+            const u32 b = form == 1 ? 2U : form == 4 ? std::bit_cast<u32>(-0.5f) : 0x00c04000U;
+            const std::array<Native, 2> code{{
+                {{(form << 9) | 8U | 0x7000U | (destination << 16),
+                  b | ((form != 4 && (modifiers & 4)) ? 1U << 30 : 0U) |
+                      ((form != 4 && (modifiers & 8)) ? 1U << 31 : 0U),
+                  ((modifiers & 1) ? 1U << 9 : 0U) | ((modifiers & 2) ? 1U << 8 : 0U) |
+                      (inverted ? 1U << 26 : 0U), 0}},
+                VertexTransform.back(),
+            }};
+            Shader::ObjectPool<IR::Inst> pool;
+            IR::Block block{pool};
+            TranslateScalarNative(code, block);
+            ScalarNativeMachine machine;
+            machine.regs[0] = std::bit_cast<u32>(-1.75f);
+            machine.regs[2] = std::bit_cast<u32>(-2.5f);
+            machine.constants[(u64{3} << 32) | 0x100U] = std::bit_cast<u32>(-3.25f);
+            machine.predicates[0] = predicate;
+            float a = (modifiers & 1) ? 1.75f : -1.75f;
+            if (modifiers & 2) a = -a;
+            float selected_b = form == 1 ? -2.5f : form == 4 ? -0.5f : -3.25f;
+            if (modifiers & 4) selected_b = std::abs(selected_b);
+            if (modifiers & 8) selected_b = -selected_b;
+            const float expected = predicate != inverted ? a : selected_b;
+            machine.Execute(block);
+            CAPTURE(form, destination, modifiers, predicate, inverted);
+            REQUIRE(machine.regs[destination] == std::bit_cast<u32>(expected));
+        }
+    }
 }
 
 TEST_CASE("Native half matrix rounding matches measured hardware fragments", "[native-shader]") {
@@ -9292,4 +9476,697 @@ TEST_CASE("Native half matrix rounding matches measured hardware fragments", "[n
         INFO("depth=" << depth << " lane=" << lane << " fragment=" << fragment);
         REQUIRE(registers[lane][32 + fragment] == hardware[depth == 16][lane * 2 + fragment]);
     }
+}
+
+TEST_CASE("Storage range grouping retains members across inline capacity changes", "[native-shader][storage-range-capacity]") {
+    std::vector<VideoCommon::StorageAddressRange> ranges;
+    for (u32 i = 0; i < 20; ++i) ranges.push_back({0x100000ULL + i * 0x1000, 16});
+    for (u32 i = 0; i < 40; ++i) ranges.push_back({0x1000ULL + i * 8, 16});
+    const auto groups = VideoCommon::GroupStorageRanges(ranges);
+    REQUIRE(groups.size() == 21);
+    REQUIRE(groups[0].address == 0x1000);
+    REQUIRE(groups[0].end == 0x1000 + 39 * 8 + 16);
+    REQUIRE(groups[0].members.size() == 40);
+    for (size_t i = 0; i < 40; ++i) REQUIRE(groups[0].members[i] == 20 + i);
+    for (size_t i = 0; i < 20; ++i) {
+        REQUIRE(groups[i+1].address == 0x100000 + i * 0x1000);
+        REQUIRE(groups[i+1].members.size() == 1);
+        REQUIRE(groups[i+1].members[0] == i);
+    }
+}
+
+TEST_CASE("Native CPU read windows cover scalar loads and expand sequential streams", "[native-cpu-read-window]") {
+    for (const u64 line : {64ULL, 256ULL, 512ULL}) {
+        VideoCommon::NativeCpuReadWindow policy;
+        auto area = policy.Select(0x1004, 4, line, 4096);
+        REQUIRE(area.first == 0x1000);
+        REQUIRE(area.end == 0x1000 + line);
+        for (u64 i = 1; i < 4; ++i) {
+            area = policy.Select(0x1000 + i * line, 4, line, 4096);
+            REQUIRE(area.first <= 0x1000 + i * line);
+            REQUIRE(area.end >= 0x1004 + i * line);
+        }
+        REQUIRE(area.first == 0x1000);
+        REQUIRE(area.end == 0x2000);
+        area = policy.Select(0x2fff, 8, line, 4096);
+        REQUIRE(area.first == 0x2000);
+        REQUIRE(area.end == 0x4000);
+        area = policy.Select(0x4008, 16, line, 4096);
+        REQUIRE(area.first == 0x4000);
+        REQUIRE(area.end == 0x5000);
+    }
+}
+
+TEST_CASE("Native CPU read history and reactive first reads preserve GPU bytes", "[native-cpu-read-coherence]") {
+    constexpr u64 base = 0x100000;
+    for (const u64 line : {64ULL, 256ULL, 512ULL}) {
+        VideoCommon::NativeCpuReadWindow policy;
+        VideoCommon::NativeCpuReadArea current{};
+        std::array<u8, 8192> gpu{}, cpu{};
+        std::array<bool, 8192> history{}, dirty{};
+        for (u64 frame = 0; frame < 32; ++frame) {
+            // Completed GPU writes: only previously visited hints are copied at the fence.
+            for (size_t byte = 0; byte < gpu.size(); ++byte) {
+                gpu[byte] = static_cast<u8>((frame * 31 + byte * 7) & 255);
+                dirty[byte] = true;
+                if (history[byte]) { cpu[byte] = gpu[byte]; dirty[byte] = false; }
+            }
+            for (u64 read = 0; read < 32; ++read) {
+                const u64 offset = (frame * 131 + read * 257) % (gpu.size() - 8);
+                const u64 address = base + offset;
+                const u64 bytes = read & 1 ? 8 : 4;
+                if (!(current.first <= address && address + bytes <= current.end)) {
+                    current = policy.Select(address, bytes, line, 4096);
+                    REQUIRE(current.first <= address);
+                    REQUIRE(current.end >= address + bytes);
+                    bool needs_flush = false;
+                    for (u64 byte = current.first - base; byte < current.end - base; ++byte) {
+                        needs_flush |= dirty[byte];
+                        history[byte] = true;
+                    }
+                    if (needs_flush) {
+                        for (u64 byte = current.first - base; byte < current.end - base; ++byte) {
+                            cpu[byte] = gpu[byte]; dirty[byte] = false;
+                        }
+                    }
+                }
+                for (u64 byte = offset; byte < offset + bytes; ++byte) REQUIRE(cpu[byte] == gpu[byte]);
+            }
+        }
+    }
+}
+
+TEST_CASE("Native method batches preserve register reads, execution state and shadow transitions", "[native-method-batch]") {
+    struct Engine {
+        enum : u32 { ShadowControl = 64, Execute = 65 };
+        std::array<u32, 128> registers{}, shadow{};
+        std::bitset<128> execution_mask;
+        std::vector<std::pair<u32, u32>> method_sink;
+        std::vector<std::array<u32, 128>> executions;
+        u32 mode = 2;
+        size_t calls{};
+
+        Engine() { execution_mask.set(Execute); }
+        void StateWrite(u32 method, u32 value, u32 control) {
+            if (control <= 1) shadow[method] = value;
+            else if (control == 3) value = shadow[method];
+            registers[method] = value;
+        }
+        void CallMethod(u32&, u32 method, u32 value, bool) {
+            ++calls;
+            if (method == ShadowControl) {
+                mode = value;
+                shadow[method] = registers[method] = value;
+                return;
+            }
+            StateWrite(method, value, mode);
+            if (method == Execute) executions.push_back(registers);
+        }
+        void ConsumeSink(u32&) {
+            const u32 control = mode;
+            for (const auto& [method, value] : method_sink) StateWrite(method, value, control);
+            method_sink.clear();
+        }
+        u32 GetRegisterValue(u32 method) const { return registers[method]; }
+    };
+    Engine immediate, batched;
+    u32 system{}, random = 0xa519b3;
+    const auto next = [&] {
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        return random;
+    };
+    for (size_t step = 0; step < 10000; ++step) {
+        if (next() % 8 == 0) {
+            const u32 method = next() % 64;
+            REQUIRE(VideoCommon::ReadNativeMethodRegister(batched, system, method, true) ==
+                    immediate.GetRegisterValue(method));
+            continue;
+        }
+        u32 method = next() % 64;
+        u32 value = next();
+        if (step % 97 == 0) {
+            method = Engine::ShadowControl;
+            value %= 4;
+        } else if (step % 19 == 0) {
+            method = Engine::Execute;
+        }
+        VideoCommon::EmitNativeMethod(immediate, system, method, value, Engine::ShadowControl, false);
+        VideoCommon::EmitNativeMethod(batched, system, method, value, Engine::ShadowControl, true);
+        if (method >= Engine::ShadowControl) {
+            REQUIRE(batched.method_sink.empty());
+            REQUIRE(batched.registers == immediate.registers);
+            REQUIRE(batched.shadow == immediate.shadow);
+        }
+    }
+    batched.ConsumeSink(system);
+    REQUIRE(batched.registers == immediate.registers);
+    REQUIRE(batched.shadow == immediate.shadow);
+    REQUIRE(batched.executions == immediate.executions);
+    REQUIRE(batched.calls < immediate.calls / 2);
+}
+
+TEST_CASE("Mapped prefixes survive unrelated mapping changes and refresh overlapping queries", "[mapped-prefix-invalidation]") {
+    VideoCommon::MappedPrefixCache cache;
+    u32 prefix = 128, probes = 0;
+    const auto query = [&] { return cache.Query(0, 0x1000, 256, [&](u64, u32) { ++probes; return prefix; }); };
+    REQUIRE(query() == 128);
+    REQUIRE(query() == 128);
+    REQUIRE(probes == 1);
+    cache.Invalidate(1, 0x1000, 256);
+    cache.Invalidate(0, 0x1100, 1);
+    cache.Invalidate(0, 0xff0, 16);
+    cache.Invalidate(0, 0x1000, 0);
+    REQUIRE(query() == 128);
+    REQUIRE(probes == 1);
+    prefix = 256;
+    cache.Invalidate(0, 0x10f0, 1);
+    REQUIRE(query() == 256);
+    REQUIRE(probes == 2);
+    prefix = 0;
+    cache.Invalidate(0, 0x1000, 1);
+    REQUIRE(query() == 0);
+    REQUIRE(probes == 3);
+    for (size_t i = 0; i <= cache.MAX_DEFERRED; ++i) cache.Invalidate(9, 0x8000 + i * 4096, 1);
+    REQUIRE(query() == 0);
+    REQUIRE(probes == 4);
+
+    VideoCommon::MappedPrefixCache during_walk;
+    REQUIRE(during_walk.Query(0, 0x1000, 256, [&](u64, u32) {
+        during_walk.Invalidate(0, 0x1000, 256);
+        return 0U;
+    }) == 0);
+    REQUIRE(during_walk.Query(0, 0x1000, 256, [](u64, u32) { return 256U; }) == 256);
+}
+
+TEST_CASE("Mapped prefix cache matches mapping walks across two changing address spaces", "[mapped-prefix-invalidation]") {
+    VideoCommon::MappedPrefixCache cache{GENERATE(false, true)};
+    std::array<std::array<bool, 32>, 2> pages;
+    for (auto& address_space : pages) address_space.fill(true);
+    u32 random = 0xa8123;
+    const auto next = [&] {
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        return random;
+    };
+    const auto walk = [&](size_t as_id, u64 address, u32 size) {
+        u32 prefix = 0;
+        while (prefix < size) {
+            const u64 current = address + prefix;
+            if (!pages[as_id][current / 4096]) break;
+            prefix += (std::min)(size - prefix, static_cast<u32>(4096 - (current % 4096)));
+        }
+        return prefix;
+    };
+    for (size_t step = 0; step < 800; ++step) {
+        const size_t as_id = next() % pages.size();
+        const size_t page = next() % pages[0].size();
+        pages[as_id][page] = !pages[as_id][page];
+        cache.Invalidate(as_id, page * 4096, 4096);
+        for (size_t query = 0; query < 20; ++query) {
+            const size_t read_as = next() % pages.size();
+            const u64 address = (next() % 24) * 4096 + (next() % 4) * 128;
+            const u32 size = (next() % 4 + 1) * 4096;
+            const u32 expected = walk(read_as, address, size);
+            REQUIRE(cache.Query(read_as, address, size, [&](u64 start, u32 bytes) { return walk(read_as, start, bytes); }) == expected);
+        }
+    }
+}
+
+TEST_CASE("Mapped intervals reuse overlapping queries and probe only unknown suffixes", "[mapped-prefix-invalidation]") {
+    VideoCommon::MappedPrefixCache cache{true};
+    std::vector<std::pair<u64, u32>> probes;
+    bool hole = false;
+    const auto probe = [&](u64 address, u32 size) {
+        probes.emplace_back(address, size);
+        if (hole && address < 0x1500 && address + size > 0x1400) {
+            return address >= 0x1400 ? 0U : static_cast<u32>(0x1400 - address);
+        }
+        return size;
+    };
+    REQUIRE(cache.Query(0, 0x1000, 0x1000, probe) == 0x1000);
+    REQUIRE(cache.Query(0, 0x1100, 0x700, probe) == 0x700);
+    REQUIRE(probes.size() == 1);
+    REQUIRE(cache.Query(0, 0x1800, 0x1000, probe) == 0x1000);
+    REQUIRE(probes.back() == std::pair<u64, u32>{0x2000, 0x800});
+    hole = true;
+    cache.Invalidate(0, 0x1400, 0x100);
+    REQUIRE(cache.Query(0, 0x1300, 0x400, probe) == 0x100);
+    REQUIRE(probes.back() == std::pair<u64, u32>{0x1400, 0x300});
+    const size_t calls = probes.size();
+    REQUIRE(cache.Query(0, 0x1600, 0x800, probe) == 0x800);
+    REQUIRE(probes.size() == calls);
+    REQUIRE(cache.Query(1, 0x1600, 0x800, probe) == 0x800);
+    REQUIRE(probes.size() == calls + 1);
+    hole = false;
+    cache.Invalidate(0, 0x1400, 0x100);
+    REQUIRE(cache.Query(0, 0x1300, 0x400, probe) == 0x400);
+    REQUIRE(cache.Query(0, 0x1000, 0x1800, probe) == 0x1800);
+    REQUIRE(probes.back() == std::pair<u64, u32>{0x1400, 0x300});
+    const size_t before_eviction = probes.size();
+    for (u64 i = 0; i < cache.MAX_ENTRIES + 2; ++i) {
+        REQUIRE(cache.Query(0, 0x1000 + i, 1, probe) == 1);
+    }
+    REQUIRE(probes.size() == before_eviction);
+    cache.Invalidate(0, 0x1000, 0x1800);
+    REQUIRE(cache.Query(0, 0x1100, 0x200, [&](u64, u32) {
+        cache.Invalidate(0, 0x1100, 0x200);
+        return 0x200U;
+    }) == 0x200);
+    REQUIRE(cache.Query(0, 0x1100, 0x100, [](u64, u32) { return 0U; }) == 0);
+}
+
+TEST_CASE("Native reactive read hints invalidate after writes and retain the pre-read epoch", "[native-readback-epoch]") {
+    VideoCommon::NativeReadbackEpoch epoch;
+    std::array<VideoCommon::NativeReadbackHint, 3> hints;
+    std::array<u8, 16384> gpu{}, cpu{};
+    u32 random = 0x381ca91;
+    const auto next = [&] { random = random * 1664525U + 1013904223U; return random; };
+    size_t refreshed = 0;
+    for (size_t step = 0; step < 400; ++step) {
+        const size_t write = next() % (gpu.size() - 32);
+        for (size_t byte = write; byte < write + 32; ++byte) gpu[byte] = static_cast<u8>(next());
+        epoch.Invalidate();
+        for (size_t core = 0; core < hints.size(); ++core) {
+            const size_t address = core == 0 ? write : next() % (gpu.size() - 32);
+            const size_t bytes = core == 2 ? 32 : 4;
+            const u64 observed = epoch.Observe();
+            auto& hint = hints[core];
+            if (!hint.Contains(address, bytes, observed)) {
+                ++refreshed;
+                const size_t first = address & ~size_t{4095};
+                const size_t end = (address + bytes + 4095) & ~size_t{4095};
+                std::copy(gpu.begin() + first, gpu.begin() + end, cpu.begin() + first);
+                hint.Remember(first, end, observed);
+            }
+            for (size_t byte = address; byte < address + bytes; ++byte) REQUIRE(cpu[byte] == gpu[byte]);
+            REQUIRE(hint.Contains(address, bytes, epoch.Observe()));
+            REQUIRE_FALSE(hint.Contains(address, std::numeric_limits<u64>::max(), epoch.Observe()));
+        }
+    }
+    REQUIRE(refreshed == 400 * hints.size());
+    const u64 before = epoch.Observe();
+    epoch.Invalidate();
+    hints[0].Remember(0, 4096, before);
+    REQUIRE_FALSE(hints[0].Contains(0, 4, epoch.Observe()));
+}
+
+TEST_CASE("Native pending channels retain blocked work and resume dependency chains", "[native-channel-progress]") {
+    const std::array<size_t, 3> channels{2, 1, 0};
+    std::array<u32, 3> values{};
+    std::array<bool, 3> pending{true, true, true};
+    std::vector<size_t> dispatched;
+    const auto ready = [&](size_t channel) {
+        return pending[channel] && Tegra::NativeSemaphoreWait{0, 1, 1}.Matches(values[channel]);
+    };
+    const auto dispatch = [&](size_t channel) {
+        REQUIRE(ready(channel));
+        dispatched.push_back(channel);
+        pending[channel] = false;
+        if (channel + 1 < values.size()) values[channel + 1] = 1;
+    };
+    REQUIRE(Tegra::ResumeReadyNativeChannels(channels, ready, dispatch) == 0);
+    REQUIRE(dispatched.empty());
+    REQUIRE(std::all_of(pending.begin(), pending.end(), [](bool value) { return value; }));
+    values[0] = 2;
+    REQUIRE(Tegra::ResumeReadyNativeChannels(channels, ready, dispatch) == 0);
+    values[0] = 1;
+    REQUIRE(Tegra::ResumeReadyNativeChannels(channels, ready, dispatch) == 3);
+    REQUIRE(dispatched == (std::vector<size_t>{0, 1, 2}));
+    REQUIRE(Tegra::ResumeReadyNativeChannels(channels, ready, dispatch) == 0);
+}
+
+TEST_CASE("Native semaphore hints avoid readback only when the queued release satisfies the predicate", "[native-semaphore-hint]") {
+    for (const auto operation : {1U, 4U, 8U, 99U}) {
+        for (const auto required : {0U, 1U, 2U, 0x80000000U, 0xffffffffU}) {
+            const Tegra::NativeSemaphoreWait wait{0x1000, required, operation};
+            for (const auto physical : {0U, 1U, 3U, 0xffffffffU}) {
+                for (const auto pending : {std::optional<u32>{}, std::optional<u32>{0},
+                                           std::optional<u32>{1}, std::optional<u32>{0xffffffffU}}) {
+                    unsigned reads = 0;
+                    const bool expected_pending = pending && wait.Matches(*pending);
+                    const bool result = wait.MatchesPendingOrRead(pending, [&] { ++reads; return physical; });
+                    REQUIRE(result == (expected_pending || wait.Matches(physical)));
+                    REQUIRE(reads == (expected_pending ? 0U : 1U));
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Storage batches retain source capacity without exposing preceding draw entries", "[storage-batch-reuse]") {
+    struct Entry {
+        u64 key{};
+        std::vector<u32> sources;
+        bool written{};
+    };
+    VideoCommon::ReusableStorageBatch<Entry> batch;
+    batch.Reset(true);
+    auto& initial = batch.Append();
+    initial.sources.resize(128, 7);
+    const auto* allocation = initial.sources.data();
+    const auto capacity = initial.sources.capacity();
+    for (size_t i = 1; i < 40; ++i) {
+        auto& extra = batch.Append();
+        extra.key = i;
+        extra.sources.resize(i);
+        extra.written = true;
+    }
+    REQUIRE(batch.Active().size() == 40);
+    for (u32 draw = 0; draw < 64; ++draw) {
+        batch.Reset(true);
+        REQUIRE(batch.Active().empty());
+        auto& current = batch.Append();
+        current.key = draw;
+        current.written = false;
+        current.sources.assign(draw + 1, draw);
+        REQUIRE(current.sources.data() == allocation);
+        REQUIRE(current.sources.capacity() == capacity);
+        REQUIRE(batch.Active().size() == 1);
+        REQUIRE(batch.Active()[0].key == draw);
+        REQUIRE_FALSE(batch.Active()[0].written);
+        REQUIRE(current.sources.size() == draw + 1);
+        REQUIRE(std::all_of(current.sources.begin(), current.sources.end(),
+                            [&](u32 value) { return value == draw; }));
+    }
+    batch.Reset(false);
+    REQUIRE(batch.Active().empty());
+    auto& fresh = batch.Append();
+    REQUIRE(fresh.sources.empty());
+    REQUIRE(fresh.key == 0);
+    REQUIRE_FALSE(fresh.written);
+}
+
+TEST_CASE("Download batches preserve fragmented copies and interleaved owners", "[download-copy-batches]") {
+    using VideoCommon::BufferCopy;
+    std::array<std::vector<u8>, 3> sources;
+    for (size_t buffer = 0; buffer < sources.size(); ++buffer) {
+        sources[buffer].resize(4096);
+        for (size_t i = 0; i < sources[buffer].size(); ++i) {
+            sources[buffer][i] = static_cast<u8>(i * 13 + buffer * 71);
+        }
+    }
+    std::vector<std::pair<BufferCopy, u32>> downloads;
+    for (u32 i = 0; i < 700; ++i) {
+        const u32 owner = i < 513 ? 1 : i < 516 ? 2 : 1;
+        downloads.push_back({{(i * 17) % 3000, i * 32 + 5, i % 13 + 1}, owner});
+    }
+    std::vector<u8> expected(700 * 32 + 64, 0xcd);
+    auto actual = expected;
+    for (const auto& [copy, owner] : downloads) {
+        std::memcpy(expected.data() + copy.dst_offset, sources[owner].data() + copy.src_offset,
+                    copy.size);
+    }
+    size_t copied = 0;
+    size_t batches = 0;
+    VideoCommon::ForEachDownloadCopyBatch(
+        std::span<const std::pair<BufferCopy, u32>>{downloads},
+        [&](u32 owner, std::span<const BufferCopy> copies) {
+            REQUIRE_FALSE(copies.empty());
+            REQUIRE(copies.size() <= VideoCommon::DOWNLOAD_COPY_BATCH_SIZE);
+            ++batches;
+            for (const auto& copy : copies) {
+                REQUIRE(owner == downloads[copied].second);
+                REQUIRE(copy.src_offset == downloads[copied].first.src_offset);
+                REQUIRE(copy.dst_offset == downloads[copied].first.dst_offset);
+                REQUIRE(copy.size == downloads[copied].first.size);
+                std::memcpy(actual.data() + copy.dst_offset,
+                            sources[owner].data() + copy.src_offset, copy.size);
+                ++copied;
+            }
+        });
+    REQUIRE(copied == downloads.size());
+    REQUIRE(batches == 5);
+    REQUIRE(actual == expected);
+
+    bool called = false;
+    VideoCommon::ForEachDownloadCopyBatch(
+        std::span<const std::pair<BufferCopy, u32>>{},
+        [&](u32, std::span<const BufferCopy>) { called = true; });
+    REQUIRE_FALSE(called);
+}
+
+TEST_CASE("Completed snapshots retain latest bytes and CPU-cancelled holes", "[completed-downloads]") {
+    struct Snapshot { size_t begin, end; u8 value; };
+    for (size_t seed = 0; seed < 200; ++seed) {
+        std::array<u8, 512> expected, actual;
+        expected.fill(0xCD);
+        actual = expected;
+        std::array<bool, 512> active;
+        active.fill(true);
+        for (size_t i = 0; i < active.size(); ++i) {
+            if ((i + seed) % 47 < 9) active[i] = false;
+        }
+        std::array<Snapshot, 12> snapshots;
+        size_t original_bytes = 0, copied_bytes = 0;
+        for (size_t i = 0; i < snapshots.size(); ++i) {
+            const size_t begin = (seed * 31 + i * 67) % 440;
+            snapshots[i] = {begin, std::min(size_t{512}, begin + 20 + (i * 59) % 180), static_cast<u8>(i + 1)};
+            for (size_t byte = snapshots[i].begin; byte < snapshots[i].end; ++byte) {
+                if (active[byte]) { expected[byte] = snapshots[i].value; ++original_bytes; }
+            }
+        }
+        VideoCommon::CompletedDownloadCoverage coverage;
+        for (auto item = snapshots.rbegin(); item != snapshots.rend(); ++item) {
+            for (size_t first = item->begin; first < item->end;) {
+                if (!active[first]) { ++first; continue; }
+                size_t last = first + 1;
+                while (last < item->end && active[last]) ++last;
+                coverage.ForEachUncovered(first, last - first, [&](DAddr begin, DAddr end) {
+                    REQUIRE(begin >= first);
+                    REQUIRE(end <= last);
+                    for (DAddr byte = begin; byte < end; ++byte) actual[byte] = item->value;
+                    copied_bytes += end - begin;
+                });
+                first = last;
+            }
+        }
+        CAPTURE(seed);
+        REQUIRE(actual == expected);
+        REQUIRE(copied_bytes <= original_bytes);
+        REQUIRE(copied_bytes <= actual.size());
+    }
+}
+
+TEST_CASE("Buffer usage covers partial blocks and page boundaries", "[usage-tracker]") {
+    const bool merge_ranges = GENERATE(false, true);
+    VideoCommon::UsageTracker tracker{3 * 4096 + 93, merge_ranges};
+    tracker.Track(0, 1);
+    REQUIRE(tracker.IsUsed(0, 1));
+    REQUIRE_FALSE(tracker.IsUsed(64, 64));
+
+    tracker.Reset();
+    tracker.Track(63, 65);
+    REQUIRE(tracker.IsUsed(0, 64));
+    REQUIRE(tracker.IsUsed(64, 64));
+    REQUIRE_FALSE(tracker.IsUsed(128, 64));
+
+    tracker.Reset();
+    tracker.Track(4095, 2);
+    REQUIRE(tracker.IsUsed(4032, 64));
+    REQUIRE(tracker.IsUsed(4096, 64));
+    REQUIRE_FALSE(tracker.IsUsed(4160, 64));
+
+    tracker.Reset();
+    tracker.Track(4096, 4096);
+    REQUIRE_FALSE(tracker.IsUsed(0, 4096));
+    REQUIRE(tracker.IsUsed(4096, 4096));
+    REQUIRE_FALSE(tracker.IsUsed(8192, 4096));
+    tracker.Track(3 * 4096 + 92, 1);
+    REQUIRE(tracker.IsUsed(3 * 4096 + 92, 1));
+
+    tracker.Reset();
+    tracker.Track(std::numeric_limits<u64>::max(), 2);
+    tracker.Track(0, std::numeric_limits<u64>::max());
+    tracker.Track(3 * 4096 + 93, 1);
+    REQUIRE_FALSE(tracker.IsUsed(0, 3 * 4096 + 93));
+    REQUIRE(tracker.IsUsed(std::numeric_limits<u64>::max(), 2));
+    REQUIRE(tracker.IsUsed(0, std::numeric_limits<u64>::max()));
+    REQUIRE(tracker.IsUsed(3 * 4096 + 93, 1));
+    REQUIRE_FALSE(tracker.IsUsed(std::numeric_limits<u64>::max(), 0));
+}
+
+TEST_CASE("Buffer usage matches independent block coverage through overlapping draws", "[usage-tracker]") {
+    constexpr u64 buffer_size = 3 * 4096 + 93;
+    const bool merge_ranges = GENERATE(false, true);
+    VideoCommon::UsageTracker tracker{buffer_size, merge_ranges};
+    std::array<bool, (buffer_size + 63) / 64> expected{};
+    const auto track = [&](u64 offset, u64 size) {
+        tracker.Track(offset, size);
+        if (!size) {
+            return;
+        }
+        for (u64 bit = offset / 64; bit <= (offset + size - 1) / 64; ++bit) {
+            expected[bit] = true;
+        }
+    };
+    const auto query = [&](u64 offset, u64 size) {
+        bool used = false;
+        if (size) {
+            for (u64 bit = offset / 64; bit <= (offset + size - 1) / 64; ++bit) {
+                used |= expected[bit];
+            }
+        }
+        CAPTURE(merge_ranges, offset, size);
+        REQUIRE(tracker.IsUsed(offset, size) == used);
+    };
+    for (const auto& [offset, size] :
+         std::array<std::pair<u64, u64>, 9>{{{256, 256}, {128, 192}, {500, 300},
+                                           {800, 1}, {384, 32}, {4031, 66},
+                                           {4097, 8192}, {0, 128}, {700, 1}}}) {
+        track(offset, size);
+        for (u64 byte = 0; byte < buffer_size; byte += 17) {
+            query(byte, std::min<u64>(71, buffer_size - byte));
+        }
+    }
+
+    std::mt19937 random{0xDBA2026};
+    for (size_t operation = 0; operation < 1600; ++operation) {
+        if (operation % 31 == 0) {
+            tracker.Reset();
+            expected.fill(false);
+            query(0, buffer_size);
+        }
+        const u64 offset = random() % (buffer_size + 1);
+        const u64 size = random() % (buffer_size - offset + 1);
+        track(offset, size);
+        for (size_t sample = 0; sample < 10; ++sample) {
+            const u64 first = random() % (buffer_size + 1);
+            const u64 length = random() % (buffer_size - first + 1);
+            query(first, length);
+        }
+    }
+}
+
+TEST_CASE("Packed page checks retain reserved entries and word boundaries", "[packed-page-probe]") {
+    std::array<u64, 3> entries{};
+    REQUIRE(VideoCommon::PackedPagesMatch(entries, 0, 96, 0));
+    REQUIRE_FALSE(VideoCommon::PackedPagesPresent(entries, 0, 96));
+    entries.fill(0xAAAAAAAAAAAAAAAAULL);
+    REQUIRE(VideoCommon::PackedPagesMatch(entries, 0, 96, 2));
+    REQUIRE(VideoCommon::PackedPagesMatch(entries, 31, 34, 2));
+    REQUIRE(VideoCommon::PackedPagesPresent(entries, 31, 34));
+    entries[1] = 0x5555555555555555ULL;
+    REQUIRE(VideoCommon::PackedPagesPresent(entries, 31, 34));
+    REQUIRE_FALSE(VideoCommon::PackedPagesMatch(entries, 31, 34, 2));
+    entries[1] |= u64{2} << 62;
+    REQUIRE_FALSE(VideoCommon::PackedPagesPresent(entries, 62, 2));
+    REQUIRE(VideoCommon::PackedPagesPresent(entries, 64, 32));
+    entries[1] &= ~(u64{3} << 62);
+    REQUIRE_FALSE(VideoCommon::PackedPagesPresent(entries, 63, 2));
+    REQUIRE(VideoCommon::PackedPagesMatch(entries, 63, 1, 0));
+    REQUIRE_FALSE(VideoCommon::PackedPagesMatch(entries, 95, 2, 2));
+    REQUIRE_FALSE(VideoCommon::PackedPagesPresent(entries, 96, 1));
+    REQUIRE_FALSE(VideoCommon::PackedPagesPresent(entries, std::numeric_limits<size_t>::max(), 1));
+    REQUIRE(VideoCommon::PackedPagesPresent(entries, 96, 0));
+}
+
+TEST_CASE("Packed native mapping probes agree with individual page walks", "[packed-page-probe]") {
+    constexpr u64 small_bytes = 64, big_bytes = 256, space_bytes = 128 * big_bytes;
+    std::array<u8, 128> big_states{};
+    std::array<u8, 512> small_states{};
+    std::array<u64, 4> big_entries{};
+    std::array<u64, 16> small_entries{};
+    std::mt19937 random{0xA6A104};
+    const auto reference = [&](u64 first, u64 size) {
+        for (u64 address = first; size;) {
+            const u64 bytes = std::min(big_bytes - address % big_bytes, size);
+            const auto state = big_states[address / big_bytes];
+            if (state == 1) return false;
+            if (state != 2) {
+                for (u64 page = address / small_bytes; page <= (address + bytes - 1) / small_bytes; ++page) {
+                    if (small_states[page] != 1 && small_states[page] != 2) return false;
+                }
+            }
+            address += bytes;
+            size -= bytes;
+        }
+        return true;
+    };
+    const auto probe = [&](u64 first, u64 size) {
+        return VideoCommon::PackedGpuRangeMapped(big_entries, small_entries, 8, 6, first, size);
+    };
+    for (size_t scenario = 0; scenario < 300; ++scenario) {
+        big_entries.fill(0);
+        small_entries.fill(0);
+        for (size_t page = 0; page < big_states.size(); ++page) {
+            const u8 state = static_cast<u8>(scenario % 4 == 0 ? 0 : scenario % 4 == 1 ? 2 :
+                scenario % 4 == 2 ? random() % 4 : (page % 2) * 2);
+            big_states[page] = state;
+            big_entries[page / 32] |= u64{state} << ((page % 32) * 2);
+        }
+        for (size_t page = 0; page < small_states.size(); ++page) {
+            const u8 state = scenario % 5 < 2 ? static_cast<u8>(scenario % 5 + 1) : random() % 4;
+            small_states[page] = state;
+            small_entries[page / 32] |= u64{state} << ((page % 32) * 2);
+        }
+        for (size_t query = 0; query < 120; ++query) {
+            const u64 first = random() % (space_bytes + 1);
+            const u64 size = random() % (space_bytes - first + 1);
+            CAPTURE(scenario, first, size);
+            REQUIRE(probe(first, size) == reference(first, size));
+        }
+        REQUIRE(probe(0, space_bytes) == reference(0, space_bytes));
+    }
+    REQUIRE_FALSE(probe(std::numeric_limits<u64>::max() - 2, 9));
+    REQUIRE_FALSE(probe(space_bytes, 1));
+    REQUIRE(probe(space_bytes, 0));
+}
+
+
+TEST_CASE("Native calls to a two-instruction return stub retain the caller link", "[native-shader][native-return-stub]") {
+    const u32 link = GENERATE(0U, 8U, 12U);
+    std::array<Native, 7> input{{
+        {{0x00037802, 0x40a00000, 0x00000f00, 0}},
+        {{0x7802U | (link << 16), 48, 0xf00, 0}},
+        {{0x7944, 32, 0x03c00000, 0}},
+        {{0xff007322, 0x00007003, 0x000000ff, 0}},
+        VertexTransform.back(),
+        {{0x7802U | ((link + 1) << 16), 0, 0xf00, 0}},
+        {{0x7950U | (link << 24), 0xffffff90, 0x03c3ffff, 0}},
+    }};
+    const auto lowered = Shader::Ampere::LowerToMaxwell(input);
+    INFO(lowered.error << " offset=" << lowered.error_offset);
+    REQUIRE(lowered);
+
+    auto invalid = input;
+    invalid[2].words[0] = 0x7947; // A branch does not establish a call link.
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+    invalid = input;
+    invalid[2].words[1] += 16; // Calling the RET would skip the upper-link setup.
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+    invalid = input;
+    invalid[5].words[1] = 1;
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+
+    std::vector<u64> code(0x50 / 8);
+    for (const auto word : lowered.instructions) {
+        if ((code.size() * 8) % 32 == 0) code.push_back(0);
+        code.push_back(word);
+    }
+    class StubEnvironment final : public EmptyEnvironment {
+    public:
+        explicit StubEnvironment(const std::vector<u64>& code_) : code{code_} { stage = Shader::Stage::VertexB; }
+        u64 ReadInstruction(u32 address) override { return code.at(address / 8); }
+        const std::vector<u64>& code;
+    } env{code};
+    Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+    Shader::ObjectPool<IR::Inst> inst_pool;
+    Shader::ObjectPool<IR::Block> block_pool;
+    Shader::Maxwell::Flow::CFG cfg{env, flow_pool, 0x50};
+    REQUIRE(cfg.Functions().size() == 2);
+    Shader::HostTranslateInfo host;
+    const auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
+    u32 stores{};
+    for (const auto* block : program.blocks) {
+        for (const auto& inst : block->Instructions()) {
+            if (inst.GetOpcode() != IR::Opcode::SetAttribute) continue;
+            ++stores;
+            REQUIRE(inst.Arg(1).IsImmediate());
+            REQUIRE(inst.Arg(1).F32() == 5.0f);
+        }
+    }
+    REQUIRE(stores == 1);
 }

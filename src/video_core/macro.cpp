@@ -6,8 +6,10 @@
 
 #include "video_core/native_diagnostics.h"
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <unordered_set>
+#include <utility>
 #include <cstring>
 #include <fstream>
 #include <optional>
@@ -23,6 +25,7 @@
 
 #include "common/assert.h"
 #include "common/scope_exit.h"
+#include "video_core/native_method_batch.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/settings.h"
@@ -31,6 +34,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/memory_manager.h"
+#include "video_core/gpu_split.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/macro.h"
 
@@ -1348,6 +1352,21 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                           std::span<const u32> parameters) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
     if (native_turing) {
+        static const bool requested_batch = [] {
+            const char* value = std::getenv("EDEN_NATIVE_METHOD_BATCH");
+            return value && value[0] == '1';
+        }();
+        const bool batch = requested_batch && !VideoCommon::GpuSplit::Get().Active();
+        if (batch) {
+            maxwell3d.ConsumeSink(system);
+            static bool logged{};
+            if (!std::exchange(logged, true)) {
+                LOG_INFO(HW_GPU, "Native macro state writes use ordered method batches");
+            }
+        }
+        SCOPE_EXIT {
+            if (batch) maxwell3d.ConsumeSink(system);
+        };
         maxwell3d.RefreshParameters();
         const auto context = reinterpret_cast<std::uintptr_t>(this);
         static std::unordered_set<std::uintptr_t> captured_contexts;
@@ -1396,7 +1415,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         const auto emit = [&](u32 address, u32 value) {
                 if (address >= 0xe00) return false;
                 if (address == 0x556) {
-                    // SET_RENDER_ENABLE_OVERRIDE: 0 use the render-enable condition, 1 always,
+                    // SET_RENDER_ENABLE_C (render_enable.mode): 0 never, 1 always, 2-4 conditional.
                     // 2 never. Log a histogram every 20000 macro writes (pop-in diagnostics).
                     static std::array<u64, 4> modes{};
                     static u64 enable_writes{};
@@ -1408,7 +1427,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                 }
                 {
                     VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
-                    maxwell3d.CallMethod(system, address, value, true);
+                    VideoCommon::EmitNativeMethod(maxwell3d, system, address, value,
+                        static_cast<u32>(MAXWELL3D_REG_INDEX(shadow_ram_control)), batch);
                 }
                 // Turing MME memory reads (methods 0x550 SET_MME_MEM_ADDRESS_A/B, 0x558 data RAM
                 // address, 0x55c MME_DMA_READ into data RAM, 0x560 MME_DMA_READ_FIFOED into
@@ -1421,6 +1441,23 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                                             maxwell3d.GetRegisterValue(MemAddressB);
                     auto& memory = maxwell3d.GetMemoryManager();
                     const u32 ram = maxwell3d.GetRegisterValue(DataRamAddress);
+                    // The GPU reads what the semaphore releases before it wrote (title 4 keeps
+                    // "clear pending" flags that way): wait for the back to run those sent to
+                    // the words, then take releases that still wait for the host GPU (accurate
+                    // GPU mode writes them from a fence).
+                    const u64 dma_bytes = u64{std::min<u32>(value, 0x1000)} * 4;
+                    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active() && split.FrontMacros()) {
+                        split.AwaitReleases(source, dma_bytes);
+                    }
+                    const auto read_word = [&](GPUVAddr address) {
+                        if (const auto device = dma_bytes <= 256 ? memory.GpuToCpuAddress(address)
+                                                                 : std::nullopt) {
+                            if (const auto pending = maxwell3d.Rasterizer().PendingSemaphoreRelease(*device)) {
+                                return *pending;
+                            }
+                        }
+                        return memory.Read<u32>(address);
+                    };
                     // The words may have just been written by the GPU (e.g. indirect draw arguments
                     // from a culling dispatch) and still be only in host buffers: flush them first,
                     // or the macro draws with an older frame's arguments (objects pop in and out).
@@ -1433,23 +1470,64 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                             }
                         }
                     }
-                    if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+                    std::vector<u32> dma_words(std::min<u32>(value, 0x1000));
+                    const auto load_words = [&] {
+                    static const bool dma_statistics = std::getenv("EDEN_NATIVE_MME_DMA_STATS") != nullptr;
+                    const bool dirty = memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
+                    const auto wait_begin = dma_statistics ? std::chrono::steady_clock::now()
+                                                          : std::chrono::steady_clock::time_point{};
+                    if (dirty) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
                         static u64 flushes{};
                         if (++flushes % 2000 == 1) {
                             LOG_INFO(HW_GPU, "Native MME DMA read flushed GPU-written memory ({} times)", flushes);
                         }
                     }
+                    if (dma_statistics) {
+                        struct Timing { u64 requests{}, flushes{}, wait_ns{}; };
+                        static std::array<Timing, 4096> timings{};
+                        const auto now = std::chrono::steady_clock::now();
+                        static auto report_begin = now;
+                        if (method < timings.size()) {
+                            auto& timing = timings[method];
+                            ++timing.requests;
+                            timing.flushes += dirty;
+                            if (dirty) {
+                                timing.wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(now - wait_begin).count();
+                            }
+                        }
+                        if (now - report_begin >= std::chrono::seconds{10}) {
+                            for (size_t start = 0; start < timings.size(); ++start) {
+                                const auto& timing = timings[start];
+                                if (timing.requests) {
+                                    LOG_INFO(HW_GPU, "Native MME DMA timing: start={:#x} requests={} flushes={} wait_ms={:.1f}",
+                                        start, timing.requests, timing.flushes, timing.wait_ns / 1e6);
+                                }
+                            }
+                            timings.fill({});
+                            report_begin = now;
+                        }
+                    }
+                        for (u32 i = 0; i < dma_words.size(); ++i) {
+                            dma_words[i] = read_word(source + u64{i} * 4);
+                        }
+                    };
+                    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active() && split.FrontMacros()) {
+                        split.Defer(load_words);
+                        split.Drain();
+                    } else {
+                        load_words();
+                    }
                     static u32 dma_logs{};
                     if (dma_logs < 400) {
                         ++dma_logs;
                         std::array<u32, 8> words{};
-                        for (u32 i = 0; i < std::min<u32>(value, 8); ++i) words[i] = memory.Read<u32>(source + u64{i} * 4);
+                        for (u32 i = 0; i < std::min<u32>(value, 8); ++i) words[i] = dma_words[i];
                         LOG_INFO(HW_GPU, "Native MME DMA read{} start={:#x} source={:#x} count={} words={:08x}",
                                  address == DmaReadFifoed ? " fifoed" : "", method, source, value, fmt::join(words, ","));
                     }
                     for (u32 i = 0; i < std::min<u32>(value, 0x1000); ++i) {
-                        const u32 word = memory.Read<u32>(source + u64{i} * 4);
+                        const u32 word = dma_words[i];
                         if (address == DmaReadFifoed) {
                             fifo.push_back(word);
                         } else if (ram + i < native_interpreter.active_dram->size()) {
@@ -1480,7 +1558,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
             const auto result = native_jit->Execute(
                 method, fifo, std::span<u32>{*native_interpreter.active_dram},
                 [&](u32 address) {
-                    return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U;
+                    return address < Maxwell3D::Regs::NUM_REGS
+                        ? VideoCommon::ReadNativeMethodRegister(maxwell3d, system, address, batch) : 0U;
                 },
                 emit);
             if (!result.success) {
@@ -1526,7 +1605,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         fifo.assign(parameters.begin(), parameters.end());
         const u64 code_generation = native_code_generation;
         const auto result = native_interpreter.Execute(native_code, method, fifo,
-            [&](u32 address) { return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U; },
+            [&](u32 address) { return address < Maxwell3D::Regs::NUM_REGS
+                ? VideoCommon::ReadNativeMethodRegister(maxwell3d, system, address, batch) : 0U; },
             [&](u32 address, u32 value) {
                 if (use_memo) {
                     native_writes.emplace_back(address, value);

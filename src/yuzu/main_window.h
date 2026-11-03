@@ -43,6 +43,7 @@
 class QtConfig;
 class EmuThread;
 class GameList;
+class JinraHome;
 class GImageInfo;
 class GRenderWindow;
 class LoadingScreen;
@@ -507,6 +508,8 @@ private:
 #endif
 
     GameListPlaceholder* game_list_placeholder = nullptr;
+    JinraHome* jinra_home = nullptr;
+    int jinra_configuration_category = 0;
 
     std::vector<VkDeviceInfo::Record> vk_device_records;
 

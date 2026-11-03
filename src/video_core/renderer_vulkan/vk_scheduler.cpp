@@ -360,6 +360,7 @@ void Scheduler::AllocateWorkerCommandBuffer() {
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
     EndPendingOperations();
+    deferred_fence_submission = false;
     InvalidateState();
 
     const u64 signal_value = master_semaphore->NextTick();

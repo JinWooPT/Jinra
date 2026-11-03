@@ -112,6 +112,9 @@ namespace Vulkan {
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
                                 VkDeviceSize min_alignment) const;
 
+        vk::Buffer TryCreateMappedDeviceBuffer(const VkBufferCreateInfo& ci,
+                                               VkDeviceSize min_alignment) const;
+
         /**
          * Commits a memory with the specified requirements.
          *

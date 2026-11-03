@@ -101,9 +101,10 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
     const char* capture = std::getenv("EDEN_NATIVE_FRAME_CAPTURE");
     const bool sequence = std::getenv("EDEN_NATIVE_FRAME_SEQUENCE") != nullptr;
     const bool on_demand = std::getenv("EDEN_NATIVE_FRAME_ON_DEMAND") != nullptr;
+    std::error_code capture_error;
     const bool requested = on_demand && !output_layers.empty() &&
-        !diagnostic_frame_pending->load() && std::filesystem::exists("native-frame.request");
-    if (requested) std::filesystem::remove("native-frame.request");
+        !diagnostic_frame_pending->load() &&
+        std::filesystem::remove("native-frame.request", capture_error);
     const bool sample_frame = requested || (capture && std::string_view{capture} == "1" && !output_layers.empty() &&
         diagnostic_frame_count < (sequence ? 36000U : 3840U) && ++diagnostic_frame_count != 0 &&
         (sequence ? (diagnostic_frame_count == 1 || diagnostic_frame_count % 120 == 0)

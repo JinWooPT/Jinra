@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -18,6 +19,7 @@
 #include "video_core/invalidation_accumulator.h"
 #include "core/hle/dlss_trace.h"
 #include "video_core/memory_manager.h"
+#include "video_core/packed_page_probe.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/texture_cache/util.h"
@@ -688,6 +690,20 @@ bool MemoryManager::IsContinuousRange(GPUVAddr gpu_addr, std::size_t size) const
 }
 
 bool MemoryManager::IsFullyMappedRange(GPUVAddr gpu_addr, std::size_t size) const {
+    static const bool packed_probe = [] {
+        const char* value = std::getenv("EDEN_NATIVE_PACKED_MAP_PROBE");
+        return !value || value[0] != '0';
+    }();
+    if (packed_probe && native_tiling && size >= page_size * 2 && gpu_addr < address_space_size &&
+        size <= address_space_size - gpu_addr) {
+        static const bool activated = [] {
+            LOG_INFO(HW_GPU, "Native packed page probe enabled");
+            return true;
+        }();
+        (void)activated;
+        return VideoCommon::PackedGpuRangeMapped(big_entries, entries,
+            static_cast<unsigned>(big_page_bits), static_cast<unsigned>(page_bits), gpu_addr, size);
+    }
     bool result{true};
     auto fail = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset,
                     [[maybe_unused]] std::size_t copy_amount) {

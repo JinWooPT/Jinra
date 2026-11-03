@@ -47,6 +47,7 @@ struct FenceManagerParams {
     using QueryCacheType = QueryCache;
 
     static constexpr bool HAS_ASYNC_CHECK = true;
+    static constexpr bool QUEUE_FENCE_FLUSHES_COMMANDS = true;
 };
 
 using GenericFenceManager = VideoCommon::FenceManager<FenceManagerParams>;

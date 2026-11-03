@@ -16,6 +16,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
+#include "video_core/buffer_cache/reusable_storage_batch.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
@@ -53,6 +54,10 @@ public:
 
     [[nodiscard]] vk::MemoryLocation Location() const noexcept {
         return buffer.Location();
+    }
+
+    [[nodiscard]] std::span<const u8> MappedReadback() const noexcept {
+        return buffer.IsHostCoherent() ? buffer.Mapped() : std::span<const u8>{};
     }
 
     [[nodiscard]] bool IsRegionUsed(u64 offset, u64 size) const noexcept {
@@ -117,6 +122,9 @@ public:
     void Wait(u64 tick);
 
     void Finish();
+
+    std::span<const u8> ReadMappedBuffer(Buffer& buffer,
+                                        std::span<const VideoCommon::BufferCopy> copies);
 
     u64 GetDeviceLocalMemory() const;
 
@@ -200,7 +208,12 @@ public:
 
     void BeginStorageBatch(bool native) {
         grouped_storage = native;
-        storage_batch.clear();
+        static const bool reuse = [] {
+            const char* value = std::getenv("EDEN_NATIVE_STORAGE_REUSE");
+            return value && value[0] == '1';
+        }();
+        retain_storage_batch = native && reuse;
+        storage_batch.Reset(retain_storage_batch);
     }
 
     [[nodiscard]] bool UseGroupedStorage() const noexcept { return grouped_storage; }
@@ -276,7 +289,8 @@ private:
         std::vector<MultiRangeSource> sources;
         bool written{};
     };
-    std::vector<StorageBatchEntry> storage_batch;
+    VideoCommon::ReusableStorageBatch<StorageBatchEntry> storage_batch;
+    bool retain_storage_batch{};
     bool grouped_storage{};
 
     MultiRangeBufferCache multi_range_buffers;

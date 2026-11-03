@@ -203,7 +203,7 @@ struct Values {
     // Core
     SwitchableSetting<bool> use_multi_core{linkage, true, "use_multi_core", Category::Core};
     SwitchableSetting<MemoryLayout, true> memory_layout_mode{linkage,
-                                                             MemoryLayout::Memory_4Gb,
+                                                             MemoryLayout::Memory_12Gb,
                                                              "memory_layout_mode",
                                                              Category::Core,
                                                              Specialization::Default,
@@ -345,7 +345,7 @@ struct Values {
 
     // Graphics Settings
     ResolutionScalingInfo resolution_info{};
-    SwitchableSetting<ResolutionSetup> resolution_setup{linkage, ResolutionSetup::Res1X,
+    SwitchableSetting<ResolutionSetup> resolution_setup{linkage, ResolutionSetup::Res2X,
                                                         "resolution_setup", Category::Renderer};
 
     SwitchableSetting<VSyncMode, true> vsync_mode{linkage,
@@ -357,7 +357,7 @@ struct Values {
                                                   true};
 
     SwitchableSetting<ScalingFilter> scaling_filter{linkage,
-                                                    ScalingFilter::NearestNeighbor,
+                                                    ScalingFilter::ScaleForce,
                                                     "scaling_filter",
                                                     Category::Renderer,
                                                     Specialization::Default,
@@ -386,7 +386,7 @@ struct Values {
                                                       true};
 
     SwitchableSetting<AntiAliasing> anti_aliasing{linkage,
-                                                  AntiAliasing::None,
+                                                  AntiAliasing::Smaa,
                                                   "anti_aliasing",
                                                   Category::Renderer,
                                                   Specialization::Default,
@@ -533,11 +533,11 @@ struct Values {
                                                                  true};
 
     SwitchableSetting<VramUsageMode, true> vram_usage_mode{linkage,
-                                                           VramUsageMode::Conservative,
+                                                           VramUsageMode::Aggressive,
                                                            "vram_usage_mode",
                                                            Category::RendererAdvanced};
 
-    SwitchableSetting<NvdecEmulation> nvdec_emulation{linkage, NvdecEmulation::Cpu,
+    SwitchableSetting<NvdecEmulation> nvdec_emulation{linkage, NvdecEmulation::Gpu,
                                                       "nvdec_emulation", Category::RendererAdvanced};
 
     SwitchableSetting<AnisotropyMode, true> max_anisotropy{linkage,
@@ -653,7 +653,7 @@ struct Values {
     SwitchableSetting<bool> emulate_bgr565{linkage, false, "emulate_bgr565",
                                             Category::RendererHacks};
 
-    SwitchableSetting<bool> use_asynchronous_shaders{linkage, false, "use_asynchronous_shaders",
+    SwitchableSetting<bool> use_asynchronous_shaders{linkage, true, "use_asynchronous_shaders",
                                                      Category::RendererHacks};
 
     SwitchableSetting<GpuUnswizzleSize> gpu_unswizzle_texture_size{linkage,
@@ -761,7 +761,7 @@ struct Values {
 #ifdef __ANDROID__
                                                    ConsoleMode::Handheld,
 #else
-                                                   ConsoleMode::Docked,
+                                                   ConsoleMode::Handheld,
 #endif
                                                    "use_docked_mode",
                                                    Category::System,
@@ -934,7 +934,7 @@ struct Values {
     // WebService
     Setting<std::string> web_api_url{linkage, "api.ynet-fun.xyz", "web_api_url",
                                      Category::WebService};
-    Setting<std::string> eden_username{linkage, "Eden", "eden_username",
+    Setting<std::string> eden_username{linkage, "Jinra", "eden_username",
                                        Category::WebService};
     Setting<std::string> eden_token{linkage, "",
                                     "eden_token", Category::WebService};

@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <system_error>
 #include <vector>
 #include <optional>
 #include <chrono>
@@ -18,6 +20,7 @@
 #include <ranges>
 #include "common/thread.h"
 #include "common/assert.h"
+#include "common/input_replay_clock.h"
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/frontend/input_converter.h"
 #include "hid_core/hid_util.h"
@@ -1813,8 +1816,29 @@ CaptureButtonState EmulatedController::GetCaptureButtons() const {
 
 // EDEN_AUTO_PRESS_A=<start>,<interval>,<end>[;...]: taps A for 200 ms every <interval> seconds
 // between <start> and <end> seconds after the emulator started. For unattended test runs.
-static const auto auto_press_epoch = std::chrono::steady_clock::now();
 static bool AutoPressA() {
+    static const bool from_file = [] {
+        const char* background = std::getenv("EDEN_BACKGROUND_TEST");
+        const char* enabled = std::getenv("EDEN_AUTO_A_FILE");
+        const bool active = background && background[0] == '1' && enabled && enabled[0] == '1';
+        if (active) LOG_INFO(Service_HID, "Background controller entry uses file requests");
+        return active;
+    }();
+    if (from_file) {
+        static thread_local std::chrono::steady_clock::time_point last;
+        static thread_local bool pressed{};
+        static thread_local bool finished{};
+        if (finished) return false;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last >= std::chrono::milliseconds{20}) {
+            std::error_code error;
+            finished = std::filesystem::exists("auto-entry.ready", error);
+            if (finished) return false;
+            pressed = std::filesystem::exists("auto-a.hold", error);
+            last = now;
+        }
+        return pressed;
+    }
     static const auto schedules = [] {
         std::vector<std::array<double, 3>> parsed;
         for (const char* cursor = std::getenv("EDEN_AUTO_PRESS_A"); cursor && *cursor;) {
@@ -1829,8 +1853,29 @@ static bool AutoPressA() {
         return parsed;
     }();
     if (schedules.empty()) return false;
-    const double now =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - auto_press_epoch).count();
+    const double now = Common::InputReplay::Time();
+    return std::any_of(schedules.begin(), schedules.end(), [now](const auto& window) {
+        const auto [first, interval, last] = window;
+        return now >= first && now <= last && std::fmod(now - first, interval) < 0.2;
+    });
+}
+
+static bool AutoPressY() {
+    static const auto schedules = [] {
+        std::vector<std::array<double, 3>> parsed;
+        for (const char* cursor = std::getenv("EDEN_AUTO_PRESS_Y"); cursor && *cursor;) {
+            std::array<double, 3> window{};
+            if (std::sscanf(cursor, "%lf,%lf,%lf", &window[0], &window[1], &window[2]) == 3 &&
+                window[1] > 0) {
+                parsed.push_back(window);
+            }
+            cursor = std::strchr(cursor, ';');
+            if (cursor) ++cursor;
+        }
+        return parsed;
+    }();
+    if (schedules.empty()) return false;
+    const double now = Common::InputReplay::Time();
     return std::any_of(schedules.begin(), schedules.end(), [now](const auto& window) {
         const auto [first, interval, last] = window;
         return now >= first && now <= last && std::fmod(now - first, interval) < 0.2;
@@ -1851,8 +1896,7 @@ static bool AutoHoldPlus() {
         return parsed;
     }();
     if (windows.empty()) return false;
-    const double now =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - auto_press_epoch).count();
+    const double now = Common::InputReplay::Time();
     return std::any_of(windows.begin(), windows.end(),
                        [now](const auto& window) { return now >= window[0] && now <= window[1]; });
 }
@@ -1862,6 +1906,7 @@ NpadButtonState EmulatedController::GetNpadButtons() const {
         return {};
     NpadButtonState state{controller.npad_button_state.raw & GetTurboButtonMask()};
     if (AutoPressA()) state.a.Assign(1);
+    if (AutoPressY()) state.y.Assign(1);
     if (AutoHoldPlus()) state.plus.Assign(1);
     return state;
 }
@@ -1890,8 +1935,7 @@ static std::optional<AnalogSticks> AutoSticks() {
         return parsed;
     }();
     if (windows.empty()) return std::nullopt;
-    const double now =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - auto_press_epoch).count();
+    const double now = Common::InputReplay::Time();
     for (const auto& window : windows) {
         if (now >= window[0] && now <= window[1]) {
             const auto axis = [](double value) {
