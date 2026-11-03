@@ -777,6 +777,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     if (const auto explicit_format{PixelFormatFromImageFormat(desc.format)}) {
                         format = *explicit_format;
                     }
+                } else {
+                    format = ResolveTextureBufferFormat(desc, format, image_view.GpuAddr(),
+                                                        image_view.BufferSize());
                 }
                 buffer_cache.BindGraphicsTextureBuffer(stage, index, image_view.GpuAddr(),
                                                        image_view.BufferSize(), format,

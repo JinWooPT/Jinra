@@ -1489,8 +1489,20 @@ void Device::RemoveUnsuitableExtensions() {
                                VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     }
 
-    // VK_KHR_shader_quad_control
-    extensions.shader_quad_control = features.shader_quad_control.shaderQuadControl;
+    // VK_KHR_shader_maximal_reconvergence
+    extensions.shader_maximal_reconvergence =
+        extensions.shader_maximal_reconvergence &&
+        features.shader_maximal_reconvergence.shaderMaximalReconvergence;
+    RemoveExtensionFeatureIfUnsuitable(extensions.shader_maximal_reconvergence,
+                                       features.shader_maximal_reconvergence,
+                                       VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+
+    // Quad control requires maximal reconvergence and Vulkan 1.2 or KHR memory model.
+    extensions.shader_quad_control =
+        extensions.shader_quad_control && features.shader_quad_control.shaderQuadControl &&
+        extensions.shader_maximal_reconvergence &&
+        (instance_version >= VK_API_VERSION_1_2 ||
+         loaded_extensions.contains(VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME));
     RemoveExtensionFeatureIfUnsuitable(extensions.shader_quad_control, features.shader_quad_control,
                                        VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME);
 

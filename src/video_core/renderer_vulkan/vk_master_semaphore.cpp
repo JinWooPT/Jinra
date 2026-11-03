@@ -48,17 +48,25 @@ MasterSemaphore::MasterSemaphore(const Device& device_) : device(device_) {
     // a separate thread waiting for each timeline semaphore value.
     debug_thread = std::jthread([this](std::stop_token stop_token) {
         u64 counter = 0;
-        while (!stop_token.stop_requested()) {
-            if (semaphore.Wait(counter, 10'000'000)) {
-                ++counter;
+        try {
+            while (!stop_token.stop_requested()) {
+                if (semaphore.Wait(counter, 10'000'000)) {
+                    ++counter;
+                }
             }
+        } catch (const vk::Exception& error) {
+            if (error.GetResult() == VK_ERROR_DEVICE_LOST) {
+                device.ReportLoss();
+                return;
+            }
+            throw;
         }
     });
 }
 
 MasterSemaphore::~MasterSemaphore() = default;
 
-void MasterSemaphore::Refresh() {
+void MasterSemaphore::Refresh() try {
     if (!semaphore) {
         // If we don't support timeline semaphores, there's nothing to refresh
         return;
@@ -74,9 +82,14 @@ void MasterSemaphore::Refresh() {
         }
     } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
                                              std::memory_order_relaxed));
+} catch (const vk::Exception& error) {
+    if (error.GetResult() == VK_ERROR_DEVICE_LOST) {
+        device.ReportLoss();
+    }
+    throw;
 }
 
-void MasterSemaphore::Wait(u64 tick) {
+void MasterSemaphore::Wait(u64 tick) try {
     if (!semaphore) {
         // Fast check: already reached the requested tick?
         if (gpu_tick.load(std::memory_order_acquire) >= tick) {
@@ -108,6 +121,11 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     Refresh();
+} catch (const vk::Exception& error) {
+    if (error.GetResult() == VK_ERROR_DEVICE_LOST) {
+        device.ReportLoss();
+    }
+    throw;
 }
 
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,

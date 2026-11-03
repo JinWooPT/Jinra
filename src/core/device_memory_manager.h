@@ -132,6 +132,8 @@ public:
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);
 
 private:
+    friend struct DeviceMemoryManagerTestAccess;
+
     struct TranslationEntry {
         DAddr guest_page{};
         u8* host_ptr{};
@@ -191,6 +193,8 @@ private:
 
     void WalkBlock(const DAddr addr, const std::size_t size, auto on_unmapped, auto on_memory,
                    auto increment);
+
+    void CutContinuityAt(size_t page);
 
     void InnerGatherDeviceAddresses(Common::ScratchBuffer<u32>& buffer, PAddr address);
 

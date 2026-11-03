@@ -1593,6 +1593,12 @@ void QtSoftwareKeyboard::InitializeKeyboard(
 }
 
 void QtSoftwareKeyboard::ShowNormalKeyboard() const {
+    if (qEnvironmentVariableIsSet("EDEN_BACKGROUND_TEST") &&
+        qEnvironmentVariableIsSet("EDEN_AUTO_KEYBOARD_TEXT")) {
+        SubmitNormalText(SwkbdResult::Ok,
+                         qEnvironmentVariable("EDEN_AUTO_KEYBOARD_TEXT").toStdU16String(), true);
+        return;
+    }
     emit MainWindowShowNormalKeyboard();
 }
 

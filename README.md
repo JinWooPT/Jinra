@@ -8,29 +8,17 @@ Donkey Kong Bananza rendering and performance work, and a new desktop interface.
 
 ## Testing scope — please read first
 
-**Donkey Kong Bananza is the only game validated for gameplay with this version
-of Jinra.**
-
-**The emulator has been optimized and tested on NVIDIA graphics cards under
-Windows. Results on AMD graphics cards are unknown: AMD compatibility,
-rendering quality, performance and stability have not been verified.**
-
-Other games, Intel graphics, other GPU configurations and other operating systems
-have not been validated by this project. A preliminary Pokopia test reached
-character creation but crashed during the introductory cinematic with a Vulkan
-device-loss error. That crash is under investigation; Pokopia is not considered
-playable. The upstream project's compatibility
-reports and screenshots are not Jinra test results.
+Jinra is optimized and tested on Windows with NVIDIA graphics and Vulkan.
+Results on AMD graphics are unknown. Compatibility on other GPU configurations
+and operating systems remains unverified.
 
 | Game | Tested environment | Current scope |
 | --- | --- | --- |
-| Donkey Kong Bananza | Windows, NVIDIA GPU, Vulkan | Rendering fixes and performance improvements tested; optimization and stability work continue |
-| Pokopia | Preliminary Windows/NVIDIA test | Crashes during the introductory cinematic; not validated for gameplay |
-| All other games | Not tested with Jinra | Compatibility and performance unknown |
+| Donkey Kong Bananza | Windows, NVIDIA GPU, Vulkan | Rendering and performance changes tested in gameplay. The owner also verified loading a `.nup` dump. |
+| Pokémon Pokopia | Windows, GeForce RTX 5090, Vulkan | Introductory cinematic, tutorial and movement verified. The project owner reported a stable 60 FPS at 2× in the tested gameplay. |
+| All other games | No Jinra gameplay results | Compatibility and performance unknown |
 
-**Stable 60 FPS is a development target, not a guarantee.** Slowdowns and stutter
-can still occur, particularly during destruction and in demanding areas. A brief
-60 FPS reading does not establish sustained performance or crash-free gameplay.
+The 60 FPS result applies to the tested hardware, settings and gameplay.
 
 ## Screenshots
 
@@ -51,6 +39,8 @@ The Windows session below automatically detected a DualSense controller.
 
 - Rendering, synchronization and buffer-handling work developed while testing
   Donkey Kong Bananza on NVIDIA hardware.
+- A targeted NVIDIA Vulkan workaround for the Pokémon Pokopia introductory
+  cinematic crash. See [the technical notes](docs/upstream-pokopia-fixes.md).
 - Jinra branding, the samurai icon and a redesigned desktop library.
 - Library search, Recent and Favorites views, and a selected-game panel.
 - Xbox and DualSense layout previews, SDL device detection and physical button
@@ -116,6 +106,12 @@ unverified. Source builders can run the focused update tests by configuring
 
 Use your own game dumps and any required keys and firmware. No games, keys,
 firmware, user profiles, saves or shader caches are distributed with Jinra.
+
+**Use Switch 2 firmware 23.0.0 for the tested builds of Donkey Kong Bananza and
+Pokémon Pokopia.** The tested Bananza build stalled at launch with firmware
+22.5.0. The installer preserves existing firmware, so install your own 23.0.0
+dump under **Tools > Install Firmware** and check the reported version in the
+status bar.
 
 Add your game folder in the Library or use **File > Load File**. Extracted dumps
 are supported; for that layout, keep `romfs` alongside `exefs`.

@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstring>
 #include <cstdlib>
@@ -125,6 +126,43 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
 }
 } // Anonymous namespace
 
+VideoCore::Surface::PixelFormat ResolveTextureBufferFormat(
+    const Shader::TextureBufferDescriptor& descriptor, VideoCore::Surface::PixelFormat format,
+    GPUVAddr address, u32 size) {
+    using VideoCore::Surface::PixelFormat;
+    using Shader::TextureBufferNumericType;
+    if (address == 0 || size == 0) {
+        static std::atomic<u32> reports{};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_INFO(Render_Vulkan,
+                     "Typed null texel buffer: c{}[{:#x}] numeric={} supplied_format={} address={:#x} size={}",
+                     descriptor.cbuf_index, descriptor.cbuf_offset,
+                     static_cast<u32>(descriptor.numeric_type), static_cast<u32>(format), address, size);
+        }
+        switch (descriptor.numeric_type) {
+        case TextureBufferNumericType::Uint:
+            return PixelFormat::R32_UINT;
+        case TextureBufferNumericType::Sint:
+            return PixelFormat::R32_SINT;
+        default:
+            return PixelFormat::R32_FLOAT;
+        }
+    }
+    const auto actual_type = Shader::TextureBufferType(static_cast<Shader::TexturePixelFormat>(format));
+    if (actual_type != descriptor.numeric_type) {
+        static std::atomic<u32> reports{};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_ERROR(Render_Vulkan,
+                      "Texel buffer numeric type changed: c{}[{:#x}] expected={} actual={} format={} address={:#x} size={}",
+                      descriptor.cbuf_index, descriptor.cbuf_offset,
+                      static_cast<u32>(descriptor.numeric_type), static_cast<u32>(actual_type),
+                      static_cast<u32>(format), address, size);
+        }
+        throw Shader::RuntimeError("Texture buffer numeric type changed after shader compilation");
+    }
+    return format;
+}
+
 Buffer::Buffer(BufferCacheRuntime& runtime, VideoCommon::NullBufferParams null_params)
     : VideoCommon::BufferBase(null_params), scheduler{&runtime.scheduler}, tracker{4096} {
     if (runtime.device.HasNullDescriptor()) {
@@ -166,7 +204,7 @@ VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat 
     } else if (is_null) {
         // Null buffer not supported, adjust offset and size
         offset = 0;
-        size = 0;
+        size = 16;
     }
     const auto it{std::ranges::find_if(views, [offset, size, format](const BufferView& view) {
         return offset == view.offset && size == view.size && format == view.format;
@@ -892,9 +930,10 @@ vk::Buffer BufferCacheRuntime::CreateNullBuffer() {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .size = 4,
+        .size = 16,
         .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                 VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,

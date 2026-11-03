@@ -1901,6 +1901,40 @@ static bool AutoHoldPlus() {
                        [now](const auto& window) { return now >= window[0] && now <= window[1]; });
 }
 
+struct BackgroundInput {
+    NpadButton buttons{};
+    AnalogSticks sticks{};
+};
+
+static std::optional<BackgroundInput> ReadBackgroundInput() {
+    static const bool enabled = std::getenv("EDEN_BACKGROUND_TEST") &&
+                                std::getenv("EDEN_AUTO_INPUT_FILE");
+    if (!enabled) return std::nullopt;
+    static thread_local auto last = std::chrono::steady_clock::time_point{};
+    static thread_local BackgroundInput input{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last >= std::chrono::milliseconds{20}) {
+        last = now;
+        input = {};
+        if (auto* file = std::fopen("auto-input.hold", "r")) {
+            unsigned long long buttons{};
+            std::array<double, 4> axes{};
+            if (std::fscanf(file, "%llx %lf %lf %lf %lf", &buttons,
+                            &axes[0], &axes[1], &axes[2], &axes[3]) == 5 &&
+                std::ranges::all_of(axes, [](double value) { return std::isfinite(value); })) {
+                const auto axis = [](double value) {
+                    return static_cast<s32>(std::clamp(value, -1.0, 1.0) * HID_JOYSTICK_MAX);
+                };
+                input.buttons = static_cast<NpadButton>(buttons);
+                input.sticks = {.left = {axis(axes[0]), axis(axes[1])},
+                                .right = {axis(axes[2]), axis(axes[3])}};
+            }
+            std::fclose(file);
+        }
+    }
+    return input;
+}
+
 NpadButtonState EmulatedController::GetNpadButtons() const {
     if (is_configuring)
         return {};
@@ -1908,6 +1942,7 @@ NpadButtonState EmulatedController::GetNpadButtons() const {
     if (AutoPressA()) state.a.Assign(1);
     if (AutoPressY()) state.y.Assign(1);
     if (AutoHoldPlus()) state.plus.Assign(1);
+    if (const auto input = ReadBackgroundInput()) state.raw |= input->buttons;
     return state;
 }
 
@@ -1951,6 +1986,7 @@ static std::optional<AnalogSticks> AutoSticks() {
 AnalogSticks EmulatedController::GetSticks() const {
     if (is_configuring)
         return {};
+    if (const auto input = ReadBackgroundInput()) return input->sticks;
     if (const auto scripted = AutoSticks()) {
         return *scripted;
     }

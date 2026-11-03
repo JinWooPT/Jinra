@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -15,6 +16,7 @@
 #include <vector>
 #include <bit>
 #include <numeric>
+#include <spirv/unified1/spirv.hpp11>
 #include "common/cityhash.h"
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
@@ -65,7 +67,39 @@ using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 
-constexpr u32 CACHE_VERSION = 37;
+void ApplyPokopiaComputeWorkaround(std::vector<u32>& code) {
+    constexpr u64 reference_hash = 0x9a70d62db441a5a5;
+    constexpr size_t epilogue_words = 134;
+    constexpr size_t election_words = 29;
+    if (code.size() < epilogue_words ||
+        Common::CityHash64(reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u32)) !=
+            reference_hash) {
+        return;
+    }
+
+    // The original epilogue elects a lane to add the active lane count to a uniform counter.
+    // The original module can lose the device on NVIDIA. Each lane can instead add one to the
+    // same counter. Only rewrite the exact module whose epilogue was verified.
+    const auto election = code.end() - epilogue_words;
+    const auto counter_update = election + election_words;
+    const u32 always = election[8]; // True operand of OpGroupNonUniformBallot.
+    for (auto instruction = counter_update; instruction != code.end(); instruction += *instruction >> 16) {
+        switch (static_cast<spv::Op>(*instruction & 0xffff)) {
+        case spv::Op::OpBranchConditional:
+            instruction[1] = always;
+            break;
+        case spv::Op::OpAtomicIAdd:
+            instruction[6] = instruction[4]; // The existing Device scope constant is one.
+            break;
+        default:
+            break;
+        }
+    }
+    code.erase(election, counter_update);
+    LOG_INFO(Render_Vulkan, "Applied Pokopia compute counter workaround for NVIDIA");
+}
+
+constexpr u32 CACHE_VERSION = 38;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
@@ -981,7 +1015,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
 
-        if (device.HasDebuggingToolAttached()) {
+        if (device.HasDebuggingToolAttached() || Settings::values.renderer_debug) {
             const std::string name{fmt::format("Shader {:016x}", key.unique_hashes[index])};
             modules[stage_index].SetObjectNameEXT(name.c_str());
         }
@@ -1127,7 +1161,11 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
                     max_shared_memory / 1024);
         program.shared_memory_size = max_shared_memory;
     }
-    const std::vector<u32> code{EmitSPIRV(profile, program)};
+    std::vector<u32> code{EmitSPIRV(profile, program)};
+    if (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && key.unique_hash == 0x4b951d4fd4e08298 &&
+        env.HasNativeRegisterCopies()) {
+        ApplyPokopiaComputeWorkaround(code);
+    }
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 
@@ -1147,7 +1185,7 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         }
     }
 
-    if (device.HasDebuggingToolAttached()) {
+    if (device.HasDebuggingToolAttached() || Settings::values.renderer_debug) {
         const auto name{fmt::format("Shader {:016x}", key.unique_hash)};
         spv_module.SetObjectNameEXT(name.c_str());
     }

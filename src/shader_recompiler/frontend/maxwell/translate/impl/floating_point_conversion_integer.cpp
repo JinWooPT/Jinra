@@ -11,6 +11,7 @@
 #include "common/common_types.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/maxwell/opcodes.h"
+#include "shader_recompiler/frontend/maxwell/translate/impl/common_funcs.h"
 #include "shader_recompiler/frontend/maxwell/translate/impl/impl.h"
 
 namespace Shader::Maxwell {
@@ -127,6 +128,9 @@ IR::F64 UnpackCbuf(TranslatorVisitor& v, u64 insn) {
 void TranslateF2I(TranslatorVisitor& v, u64 insn, const IR::F16F32F64& src_a) {
     // F2I is used to convert from a floating point value to an integer
     const F2I f2i{insn};
+    if (f2i.cc != 0) {
+        throw NotImplementedException("F2I CC");
+    }
 
     const bool denorm_cares{f2i.src_format != SrcFormat::F16 && f2i.src_format != SrcFormat::F64 &&
                             f2i.dest_format != DestFormat::I64};
@@ -155,6 +159,10 @@ void TranslateF2I(TranslatorVisitor& v, u64 insn, const IR::F16F32F64& src_a) {
         }
     }()};
     const bool is_signed{f2i.is_signed != 0};
+    if (f2i.src_format == SrcFormat::F32 && f2i.dest_format == DestFormat::I32 && is_signed) {
+        v.X(f2i.dest_reg, ConvertF32ToS32Saturated(v.ir, IR::F32{rounded_value}));
+        return;
+    }
     const auto [max_bound, min_bound] = ClampBounds(f2i.dest_format, is_signed);
     const bool unsigned_f32_i64 = f2i.dest_format == DestFormat::I64 &&
                                   f2i.src_format == SrcFormat::F32 && !is_signed;
@@ -220,10 +228,6 @@ void TranslateF2I(TranslatorVisitor& v, u64 insn, const IR::F16F32F64& src_a) {
         v.L(f2i.dest_reg, result);
     } else {
         v.X(f2i.dest_reg, result);
-    }
-
-    if (f2i.cc != 0) {
-        throw NotImplementedException("F2I CC");
     }
 }
 } // Anonymous namespace

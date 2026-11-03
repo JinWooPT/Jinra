@@ -953,6 +953,115 @@ void FoldDriverConstBuffer(Environment& env, IR::Block& block, IR::Inst& inst, u
     }
 }
 
+// Adapted from Eglantine da775258, 38230873 and da17ced5; origins in
+// docs/upstream-pokopia-fixes.md. Zero means unknown, not a proven empty set.
+constexpr u32 MaskMinusOne = 1U;
+constexpr u32 MaskZero = 2U;
+constexpr u32 MaskOne = 4U;
+constexpr u32 MaxMaskDepth = 8;
+constexpr u32 MaxMaskVisits = 256;
+
+bool IsMaskConstant(const IR::Value& value) {
+    return value.IsImmediate() && value.Type() == IR::Type::U32 &&
+           (value.U32() == 0xffffffffU || value.U32() == 0 || value.U32() == 1);
+}
+
+u32 MaskValues(const IR::Value& value, u32 depth, u32& visits_left) {
+    if (visits_left == 0) {
+        return 0;
+    }
+    --visits_left;
+    const IR::Value resolved{value.Resolve()};
+    if (resolved.Type() != IR::Type::U32) {
+        return 0;
+    }
+    if (resolved.IsImmediate()) {
+        switch (resolved.U32()) {
+        case 0xffffffffU:
+            return MaskMinusOne;
+        case 0:
+            return MaskZero;
+        case 1:
+            return MaskOne;
+        default:
+            return 0;
+        }
+    }
+    if (depth >= MaxMaskDepth) {
+        return 0;
+    }
+    const IR::Inst* const inst{resolved.TryInstRecursive()};
+    if (!inst) {
+        return 0;
+    }
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::SelectU32: {
+        const u32 true_values{MaskValues(inst->Arg(1), depth + 1, visits_left)};
+        const u32 false_values{MaskValues(inst->Arg(2), depth + 1, visits_left)};
+        return true_values != 0 && false_values != 0 ? true_values | false_values : 0;
+    }
+    case IR::Opcode::INeg32: {
+        const u32 values{MaskValues(inst->Arg(0), depth + 1, visits_left)};
+        return (values & MaskZero) | ((values & MaskMinusOne) << 2) | ((values & MaskOne) >> 2);
+    }
+    case IR::Opcode::IAdd32:
+        for (size_t index = 0; index < 2; ++index) {
+            const IR::Value step{inst->Arg(1 - index).Resolve()};
+            if (!step.IsImmediate() || step.Type() != IR::Type::U32) {
+                continue;
+            }
+            const u32 values{MaskValues(inst->Arg(index), depth + 1, visits_left)};
+            if (step.U32() == 1 && (values & MaskOne) == 0) {
+                return values << 1;
+            }
+            if (step.U32() == 0xffffffffU && (values & MaskMinusOne) == 0) {
+                return values >> 1;
+            }
+            return 0;
+        }
+        return 0;
+    case IR::Opcode::Phi: {
+        u32 values{};
+        for (size_t index = 0; index < inst->NumArgs(); ++index) {
+            const u32 incoming{MaskValues(inst->Arg(index), depth + 1, visits_left)};
+            if (incoming == 0) {
+                return 0;
+            }
+            values |= incoming;
+        }
+        return values;
+    }
+    default:
+        return 0;
+    }
+}
+
+void FoldSMax32(IR::Block& block, IR::Inst& inst) {
+    for (size_t index = 0; index < 2; ++index) {
+        const IR::Value value{inst.Arg(index).Resolve()};
+        const IR::Inst* const negation{inst.Arg(1 - index).TryInstRecursive()};
+        if (!negation || negation->GetOpcode() != IR::Opcode::INeg32 ||
+            negation->Arg(0).Resolve() != value) {
+            continue;
+        }
+        IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
+        const IR::Inst* const select{value.TryInstRecursive()};
+        if (select && select->GetOpcode() == IR::Opcode::SelectU32 &&
+            IsMaskConstant(select->Arg(1).Resolve()) && IsMaskConstant(select->Arg(2).Resolve())) {
+            inst.ReplaceUsesWith(ir.Select(IR::U1{select->Arg(0)},
+                                           ir.Imm32(select->Arg(1).Resolve().U32() != 0 ? 1U : 0U),
+                                           ir.Imm32(select->Arg(2).Resolve().U32() != 0 ? 1U : 0U)));
+            return;
+        }
+        u32 visits_left{MaxMaskVisits};
+        if (MaskValues(value, 0, visits_left) != 0) {
+            // Exact only for {-1,0,1}; leave all unproved integers in their original form.
+            inst.ReplaceUsesWith(ir.BitwiseAnd(IR::U32{value}, ir.Imm32(1)));
+            return;
+        }
+    }
+}
+
 void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
     switch (inst.GetOpcode()) {
     case IR::Opcode::GetRegister:
@@ -963,6 +1072,8 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
         return FoldAdd<u32>(block, inst);
     case IR::Opcode::ISub32:
         return FoldISub32(inst);
+    case IR::Opcode::SMax32:
+        return FoldSMax32(block, inst);
     case IR::Opcode::IMul32:
         FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a * b; });
         return;

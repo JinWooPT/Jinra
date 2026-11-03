@@ -176,7 +176,42 @@ struct StorageBufferDescriptor {
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
 
+enum class TextureBufferNumericType : u8 {
+    Float,
+    Uint,
+    Sint,
+};
+
+[[nodiscard]] constexpr TextureBufferNumericType TextureBufferType(TexturePixelFormat format) {
+    switch (format) {
+    case TexturePixelFormat::A8B8G8R8_UINT:
+    case TexturePixelFormat::A2B10G10R10_UINT:
+    case TexturePixelFormat::R8_UINT:
+    case TexturePixelFormat::R16G16B16A16_UINT:
+    case TexturePixelFormat::R32G32B32A32_UINT:
+    case TexturePixelFormat::R16_UINT:
+    case TexturePixelFormat::R16G16_UINT:
+    case TexturePixelFormat::R8G8_UINT:
+    case TexturePixelFormat::R32G32_UINT:
+    case TexturePixelFormat::R32_UINT:
+        return TextureBufferNumericType::Uint;
+    case TexturePixelFormat::A8B8G8R8_SINT:
+    case TexturePixelFormat::R8_SINT:
+    case TexturePixelFormat::R16G16B16A16_SINT:
+    case TexturePixelFormat::R32G32B32A32_SINT:
+    case TexturePixelFormat::R32G32_SINT:
+    case TexturePixelFormat::R16_SINT:
+    case TexturePixelFormat::R16G16_SINT:
+    case TexturePixelFormat::R8G8_SINT:
+    case TexturePixelFormat::R32_SINT:
+        return TextureBufferNumericType::Sint;
+    default:
+        return TextureBufferNumericType::Float;
+    }
+}
+
 struct TextureBufferDescriptor {
+    TextureBufferNumericType numeric_type{TextureBufferNumericType::Float};
     bool has_secondary;
     u32 cbuf_index;
     u32 cbuf_offset;

@@ -37,6 +37,7 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
@@ -277,8 +278,13 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
-        const u64 fence = RequestSyncOperation([this, &raster_area]() {
+        const u64 fence = RequestSyncOperation([this, raster_area]() {
             const VideoCommon::NativeReadbackScope scope{VideoCommon::NativeReadbackReason::GuestRead};
+            if (g_native_channels.load(std::memory_order_relaxed)) {
+                // Apply pending guest writes before copying GPU data back over guest memory.
+                // Adapted from PokeDinner commit 06e211e0d0a1.
+                InvalidateGPUCache();
+            }
             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
         });
         gpu_thread.TickGPU(is_async);

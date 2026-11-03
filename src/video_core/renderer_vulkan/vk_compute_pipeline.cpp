@@ -235,6 +235,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                 if (const auto explicit_format{PixelFormatFromImageFormat(desc.format)}) {
                     format = *explicit_format;
                 }
+            } else {
+                format = ResolveTextureBufferFormat(desc, format, image_view.GpuAddr(),
+                                                    image_view.BufferSize());
             }
             buffer_cache.BindComputeTextureBuffer(index, image_view.GpuAddr(),
                                                   image_view.BufferSize(), format,

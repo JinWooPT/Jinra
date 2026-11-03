@@ -13,6 +13,7 @@ if (YUZU_USE_BUNDLED_QT AND LINUX)
 endif()
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/VERSION")
 file(STRINGS "${PROJECT_SOURCE_DIR}/VERSION" JINRA_VERSION LIMIT_COUNT 1)
 configure_file(jinra_build_version.h.in jinra_build_version.h @ONLY)
 option(JINRA_UPDATE_TESTS "Build the focused Jinra release/update tests" OFF)

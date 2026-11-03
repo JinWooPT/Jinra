@@ -17,6 +17,7 @@ add_executable(tests
     common/undefined_fix.cpp
     common/unique_function.cpp
     core/core_timing.cpp
+    core/device_memory_manager.cpp
     core/audio_revision.cpp
     core/vfs_file_limit.cpp
     core/address_space.cpp

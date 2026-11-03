@@ -2569,7 +2569,7 @@ TextureBufferBinding BufferCache<P>::GetTextureBufferBinding(GPUVAddr gpu_addr, 
         binding.device_addr = 0;
         binding.size = 0;
         binding.buffer_id = NULL_BUFFER_ID;
-        binding.format = PixelFormat::Invalid;
+        binding.format = format;
     } else {
         binding.device_addr = *device_addr;
         binding.size = size;

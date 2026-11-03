@@ -6,6 +6,8 @@
 #include "shader_recompiler/frontend/maxwell/translate/impl/impl.h"
 
 namespace Shader::Maxwell {
+[[nodiscard]] IR::U32 ConvertF32ToS32Saturated(IR::IREmitter& ir, const IR::F32& rounded);
+
 [[nodiscard]] IR::U1 IntegerCompare(IR::IREmitter& ir, const IR::U32& operand_1,
                                     const IR::U32& operand_2, CompareOp compare_op, bool is_signed);
 

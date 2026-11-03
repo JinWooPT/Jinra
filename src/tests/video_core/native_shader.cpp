@@ -14,6 +14,8 @@
 #include <unordered_map>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <spirv/unified1/spirv.hpp11>
+#include <spirv/unified1/GLSL.std.450.h>
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/buffer_cache/storage_range_groups.h"
 #include "video_core/buffer_cache/download_copy_batches.h"
@@ -37,6 +39,7 @@
 #include "shader_recompiler/frontend/ampere/program_override.h"
 #include "shader_recompiler/frontend/ampere/program_capture.h"
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
+#include "shader_recompiler/frontend/ampere/visitor.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/modifiers.h"
 #include "shader_recompiler/frontend/maxwell/decode.h"
@@ -47,6 +50,7 @@
 #include "shader_recompiler/ir_opt/buffer_texture.h"
 #include "shader_recompiler/ir_opt/conditional_phi.h"
 #include "shader_recompiler/frontend/maxwell/translate/impl/impl.h"
+#include "video_core/renderer_vulkan/vk_buffer_cache.h"
 
 namespace {
 namespace IR = Shader::IR;
@@ -403,6 +407,7 @@ struct ScalarNativeMachine {
     std::unordered_map<u32, u32> attributes;
     u32 workgroup_barriers{}, device_barriers{}, shared_memory_barriers{};
     bool carry{}, zero{}, sign{}, overflow{};
+    bool check_defined_conversions{};
     void Execute(IR::Block& block) {
         std::unordered_map<const IR::Inst*, u64> values;
         std::unordered_map<const IR::Inst*, std::array<u32, 4>> vectors;
@@ -482,7 +487,11 @@ struct ScalarNativeMachine {
             case IR::Opcode::FPClamp32: result = std::bit_cast<u32>(std::clamp(std::bit_cast<float>(static_cast<u32>(arg(0))), std::bit_cast<float>(static_cast<u32>(arg(1))), std::bit_cast<float>(static_cast<u32>(arg(2))))); break;
             case IR::Opcode::ConvertS32F32: {
                 const float value = std::bit_cast<float>(static_cast<u32>(arg(0)));
-                result = std::isnan(value) ? 0x87654321U : static_cast<u32>(static_cast<s32>(value));
+                const bool defined = value >= -0x1p31f && value < 0x1p31f;
+                if (check_defined_conversions) {
+                    REQUIRE(defined);
+                }
+                result = defined ? static_cast<u32>(static_cast<s32>(value)) : 0x87654321U;
                 break;
             }
             case IR::Opcode::GetRegister: result = inst.Arg(0).Reg() == IR::Reg::RZ ? 0 : regs[static_cast<u32>(inst.Arg(0).Reg())]; break;
@@ -603,6 +612,37 @@ void TranslateScalarNative(std::span<const Native> input, IR::Block& block, bool
         }
     }
 }
+}
+
+TEST_CASE("Signed native float-to-int conversion saturates without undefined inputs",
+          "[native-shader][f32-saturation]") {
+    const bool direct = GENERATE(false, true);
+    constexpr Native floor_f2i{{0x00027305, 0x00000008, 0x00207100, 0}};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    if (direct) {
+        EmptyEnvironment env;
+        Shader::Ampere::Visitor{env, block, floor_f2i, 0, nullptr}.Run();
+    } else {
+        TranslateScalarNative(std::array{floor_f2i, VertexTransform.back()}, block);
+    }
+
+    constexpr s32 min = (std::numeric_limits<s32>::min)();
+    constexpr s32 max = (std::numeric_limits<s32>::max)();
+    constexpr float inf = std::numeric_limits<float>::infinity();
+    constexpr float nan = std::numeric_limits<float>::quiet_NaN();
+    for (const auto& [input, expected] : std::array<std::pair<float, s32>, 11>{{
+             {-inf, min}, {-0x1p32f, min}, {-0x1p31f, min}, {-3.25f, -4}, {-0.0f, 0},
+             {3.75f, 3}, {0x1.fffffep30f, 2147483520}, {0x1p31f, max}, {inf, max},
+             {nan, 0}, {-nan, 0},
+         }}) {
+        CAPTURE(direct, input);
+        ScalarNativeMachine machine;
+        machine.check_defined_conversions = true;
+        machine.regs[8] = std::bit_cast<u32>(input);
+        machine.Execute(block);
+        REQUIRE(machine.regs[2] == static_cast<u32>(expected));
+    }
 }
 
 
@@ -10169,4 +10209,527 @@ TEST_CASE("Native calls to a two-instruction return stub retain the caller link"
         }
     }
     REQUIRE(stores == 1);
+}
+
+namespace {
+class TexelBufferFixtureEnvironment final : public VideoCommon::GenericEnvironment {
+public:
+    TexelBufferFixtureEnvironment() {
+        stage = Shader::Stage::Compute;
+        code = {0};
+        cached_lowest = cached_highest = 0;
+        workgroup_size = {1, 1, 1};
+        for (u32 index = 0; index < 3; ++index) {
+            cbuf_values.emplace(index * 8, index + 1);
+            texture_types.emplace(index + 1, Shader::TextureType::Buffer);
+        }
+        texture_pixel_formats.emplace(1, Shader::TexturePixelFormat::R32_FLOAT);
+        texture_pixel_formats.emplace(2, Shader::TexturePixelFormat::R32_UINT);
+        texture_pixel_formats.emplace(3, Shader::TexturePixelFormat::R32_SINT);
+    }
+    u32 ReadCbufValue(u32 bank, u32 offset) override {
+        return cbuf_values.at((u64{bank} << 32) | offset);
+    }
+    Shader::TextureType ReadTextureType(u32 handle) override { return texture_types.at(handle); }
+    Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override {
+        return texture_pixel_formats.at(handle);
+    }
+    bool IsTexturePixelFormatInteger(u32 handle) override {
+        return Shader::TextureBufferType(ReadTexturePixelFormat(handle)) != Shader::TextureBufferNumericType::Float;
+    }
+    u32 ReadViewportTransformState() override { return 1; }
+    std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override { return {}; }
+};
+
+void AddTypedTexelFetches(Shader::Environment& env, IR::Block& block, IR::Program& program) {
+    IR::IREmitter ir{block};
+    IR::TextureInstInfo flags{};
+    flags.type.Assign(Shader::TextureType::Buffer);
+    for (u32 index = 0; index < 3; ++index) {
+        (void)ir.ImageFetch(ir.Imm32(index * 8), ir.Imm32(0U), {}, {}, {}, flags);
+    }
+    program.stage = Shader::Stage::Compute;
+    program.workgroup_size = {1, 1, 1};
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    IR::AbstractSyntaxNode body, terminal;
+    body.type = IR::AbstractSyntaxNode::Type::Block;
+    body.data.block = &block;
+    terminal.type = IR::AbstractSyntaxNode::Type::Return;
+    program.syntax_list = {body, terminal};
+    Shader::HostTranslateInfo host;
+    Shader::Optimization::TexturePass(env, program, host);
+}
+} // namespace
+
+TEST_CASE("Texel buffer numeric types distinguish integer and normalized samples", "[native-shader][texel-buffer]") {
+    using Type = Shader::TextureBufferNumericType;
+    using Format = Shader::TexturePixelFormat;
+    REQUIRE(Shader::TextureBufferType(Format::R32_UINT) == Type::Uint);
+    REQUIRE(Shader::TextureBufferType(Format::R8_UINT) == Type::Uint);
+    REQUIRE(Shader::TextureBufferType(Format::R32_SINT) == Type::Sint);
+    REQUIRE(Shader::TextureBufferType(Format::R8_SINT) == Type::Sint);
+    REQUIRE(Shader::TextureBufferType(Format::R32_FLOAT) == Type::Float);
+    REQUIRE(Shader::TextureBufferType(Format::R8_UNORM) == Type::Float);
+    REQUIRE(Shader::TextureBufferType(Format::R8_SNORM) == Type::Float);
+}
+
+TEST_CASE("A shader can fetch float unsigned and signed texel buffers without numeric conversion", "[native-shader][texel-buffer]") {
+    using Type = Shader::TextureBufferNumericType;
+    TexelBufferFixtureEnvironment env;
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::Program program;
+    AddTypedTexelFetches(env, block, program);
+    REQUIRE(program.info.texture_buffer_descriptors.size() == 3);
+    REQUIRE(program.info.texture_buffer_descriptors[0].numeric_type == Type::Float);
+    REQUIRE(program.info.texture_buffer_descriptors[1].numeric_type == Type::Uint);
+    REQUIRE(program.info.texture_buffer_descriptors[2].numeric_type == Type::Sint);
+    Shader::Profile profile;
+    profile.supported_spirv = 0x00010300;
+    const auto binary = Shader::Backend::SPIRV::EmitSPIRV(profile, program);
+    REQUIRE(binary.size() > 5);
+    std::unordered_map<u32, Type> scalars;
+    std::unordered_map<u32, u32> vector_components;
+    std::unordered_map<u32, Type> fetch_results;
+    std::array<u32, 3> image_types{}, fetch_types{};
+    u32 returned_bitcasts{};
+    for (size_t cursor = 5; cursor < binary.size();) {
+        const u32 count = binary[cursor] >> 16;
+        REQUIRE(count != 0);
+        REQUIRE(cursor + count <= binary.size());
+        const auto op = static_cast<spv::Op>(binary[cursor] & 0xffff);
+        const auto* words = binary.data() + cursor;
+        if (op == spv::Op::OpTypeFloat && words[2] == 32) scalars[words[1]] = Type::Float;
+        if (op == spv::Op::OpTypeInt && words[2] == 32)
+            scalars[words[1]] = words[3] ? Type::Sint : Type::Uint;
+        if (op == spv::Op::OpTypeVector) vector_components[words[1]] = words[2];
+        if (op == spv::Op::OpTypeImage && words[3] == static_cast<u32>(spv::Dim::Buffer))
+            ++image_types[static_cast<size_t>(scalars.at(words[2]))];
+        if (op == spv::Op::OpImageFetch) {
+            const auto type = scalars.at(vector_components.at(words[1]));
+            fetch_results.emplace(words[2], type);
+            ++fetch_types[static_cast<size_t>(type)];
+        }
+        if (op == spv::Op::OpBitcast && fetch_results.contains(words[3])) {
+            REQUIRE(fetch_results.at(words[3]) != Type::Float);
+            REQUIRE(scalars.at(vector_components.at(words[1])) == Type::Float);
+            ++returned_bitcasts;
+        }
+        if (op == spv::Op::OpConvertSToF || op == spv::Op::OpConvertUToF)
+            REQUIRE_FALSE(fetch_results.contains(words[3]));
+        cursor += count;
+    }
+    REQUIRE(image_types == std::array<u32, 3>{1, 1, 1});
+    REQUIRE(fetch_types == std::array<u32, 3>{1, 1, 1});
+    REQUIRE(returned_bitcasts == 2);
+}
+
+TEST_CASE("Texel buffer classes survive stage joins and serialized environments", "[native-shader][texel-buffer]") {
+    using Type = Shader::TextureBufferNumericType;
+    Shader::Info base, source;
+    Shader::TextureBufferDescriptor descriptor{};
+    descriptor.count = 1;
+    descriptor.numeric_type = Type::Uint;
+    base.texture_buffer_descriptors.push_back(descriptor);
+    source.texture_buffer_descriptors.push_back(descriptor);
+    descriptor.numeric_type = Type::Sint;
+    source.texture_buffer_descriptors.push_back(descriptor);
+    Shader::Optimization::JoinTextureInfo(base, source);
+    REQUIRE(base.texture_buffer_descriptors.size() == 2);
+    REQUIRE(base.texture_buffer_descriptors[0].numeric_type == Type::Uint);
+    REQUIRE(base.texture_buffer_descriptors[1].numeric_type == Type::Sint);
+
+    TexelBufferFixtureEnvironment env;
+    const auto path = std::filesystem::temp_directory_path() / "jinra-texel-buffer-cache-test.bin";
+    {
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        REQUIRE(file.good());
+        env.Serialize(file);
+    }
+    VideoCommon::FileEnvironment restored;
+    {
+        std::ifstream file(path, std::ios::binary);
+        restored.Deserialize(file);
+        REQUIRE(file.good());
+    }
+    std::filesystem::remove(path);
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::Program program;
+    AddTypedTexelFetches(restored, block, program);
+    REQUIRE(program.info.texture_buffer_descriptors.size() == 3);
+    REQUIRE(program.info.texture_buffer_descriptors[0].numeric_type == Type::Float);
+    REQUIRE(program.info.texture_buffer_descriptors[1].numeric_type == Type::Uint);
+    REQUIRE(program.info.texture_buffer_descriptors[2].numeric_type == Type::Sint);
+}
+
+TEST_CASE("Vulkan texel bindings preserve real integer formats and type null slots", "[native-shader][texel-buffer]") {
+    using Format = VideoCore::Surface::PixelFormat;
+    Shader::TextureBufferDescriptor descriptor{};
+    descriptor.numeric_type = Shader::TextureBufferNumericType::Uint;
+    REQUIRE(Vulkan::ResolveTextureBufferFormat(descriptor, Format::R32_UINT, 0x1000, 16) == Format::R32_UINT);
+    REQUIRE_THROWS_AS(Vulkan::ResolveTextureBufferFormat(descriptor, Format::R32_FLOAT, 0x1000, 16), Shader::RuntimeError);
+    descriptor.numeric_type = Shader::TextureBufferNumericType::Float;
+    REQUIRE(Vulkan::ResolveTextureBufferFormat(descriptor, Format::R32_UINT, 0, 0) == Format::R32_FLOAT);
+    descriptor.numeric_type = Shader::TextureBufferNumericType::Sint;
+    REQUIRE(Vulkan::ResolveTextureBufferFormat(descriptor, Format::Invalid, 0, 0) == Format::R32_SINT);
+}
+
+namespace {
+
+struct PredicateMaskFixture {
+    PredicateMaskFixture() {
+        program.blocks = {&root, &left, &right, &merge};
+        program.post_order_blocks = {&merge, &right, &left, &root};
+    }
+
+    void Fold() {
+        Shader::Optimization::ConstantPropagationPass(environment, program);
+    }
+
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block root{pool}, left{pool}, right{pool}, merge{pool};
+    IR::Program program;
+    EmptyEnvironment environment;
+};
+
+struct PredicateMaskInputs {
+    u32 predicates{};
+    u32 register_value{};
+    size_t phi_input{};
+};
+
+u32 SignedMaskMaximum(u32 value) {
+    const u32 negated = 0U - value;
+    return std::bit_cast<u32>((std::max)(std::bit_cast<s32>(value), std::bit_cast<s32>(negated)));
+}
+
+// Independent IR-value evaluation: resolve the pass's Identity replacement and choose a Phi
+// predecessor explicitly. Wrapping unsigned subtraction also defines the INT_MIN oracle.
+u32 EvaluatePredicateMask(IR::Value value, PredicateMaskInputs inputs, u32 depth = 0) {
+    REQUIRE(depth < 64);
+    value = value.Resolve();
+    if (value.IsImmediate()) {
+        return value.Type() == IR::Type::U1 ? static_cast<u32>(value.U1()) : value.U32();
+    }
+    const IR::Inst* const inst = value.InstRecursive();
+    const auto arg = [&](size_t index) {
+        return EvaluatePredicateMask(inst->Arg(index), inputs, depth + 1);
+    };
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::GetPred:
+        return (inputs.predicates >> static_cast<u32>(inst->Arg(0).Pred())) & 1U;
+    case IR::Opcode::GetRegister:
+        return inputs.register_value;
+    case IR::Opcode::SelectU32:
+        return arg(0) ? arg(1) : arg(2);
+    case IR::Opcode::INeg32:
+        return 0U - arg(0);
+    case IR::Opcode::IAdd32:
+        return arg(0) + arg(1);
+    case IR::Opcode::ISub32:
+        return arg(0) - arg(1);
+    case IR::Opcode::IAbs32: {
+        const u32 input = arg(0);
+        return std::bit_cast<s32>(input) < 0 ? 0U - input : input;
+    }
+    case IR::Opcode::SMax32:
+        return std::bit_cast<u32>((std::max)(std::bit_cast<s32>(arg(0)),
+                                            std::bit_cast<s32>(arg(1))));
+    case IR::Opcode::BitwiseAnd32:
+        return arg(0) & arg(1);
+    case IR::Opcode::Phi:
+        REQUIRE(inputs.phi_input < inst->NumArgs());
+        return arg(inputs.phi_input);
+    default:
+        throw std::logic_error("Unexpected opcode in predicate-mask test evaluation");
+    }
+}
+
+IR::U32 MakeMaskMaximum(IR::IREmitter& ir, IR::U32 mask, bool reversed = false) {
+    const IR::U32 negative{ir.INeg(mask)};
+    return reversed ? ir.SMax(negative, mask) : ir.SMax(mask, negative);
+}
+
+} // namespace
+
+TEST_CASE("Predicate mask maxima fold every direct select without changing signed results",
+          "[native-shader][predicate-mask]") {
+    for (const u32 first : {0xffffffffU, 0U, 1U}) {
+        for (const u32 second : {0xffffffffU, 0U, 1U}) {
+            for (const bool reversed : {false, true}) {
+                CAPTURE(first, second, reversed);
+                PredicateMaskFixture fixture;
+                IR::IREmitter ir{fixture.merge};
+                const IR::U32 mask{ir.Select(ir.GetPred(IR::Pred::P0), ir.Imm32(first),
+                                            ir.Imm32(second))};
+                const auto result = MakeMaskMaximum(ir, mask, reversed);
+                fixture.Fold();
+                REQUIRE(result.Resolve().InstRecursive()->GetOpcode() == IR::Opcode::SelectU32);
+                for (u32 condition = 0; condition < 2; ++condition) {
+                    REQUIRE(EvaluatePredicateMask(result, {condition}) ==
+                            SignedMaskMaximum(condition ? first : second));
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Predicate mask maxima fold the merged add-negate Phi regression",
+          "[native-shader][predicate-mask]") {
+    for (const bool reversed : {false, true}) {
+        PredicateMaskFixture fixture;
+        IR::IREmitter root_ir{fixture.root}, left_ir{fixture.left}, right_ir{fixture.right};
+        const IR::U32 selected{root_ir.Select(root_ir.GetPred(IR::Pred::P0), root_ir.Imm32(0U),
+                                             root_ir.Imm32(1U))};
+        const auto first = left_ir.IAdd(left_ir.INeg(selected), left_ir.Imm32(1U));
+        const auto second = right_ir.INeg(selected);
+        const auto phi = fixture.merge.PrependNewInst(fixture.merge.end(), IR::Opcode::Phi);
+        phi->SetFlags(IR::Type::U32);
+        phi->AddPhiOperand(&fixture.left, first);
+        phi->AddPhiOperand(&fixture.right, second);
+        IR::IREmitter ir{fixture.merge};
+        const IR::U32 mask{IR::Value{&*phi}};
+        const auto result = MakeMaskMaximum(ir, mask, reversed);
+        fixture.Fold();
+        REQUIRE(result.Resolve().InstRecursive()->GetOpcode() == IR::Opcode::BitwiseAnd32);
+        REQUIRE(result.Resolve().InstRecursive()->Arg(0).Resolve() == mask.Resolve());
+        for (u32 condition = 0; condition < 2; ++condition) {
+            for (size_t predecessor = 0; predecessor < 2; ++predecessor) {
+                const PredicateMaskInputs inputs{condition, 0, predecessor};
+                REQUIRE(EvaluatePredicateMask(result, inputs) ==
+                        SignedMaskMaximum(EvaluatePredicateMask(mask, inputs)));
+            }
+        }
+    }
+}
+
+TEST_CASE("Predicate mask proofs accept safe steps and reject steps outside the domain",
+          "[native-shader][predicate-mask]") {
+    for (const bool positive : {false, true}) {
+        for (const bool escapes : {false, true}) {
+            for (const bool step_first : {false, true}) {
+                CAPTURE(positive, escapes, step_first);
+                PredicateMaskFixture fixture;
+                IR::IREmitter ir{fixture.merge};
+                const u32 lower = positive != escapes ? 0xffffffffU : 0U;
+                const u32 upper = positive != escapes ? 0U : 1U;
+                const IR::U32 selected{ir.Select(ir.GetPred(IR::Pred::P0), ir.Imm32(lower),
+                                                 ir.Imm32(upper))};
+                const auto step = ir.Imm32(positive ? 1U : 0xffffffffU);
+                const IR::U32 mask{step_first ? ir.IAdd(step, selected) : ir.IAdd(selected, step)};
+                const auto result = MakeMaskMaximum(ir, mask);
+                fixture.Fold();
+                REQUIRE(result.Resolve().InstRecursive()->GetOpcode() ==
+                        (escapes ? IR::Opcode::SMax32 : IR::Opcode::BitwiseAnd32));
+                for (u32 condition = 0; condition < 2; ++condition) {
+                    REQUIRE(EvaluatePredicateMask(result, {condition}) ==
+                            SignedMaskMaximum(EvaluatePredicateMask(mask, {condition})));
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Predicate mask maxima leave unknown values and unsafe select or Phi arms unchanged",
+          "[native-shader][predicate-mask]") {
+    for (const u32 outside : {2U, 0xfffffffeU, 0x80000000U, 0x7fffffffU}) {
+        for (const bool merge_phi : {false, true}) {
+            CAPTURE(outside, merge_phi);
+            PredicateMaskFixture fixture;
+            IR::IREmitter ir{fixture.merge};
+            IR::U32 mask;
+            if (merge_phi) {
+                const auto phi = fixture.merge.PrependNewInst(fixture.merge.end(), IR::Opcode::Phi);
+                phi->SetFlags(IR::Type::U32);
+                phi->AddPhiOperand(&fixture.left, ir.Imm32(outside));
+                phi->AddPhiOperand(&fixture.right, ir.Imm32(0U));
+                mask = IR::U32{IR::Value{&*phi}};
+            } else {
+                mask = IR::U32{ir.Select(ir.GetPred(IR::Pred::P0), ir.Imm32(outside), ir.Imm32(0U))};
+            }
+            const auto result = MakeMaskMaximum(ir, mask);
+            fixture.Fold();
+            REQUIRE(result.Resolve().InstRecursive()->GetOpcode() == IR::Opcode::SMax32);
+            for (u32 condition = 0; condition < 2; ++condition) {
+                for (size_t predecessor = 0; predecessor < 2; ++predecessor) {
+                    const PredicateMaskInputs inputs{condition, 0, predecessor};
+                    REQUIRE(EvaluatePredicateMask(result, inputs) ==
+                            SignedMaskMaximum(EvaluatePredicateMask(mask, inputs)));
+                }
+            }
+        }
+    }
+    PredicateMaskFixture fixture;
+    IR::IREmitter ir{fixture.merge};
+    const auto mask = ir.GetReg(IR::Reg::R1);
+    const auto result = MakeMaskMaximum(ir, mask);
+    fixture.Fold();
+    REQUIRE(result.Resolve().InstRecursive()->GetOpcode() == IR::Opcode::SMax32);
+    u32 value = 0x80000000U;
+    for (u32 index = 0; index < 2048; ++index) {
+        REQUIRE(EvaluatePredicateMask(result, {0, value}) == SignedMaskMaximum(value));
+        value = value * 1664525U + 1013904223U;
+    }
+}
+
+TEST_CASE("Predicate mask maxima require the same resolved SSA value",
+          "[native-shader][predicate-mask]") {
+    PredicateMaskFixture fixture;
+    IR::IREmitter ir{fixture.merge};
+    const IR::U32 first{ir.Select(ir.GetPred(IR::Pred::P0), ir.Imm32(0xffffffffU), ir.Imm32(0U))};
+    const IR::U32 second{ir.Select(ir.GetPred(IR::Pred::P1), ir.Imm32(0xffffffffU), ir.Imm32(1U))};
+    const IR::U32 negated{ir.INeg(second)};
+    const auto different = ir.SMax(first, negated);
+    const auto identity = fixture.merge.PrependNewInst(fixture.merge.end(), IR::Opcode::Identity,
+                                                      {first});
+    const auto same = ir.SMax(IR::U32{IR::Value{&*identity}}, IR::U32{ir.INeg(first)});
+    fixture.Fold();
+    REQUIRE(different.Resolve().InstRecursive()->GetOpcode() == IR::Opcode::SMax32);
+    REQUIRE(same.Resolve().InstRecursive()->GetOpcode() == IR::Opcode::SelectU32);
+    for (u32 conditions = 0; conditions < 4; ++conditions) {
+        const PredicateMaskInputs inputs{conditions};
+        const u32 expected = std::bit_cast<u32>((std::max)(
+            std::bit_cast<s32>(EvaluatePredicateMask(first, inputs)),
+            std::bit_cast<s32>(EvaluatePredicateMask(negated, inputs))));
+        REQUIRE(EvaluatePredicateMask(different, inputs) == expected);
+        REQUIRE(EvaluatePredicateMask(same, inputs) ==
+                SignedMaskMaximum(EvaluatePredicateMask(first, inputs)));
+    }
+}
+
+TEST_CASE("Predicate mask proofs honor depth and total visit limits",
+          "[native-shader][predicate-mask]") {
+    for (const u32 negations : {7U, 8U}) {
+        PredicateMaskFixture fixture;
+        IR::IREmitter ir{fixture.merge};
+        IR::U32 mask{ir.Select(ir.GetPred(IR::Pred::P0), ir.Imm32(0xffffffffU), ir.Imm32(0U))};
+        for (u32 index = 0; index < negations; ++index) mask = IR::U32{ir.INeg(mask)};
+        const auto result = MakeMaskMaximum(ir, mask);
+        fixture.Fold();
+        REQUIRE(result.Resolve().InstRecursive()->GetOpcode() ==
+                (negations == 7 ? IR::Opcode::BitwiseAnd32 : IR::Opcode::SMax32));
+        for (u32 condition = 0; condition < 2; ++condition)
+            REQUIRE(EvaluatePredicateMask(result, {condition}) ==
+                    SignedMaskMaximum(EvaluatePredicateMask(mask, {condition})));
+    }
+    // Both shared DAGs stay within depth8; expanding their repeated arms visits255 or511 nodes.
+    for (const u32 repeats : {6U, 7U}) {
+        PredicateMaskFixture fixture;
+        IR::IREmitter ir{fixture.merge};
+        const auto condition = ir.GetPred(IR::Pred::P0);
+        IR::U32 mask{ir.Select(condition, ir.Imm32(0xffffffffU), ir.Imm32(0U))};
+        for (u32 index = 0; index < repeats; ++index)
+            mask = IR::U32{ir.Select(condition, mask, mask)};
+        const auto result = MakeMaskMaximum(ir, mask);
+        fixture.Fold();
+        REQUIRE(result.Resolve().InstRecursive()->GetOpcode() ==
+                (repeats == 6 ? IR::Opcode::BitwiseAnd32 : IR::Opcode::SMax32));
+        for (u32 predicate = 0; predicate < 2; ++predicate)
+            REQUIRE(EvaluatePredicateMask(result, {predicate}) ==
+                    SignedMaskMaximum(EvaluatePredicateMask(mask, {predicate})));
+    }
+}
+
+TEST_CASE("Predicate mask proofs preserve cycles and unsupported forms conservatively",
+          "[native-shader][predicate-mask]") {
+    for (u32 scenario = 0; scenario < 6; ++scenario) {
+        CAPTURE(scenario);
+        PredicateMaskFixture fixture;
+        IR::IREmitter ir{fixture.merge};
+        IR::U32 mask;
+        if (scenario < 2) {
+            const auto phi = fixture.merge.PrependNewInst(fixture.merge.end(), IR::Opcode::Phi);
+            phi->SetFlags(IR::Type::U32);
+            mask = IR::U32{IR::Value{&*phi}};
+            if (scenario == 0) {
+                phi->AddPhiOperand(&fixture.root, ir.Imm32(0U));
+                phi->AddPhiOperand(&fixture.merge, mask);
+            }
+        } else if (scenario < 4) {
+            const IR::U32 selected{ir.Select(ir.GetPred(IR::Pred::P0), ir.Imm32(0U), ir.Imm32(1U))};
+            mask = scenario == 2 ? IR::U32{ir.ISub(ir.Imm32(1U), selected)}
+                                 : IR::U32{ir.IAbs(selected)};
+        } else if (scenario == 4) {
+            mask = IR::U32{ir.Select(ir.GetPred(IR::Pred::P0), ir.GetReg(IR::Reg::R1), ir.Imm32(0U))};
+        } else {
+            const auto unknown = ir.GetReg(IR::Reg::R1);
+            const auto phi = fixture.merge.PrependNewInst(fixture.merge.end(), IR::Opcode::Phi);
+            phi->SetFlags(IR::Type::U32);
+            phi->AddPhiOperand(&fixture.left, ir.Imm32(1U));
+            phi->AddPhiOperand(&fixture.right, unknown);
+            mask = IR::U32{IR::Value{&*phi}};
+        }
+        const auto result = MakeMaskMaximum(ir, mask);
+        fixture.Fold();
+        REQUIRE(result.Resolve().InstRecursive()->GetOpcode() == IR::Opcode::SMax32);
+        if (scenario >= 2) {
+            for (u32 condition = 0; condition < 2; ++condition) {
+                for (size_t predecessor = 0; predecessor < 2; ++predecessor) {
+                    const PredicateMaskInputs inputs{condition, 2U, predecessor};
+                    REQUIRE(EvaluatePredicateMask(result, inputs) ==
+                            SignedMaskMaximum(EvaluatePredicateMask(mask, inputs)));
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Floating min and max preserve a defined NaN result in emitted fragment shaders",
+          "[native-shader][nan-minmax]") {
+    constexpr u32 nan = 0x7fc00000U;
+    constexpr std::array<std::array<u32, 2>, 7> inputs{{
+        {nan, nan}, {nan, 0x40400000U}, {0x40400000U, nan},
+        {0x40400000U, 0xc0e00000U}, {0x7f800000U, 0xff800000U},
+        {0, 0x80000000U}, {0x80000000U, 0},
+    }};
+    for (const auto& pair : inputs) {
+        CAPTURE(pair[0], pair[1]);
+        Shader::ObjectPool<IR::Inst> pool;
+        IR::Block block{pool};
+        IR::IREmitter ir{block};
+        const auto a = ir.Imm32(std::bit_cast<f32>(pair[0]));
+        const auto b = ir.Imm32(std::bit_cast<f32>(pair[1]));
+        ir.SetFragColor(0, 0, IR::F32{ir.FPMax(a, b)});
+        ir.SetFragColor(0, 1, IR::F32{ir.FPMin(a, b)});
+        Shader::IR::Program program;
+        program.stage = Shader::Stage::Fragment;
+        program.info.stores_frag_color[0] = true;
+        program.blocks = {&block};
+        program.post_order_blocks = {&block};
+        IR::AbstractSyntaxNode body, terminal;
+        body.type = IR::AbstractSyntaxNode::Type::Block;
+        body.data.block = &block;
+        terminal.type = IR::AbstractSyntaxNode::Type::Return;
+        program.syntax_list = {body, terminal};
+        Shader::Profile profile;
+        profile.supported_spirv = 0x00010300;
+        Shader::RuntimeInfo runtime;
+        runtime.color_output_types.fill(Shader::AttributeType::Float);
+        Shader::Backend::Bindings bindings;
+        const auto binary = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
+        u32 defined_min{}, defined_max{}, undefined_nan_minmax{}, output_stores{};
+        for (size_t cursor = 5; cursor < binary.size();) {
+            const u32 count = binary[cursor] >> 16;
+            REQUIRE(count != 0);
+            REQUIRE(cursor + count <= binary.size());
+            const auto op = static_cast<spv::Op>(binary[cursor] & 0xffff);
+            if (op == spv::Op::OpExtInst) {
+                REQUIRE(count >= 5);
+                const auto instruction = binary[cursor + 4];
+                defined_min += instruction == GLSLstd450NMin;
+                defined_max += instruction == GLSLstd450NMax;
+                undefined_nan_minmax += instruction == GLSLstd450FMin ||
+                                        instruction == GLSLstd450FMax;
+            }
+            output_stores += op == spv::Op::OpStore;
+            cursor += count;
+        }
+        // These observable outputs must use the operations defined when both inputs are NaN.
+        REQUIRE(defined_min == 1);
+        REQUIRE(defined_max == 1);
+        REQUIRE(undefined_nan_minmax == 0);
+        REQUIRE(output_stores >= 2);
+    }
 }

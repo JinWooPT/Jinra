@@ -32,6 +32,10 @@ struct HostVertexBinding;
 
 class BufferCacheRuntime;
 
+[[nodiscard]] VideoCore::Surface::PixelFormat ResolveTextureBufferFormat(
+    const Shader::TextureBufferDescriptor& descriptor, VideoCore::Surface::PixelFormat format,
+    GPUVAddr address, u32 size);
+
 class Buffer : public VideoCommon::BufferBase {
 public:
     explicit Buffer(BufferCacheRuntime&, VideoCommon::NullBufferParams null_params);
@@ -46,6 +50,10 @@ public:
 
     [[nodiscard]] VkDeviceAddress DeviceAddress() const noexcept {
         return device_address;
+    }
+
+    [[nodiscard]] bool IsNull() const noexcept {
+        return !device || is_null;
     }
 
     [[nodiscard]] bool IsSparseCompatible() const noexcept {
@@ -241,6 +249,10 @@ public:
 
     void BindTextureBuffer(Buffer& buffer, u32 offset, u32 size,
                            VideoCore::Surface::PixelFormat format) {
+        if (buffer.IsNull()) {
+            offset = 0;
+            size = 16;
+        }
         guest_descriptor_queue.AddTexelBuffer(buffer.View(offset, size, format),
                                               buffer.DeviceAddress(), offset, size,
                                               TexelBufferFormat(format));

@@ -207,7 +207,8 @@ int main(int argc, char* argv[]) {
     main_window.show();
     if (qEnvironmentVariableIsSet("EDEN_BACKGROUND_TEST")) {
         const int seconds = qEnvironmentVariableIntValue("EDEN_BG_TEST_SECONDS");
-        QTimer::singleShot((seconds >= 30 && seconds <= 600 ? seconds : 120) * 1000,
+        const int maximum = qEnvironmentVariableIsSet("EDEN_EXTENDED_GPU_REPRO") ? 1800 : 600;
+        QTimer::singleShot((seconds >= 30 && seconds <= maximum ? seconds : 120) * 1000,
                            &main_window, [&main_window] { main_window.close(); });
     }
 

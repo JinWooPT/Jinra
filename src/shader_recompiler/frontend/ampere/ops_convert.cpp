@@ -72,6 +72,10 @@ void Visitor::F2I() {
     }
     // Destination widths: 8, 16 or 32 bits, saturating to the destination range.
     const u32 dst_bits = 8U << dst_size;
+    if (!half_source && dst_bits == 32 && dst_signed) {
+        X(dest, Maxwell::ConvertF32ToS32Saturated(ir, IR::F32{rounded}));
+        return;
+    }
     f64 max_bound, min_bound;
     if (dst_signed) {
         max_bound = static_cast<f64>((s64{1} << (dst_bits - 1)) - 1);

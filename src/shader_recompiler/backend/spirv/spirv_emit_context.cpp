@@ -1400,21 +1400,25 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
         return;
     }
     const spv::ImageFormat format{spv::ImageFormat::Unknown};
-    image_buffer_type = TypeImage(F32[1], spv::Dim::Buffer, 0U, false, false, 1, format);
-
-    const Id type{TypePointer(spv::StorageClass::UniformConstant, image_buffer_type)};
     texture_buffers.reserve(info.texture_buffer_descriptors.size());
     for (const TextureBufferDescriptor& desc : info.texture_buffer_descriptors) {
         if (desc.count != 1) {
             throw NotImplementedException("Array of texture buffers");
         }
-        const Id id{AddGlobalVariable(type, spv::StorageClass::UniformConstant)};
+        const Id sampled_type = desc.numeric_type == TextureBufferNumericType::Uint ? U32[1] :
+            desc.numeric_type == TextureBufferNumericType::Sint ? S32[1] : F32[1];
+        const Id image_type{TypeImage(sampled_type, spv::Dim::Buffer, 0U, false, false, 1, format)};
+        const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
+        const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "texbuf"));
         texture_buffers.push_back({
             .id = id,
+            .image_type = image_type,
+            .pointer_type = pointer_type,
             .count = desc.count,
+            .numeric_type = desc.numeric_type,
         });
         if (profile.supported_spirv >= 0x00010400) {
             interfaces.push_back(id);

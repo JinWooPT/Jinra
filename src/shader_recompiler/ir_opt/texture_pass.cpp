@@ -657,7 +657,8 @@ public:
                    desc.secondary_cbuf_offset == existing.secondary_cbuf_offset &&
                    desc.secondary_shift_left == existing.secondary_shift_left &&
                    desc.count == existing.count && desc.size_shift == existing.size_shift &&
-                   desc.has_secondary == existing.has_secondary;
+                   desc.has_secondary == existing.has_secondary &&
+                   desc.numeric_type == existing.numeric_type;
         });
     }
 
@@ -932,7 +933,12 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         }
         default:
             if (flags.type == TextureType::Buffer) {
+                if (count != 1) {
+                    throw NotImplementedException("Array of texture buffers has no fixed numeric type");
+                }
+                const auto numeric_type = TextureBufferType(ReadTexturePixelFormatCached(env, cbuf));
                 index = descriptors.Add(TextureBufferDescriptor{
+                    .numeric_type = numeric_type,
                     .has_secondary = cbuf.has_secondary,
                     .cbuf_index = cbuf.index,
                     .cbuf_offset = cbuf.offset,
@@ -943,6 +949,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .count = count,
                     .size_shift = size_shift,
                 });
+                flags.is_integer.Assign(numeric_type != TextureBufferNumericType::Float);
             } else {
                 if (!cbuf.buffer_source.enabled) count = std::min(count, sampled_dynamic_cap);
                 const bool is_integer{!cbuf.buffer_source.enabled && is_texture_pixel_format_integer(cbuf)};
