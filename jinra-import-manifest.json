@@ -1,0 +1,476 @@
+{
+  "base_commit": "c3dd05fb279b0e5b330964bf9983e4a88edc326e",
+  "target_repository": "JinWooPT/Jinra",
+  "target_branch": "jinra",
+  "patch_sha256": "17b9d5575b7eae849e0aadcac5d4873955f25a2bca69f41f4f3b8f41c002bc76",
+  "files": [
+    {
+      "path": "CMakeLists.txt",
+      "sha256_lf": "864142f6e6cdc93c3be9837d711fd98d4e9474bb0ee7886e9c0ec26b71f6cde9"
+    },
+    {
+      "path": "README.md",
+      "sha256_lf": "15c1d73265fbbad990e26f1c0a82eb4fe135dbf12ff21f742431e34328c0591b"
+    },
+    {
+      "path": "dist/controllers/dualsense.png",
+      "sha256_lf": "e8f72a679d2daa87c4ab93e677156b43ba3ea90cb7bad11e7d745d749ae0784a"
+    },
+    {
+      "path": "dist/controllers/dualsense.prompt.txt",
+      "sha256_lf": "095e1c5557248fce1591265305772fd6e8c1d220d7c38d6279de13d4c2f2c768"
+    },
+    {
+      "path": "dist/controllers/xbox.png",
+      "sha256_lf": "6818038737686252393a06d7e991418b5b89851d5419f7688f093225600e0a6f"
+    },
+    {
+      "path": "dist/controllers/xbox.prompt.txt",
+      "sha256_lf": "3d5ca15d7f1c639e5058652301b8fa37875a9881d9b729868383c04ef3ff0f67"
+    },
+    {
+      "path": "dist/eden.ico",
+      "sha256_lf": "4ef304a86bc40c8d82b71ef90516e7f681f462db758f87e0f98911ba7a8c9fde"
+    },
+    {
+      "path": "dist/jinra.png",
+      "sha256_lf": "3abcc044e1015639e2c729f46baf00700bc4d9bb2ef58ec5d88aae55df613cf1"
+    },
+    {
+      "path": "dist/jinra_profile.jpg",
+      "sha256_lf": "f62d1cd0e569ae10b8223f80c99196df39cdf1fab402882f1517d475d0969dd9"
+    },
+    {
+      "path": "docs/jinra-ui.md",
+      "sha256_lf": "26c89350081d95ea4ffc2d01a9623b2a9104b45d77dcf686aa53dfa7bc0dc454"
+    },
+    {
+      "path": "docs/nup-jinra.md",
+      "sha256_lf": "4ea82bbb7dc1c4c944fb619e2afb416cde70911f162914799aaea74ba484f6c0"
+    },
+    {
+      "path": "src/common/input.h",
+      "sha256_lf": "127e8853441025672305d9013d7774182be4bc395c899258abbd25b636ac1630"
+    },
+    {
+      "path": "src/common/input_replay_clock.h",
+      "sha256_lf": "4226b0164a28a037dc7997999219bed7b8f6738bea6a385ef719360652b01dd1"
+    },
+    {
+      "path": "src/common/settings.h",
+      "sha256_lf": "237488b8fd274143c8a18431192d505bfbfa5a6b85158172564149ea8e7cf85e"
+    },
+    {
+      "path": "src/core/CMakeLists.txt",
+      "sha256_lf": "4512143a99a487a807ad2cdb513ca4a02bb41d06fa7addb83d2934f5c12037b4"
+    },
+    {
+      "path": "src/core/constants.cpp",
+      "sha256_lf": "0f542b383098cd8a1e1308ed1b6431d49d478d99c71390087a9bf5a85be0881b"
+    },
+    {
+      "path": "src/core/constants.h",
+      "sha256_lf": "5b90db83d16c72d08fe94a5244f66f04ae65f46251f59049713dd2b6fccd1e6b"
+    },
+    {
+      "path": "src/core/core_timing.cpp",
+      "sha256_lf": "9afb99bd2e39dde1c3b1648a5457fe6c34255d5d23af7d6c1f3f9f9c16743a0f"
+    },
+    {
+      "path": "src/core/file_sys/nup_container.cpp",
+      "sha256_lf": "ccc9a9e5320a85f858175a5c11cec5720f54157e3de16dfb46bb453432f010db"
+    },
+    {
+      "path": "src/core/file_sys/nup_container.h",
+      "sha256_lf": "6b3bb984373591770e6a4e4470b18dde73c1bbec7f4b00bec7b864a16befc776"
+    },
+    {
+      "path": "src/core/hle/service/acc/acc.cpp",
+      "sha256_lf": "7e9bb18746db2d1f456bceb1ecafda4905e037f19830a473ab9dc38adfa2abfe"
+    },
+    {
+      "path": "src/core/hle/service/acc/profile_manager.cpp",
+      "sha256_lf": "bd6108a5bd58a9271e10cea714c7619ea4a5926001188b6c5dbdd51e64a85436"
+    },
+    {
+      "path": "src/core/hle/service/am/service/graphics_supervisor.cpp",
+      "sha256_lf": "564573de825fe0b24f9ed446fb8a1c1c87ab6e461c75e6f296788c258bb01406"
+    },
+    {
+      "path": "src/core/hle/service/nvdrv/devices/nvdisp_disp0.cpp",
+      "sha256_lf": "8c21837efeafc667a2b5c21ac73e7005f36f859324b333c64f3a9bbfe478359f"
+    },
+    {
+      "path": "src/core/loader/loader.cpp",
+      "sha256_lf": "e85f0cfa3061947b9a13e42f856814282fd24c96178e7553cd704a3873b91910"
+    },
+    {
+      "path": "src/core/loader/loader.h",
+      "sha256_lf": "851f31cd064584dc84e2ba15acebcfe801f2e0273c99ebfffb27d635beb9d58b"
+    },
+    {
+      "path": "src/core/loader/nup.cpp",
+      "sha256_lf": "a65becff6c2bf11154665630f3a30ac3b847f8a77b829e9281ce8eaa404fbdcc"
+    },
+    {
+      "path": "src/core/loader/nup.h",
+      "sha256_lf": "c21d3bc9f232024379a3c3fec1e4c483a0cfb4363ce2dac3ea61d377ed8e7ac2"
+    },
+    {
+      "path": "src/core/memory.cpp",
+      "sha256_lf": "19bc86d9a6fa3dcfa0df4551f095e6ced24a90d9e6b8ffbcb44753d3098dc5df"
+    },
+    {
+      "path": "src/core/perf_stats.cpp",
+      "sha256_lf": "bde97f970783f228df225b09f05ebd0c720de4b9e28f9c428bd3e499fe075acd"
+    },
+    {
+      "path": "src/hid_core/frontend/emulated_controller.cpp",
+      "sha256_lf": "5851fc7cf6c4b9137040e0883c240c68e7783595bf848d199357d073802d29a3"
+    },
+    {
+      "path": "src/input_common/drivers/sdl_driver.cpp",
+      "sha256_lf": "6ed2eb363f8d98486d6b5588468cb0e1b4d07a4b0719b3fce51737571801d0c6"
+    },
+    {
+      "path": "src/input_common/drivers/sdl_driver.h",
+      "sha256_lf": "28009e145ae7d5bdaba6f7bde2bdf891519ec7e9b15b85797979f9f963284e64"
+    },
+    {
+      "path": "src/qt_common/config/uisettings.cpp",
+      "sha256_lf": "468eeddb47dac50e9598e9833aab09063b796eda1e044e559f23b87af6899435"
+    },
+    {
+      "path": "src/qt_common/config/uisettings.h",
+      "sha256_lf": "23d20c106330ddb6a9c03464a53c62557a76542e07c89d1a2b93207ea3486451"
+    },
+    {
+      "path": "src/qt_common/game_list/game_list_p.h",
+      "sha256_lf": "a9feb87fe28dc136af724f446edb51dbdc395c2f16db9be1de82f489c25d6ff0"
+    },
+    {
+      "path": "src/qt_common/qt_common.cpp",
+      "sha256_lf": "b0748f3ff58012ca69229e75a6d7a73012fdcc65411021603c4770c823b15151"
+    },
+    {
+      "path": "src/shader_recompiler/frontend/ampere/lower_to_maxwell.h",
+      "sha256_lf": "e563b46ab5cc394140391da4056fbeb8e2aa67ee758eaf122dbf51a214ad844b"
+    },
+    {
+      "path": "src/shader_recompiler/frontend/ir/attribute.h",
+      "sha256_lf": "a016b1c2eb6cd89dccbbe6808f83a9e00acfbbd20ebe3fed2962f7da09f51948"
+    },
+    {
+      "path": "src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp",
+      "sha256_lf": "b3b3c812308b7698b97d1b1b3026ec35f8e19cb8eff5e32cab38f3e67c42de9a"
+    },
+    {
+      "path": "src/shader_recompiler/object_pool.h",
+      "sha256_lf": "8a6802e951cf6401cb2c4c514c138278892d61d55daf3dae1a8ae1b29f98dc40"
+    },
+    {
+      "path": "src/shader_recompiler/shader_info.h",
+      "sha256_lf": "58583a85485f726c4f821c1ea1df9990e22f98a4f3ce1d288f0d82d638c6338b"
+    },
+    {
+      "path": "src/tests/core/core_timing.cpp",
+      "sha256_lf": "4da2a6849d9e01943246e8fd29d7c555a1feac27a371bbf88edd45f30369b079"
+    },
+    {
+      "path": "src/tests/core/nup_container.cpp",
+      "sha256_lf": "a1007fcbfade2809d7a81bae756510407899ae1cee6ee4624b3f6d4edd70d2c8"
+    },
+    {
+      "path": "src/tests/video_core/native_shader.cpp",
+      "sha256_lf": "dd399fb52501440b7e195eee22a75964c93fd080ebc95d9aafa2d1e14496f110"
+    },
+    {
+      "path": "src/video_core/buffer_cache/buffer_cache.h",
+      "sha256_lf": "c5c83ad55768dd70af4062bc51662546a9eae96c5bec3fc164411e4bbf686515"
+    },
+    {
+      "path": "src/video_core/buffer_cache/buffer_cache_base.h",
+      "sha256_lf": "930819b53ac214022c87f4b5eb57f30789e37e7b47c3cbcfcc6f2aa3fed64372"
+    },
+    {
+      "path": "src/video_core/buffer_cache/completed_download_coverage.h",
+      "sha256_lf": "c0568953861da44f2742140b3f36e69c42db42513c94bd141880846744179493"
+    },
+    {
+      "path": "src/video_core/buffer_cache/download_copy_batches.h",
+      "sha256_lf": "2e6b1541bbc4211c062aff10ab42abb0fe21d68cfcbc06dfa8b886298d95e9e4"
+    },
+    {
+      "path": "src/video_core/buffer_cache/mapped_prefix_cache.h",
+      "sha256_lf": "be2a6bebfbc42ef882ecc06628c3d5e5e1ebea202b5b77442fe961afca7c0a16"
+    },
+    {
+      "path": "src/video_core/buffer_cache/reusable_storage_batch.h",
+      "sha256_lf": "0a736edbecb8f4caa46a0c6f833bb9c1d0b53f7b1fc800bdf00e7f0d46cafe46"
+    },
+    {
+      "path": "src/video_core/buffer_cache/storage_range_groups.h",
+      "sha256_lf": "fab4519eaedf7fc3e47754551bcd61e8db17d95c0a116f254dcb8ce6f732f9f0"
+    },
+    {
+      "path": "src/video_core/buffer_cache/usage_tracker.h",
+      "sha256_lf": "d1abe103b7eeceba82df512ea2a3dd47100c6760be7ed9b4980e81aa3e13b6da"
+    },
+    {
+      "path": "src/video_core/dma_pusher.cpp",
+      "sha256_lf": "4696943ae15f1f1039082a4355dbad03c514f8b2ef06ca8f168de4584e94cd54"
+    },
+    {
+      "path": "src/video_core/engines/maxwell_3d.h",
+      "sha256_lf": "4c89ca60ac2314458b6d6f310e44fc3cd531962c45f4f985ea9b412baf9fc645"
+    },
+    {
+      "path": "src/video_core/engines/puller.cpp",
+      "sha256_lf": "a7e06987fdf4695e54040e8bc35bf5d46e813a516427fbe78ee57f28a3ba77f0"
+    },
+    {
+      "path": "src/video_core/fence_manager.h",
+      "sha256_lf": "6912e66216da7259c51d0f382bdf6ddb6f61985c3f6f89830eb05b387fd4c7d1"
+    },
+    {
+      "path": "src/video_core/gpu.cpp",
+      "sha256_lf": "eb8f9fb360571f7112264d7a7026b77431c4602ea405db1cf7c7d99bd7e5f5b1"
+    },
+    {
+      "path": "src/video_core/gpu_split.cpp",
+      "sha256_lf": "7065e0869c0bba349d69b7e99cf9506420f93095eabba409fc0e991550a04b57"
+    },
+    {
+      "path": "src/video_core/gpu_split.h",
+      "sha256_lf": "97ce3316ba46db7622371efbd61897f5dd013f0453e1e62d12f4b58c8eb9e735"
+    },
+    {
+      "path": "src/video_core/macro.cpp",
+      "sha256_lf": "7c5453c5fd06d1cc77211b6ef1e595cf523ee983f72956e66828a55221e40c3a"
+    },
+    {
+      "path": "src/video_core/memory_manager.cpp",
+      "sha256_lf": "255fc161335a07703016dde0d6f71457e024050b6c61f107bce2a19dae4c4197"
+    },
+    {
+      "path": "src/video_core/native_cpu_read_window.h",
+      "sha256_lf": "4a3cdc4e5ccce8e7cbe69bf5253a2cff99a06700ee491bed8ad9b8d6c6d72b1f"
+    },
+    {
+      "path": "src/video_core/native_diagnostics.h",
+      "sha256_lf": "c5644f991f5d98f7ca7079b45f6e36b3f991b84e7bf9d9bbf80c1ba544c70934"
+    },
+    {
+      "path": "src/video_core/native_fence_submission.h",
+      "sha256_lf": "6f75cdfc200573ec268c118d95146a25190e598eabbcf84798aac87ce8be1918"
+    },
+    {
+      "path": "src/video_core/native_method_batch.h",
+      "sha256_lf": "cb45588f61f010cff14cff0834743a801aea9961b281a7f2e18644eafacd161e"
+    },
+    {
+      "path": "src/video_core/native_readback_epoch.h",
+      "sha256_lf": "8cd3944841ca9e9db33b9ba0f418084dcf3d58cda992ded459631425224e75c4"
+    },
+    {
+      "path": "src/video_core/native_readback_reason.h",
+      "sha256_lf": "c376e6a16f70084da990d15989677b0bee2afc1dba99b9083a83094c65d63313"
+    },
+    {
+      "path": "src/video_core/native_semaphore.h",
+      "sha256_lf": "a4d0373d8a8f36148e8cfd7eeaedf18c0b0e15d07df3baae047c0620792b64c1"
+    },
+    {
+      "path": "src/video_core/nx2_profile.h",
+      "sha256_lf": "114cc9e00c934e5fc6f97c10bfc1c12a3fefda9f0a614d75321518c9bf9484df"
+    },
+    {
+      "path": "src/video_core/packed_page_probe.h",
+      "sha256_lf": "e18adcdac69ac5f1a7a0da7815e3dcfa88df7296947338f205703f1c2f2d79ff"
+    },
+    {
+      "path": "src/video_core/renderer_opengl/gl_fence_manager.h",
+      "sha256_lf": "27d5b6def18ba52940d080b52d1bcb816586512cf0c9e9fa20e6a4d52639e3c8"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/present/layer.cpp",
+      "sha256_lf": "5cd98d5dc08c608e53f48e9e7f994a54e056919a4d9871e86f79f2ac811cb3ba"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/present/layer.h",
+      "sha256_lf": "207bac955650e57ef4d8ea12d2eaa14c0470b62bed3318d5acec50dfe8142398"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/present/smaa.cpp",
+      "sha256_lf": "4f5d47903c1ec051c2c82004ec0be58b6ac9ff8fb1c7630045bfca50ce9633df"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/present/util.cpp",
+      "sha256_lf": "252776225326d2b48354545fbe298599c227131572c2b837d2ce69345a6c98c0"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/present/util.h",
+      "sha256_lf": "6800d8e4212c53339fc83e77506fcda75fd91b812f7dbc54f50804dd560051bb"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/present/window_adapt_pass.cpp",
+      "sha256_lf": "8b68046651f949c4fd0699e6689778f4ee7db138d32433e84bb53355fc0d0bd3"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/vk_buffer_cache.cpp",
+      "sha256_lf": "1ef11a88d1af874e94d639593a2276642c8a67b775499e0d21b9ec78279769c3"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/vk_buffer_cache.h",
+      "sha256_lf": "20fd3900dae1c5860c802fce4d1588ce525e04823eeb01e0bc5289e38fb9785b"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/vk_fence_manager.cpp",
+      "sha256_lf": "896219f23881bdfb03901c9739356fc5721c28bf00ce2f739de13cbabd801207"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/vk_fence_manager.h",
+      "sha256_lf": "c035a5168fde29c3a2c0d9ccacaf0d69d909f93a92c5c0c9373774ade8753484"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/vk_graphics_pipeline.h",
+      "sha256_lf": "148b9b11f4562427b971c66775a90a1069311f2af05062e2a58068fe21bafca0"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/vk_pipeline_cache.cpp",
+      "sha256_lf": "f3e0b5953aadd8a853f84027b4e8f20875b8ee24276bb83e28918a3d48ad3378"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/vk_rasterizer.cpp",
+      "sha256_lf": "1c212aa466d0c13fb99647a197926282b2c118dfaf85930e1d9ab304d5d16b48"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/vk_rasterizer.h",
+      "sha256_lf": "144a79d400888b7c7e871d393c20b37ecc4d47abef4789aa1aea59c4bd89cd10"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/vk_scheduler.cpp",
+      "sha256_lf": "cccce45611c745723c7979519ecec01b69227fc7678fa775db691aa50d958cbc"
+    },
+    {
+      "path": "src/video_core/renderer_vulkan/vk_scheduler.h",
+      "sha256_lf": "d423a7684385b0dbe62056b3066de40c891fb884c4ba06cf42e5191ab643e237"
+    },
+    {
+      "path": "src/video_core/vulkan_common/vulkan_memory_allocator.cpp",
+      "sha256_lf": "6686c93c78e4e9c646af3e1e40b46741ae218cec3a52cc8b2b23b4b623e7df85"
+    },
+    {
+      "path": "src/video_core/vulkan_common/vulkan_memory_allocator.h",
+      "sha256_lf": "6fcbac4538584a3ff81b70de8d93540290811bfbcb0e6e1f3840f4beacb22846"
+    },
+    {
+      "path": "src/yuzu/CMakeLists.txt",
+      "sha256_lf": "cd67c2784cab1f8d6c2e9e6cd8be1f847c781c5fe5747b9642d467657f3aa7ca"
+    },
+    {
+      "path": "src/yuzu/about_dialog.cpp",
+      "sha256_lf": "e6c43ee6b1c8e98e4d7aefc3ee3ddd3148a24b52e36b5156197a232d6f807c97"
+    },
+    {
+      "path": "src/yuzu/applets/qt_profile_select.cpp",
+      "sha256_lf": "05a116d7f7cfc1074fe3be3ebffc9fa756cad8d765dd8200c6f82d8e3b89e014"
+    },
+    {
+      "path": "src/yuzu/bootmanager.cpp",
+      "sha256_lf": "443b2d7dd0f9e8b4bc9e756bb4890ac646115f7201aa0514099d3a0ab71d4317"
+    },
+    {
+      "path": "src/yuzu/configuration/configure.ui",
+      "sha256_lf": "931b9c44027993e544617a68b6cca4f31c350b34066c81a9f1d25f09998f9fe4"
+    },
+    {
+      "path": "src/yuzu/configuration/configure_dialog.cpp",
+      "sha256_lf": "5888794ad0a00eb67342a45efcb5c35e2797d0b36afcbe84206e6ab8a0c4ad19"
+    },
+    {
+      "path": "src/yuzu/configuration/configure_dialog.h",
+      "sha256_lf": "df8c58e4d5fb074fe5f809f7eb49f57d553b57cd3a00036a17877a7958eb676c"
+    },
+    {
+      "path": "src/yuzu/configuration/configure_input_player.cpp",
+      "sha256_lf": "1e0d8b86872bdaaebef94b57cc453e263e082d745293d5024fdeaaf6303065a6"
+    },
+    {
+      "path": "src/yuzu/configuration/configure_profile_manager.cpp",
+      "sha256_lf": "d5de145df0810fb10d23da8ccc49f5ceb95b19bf5e7dde6a15ee0ce2331f96b9"
+    },
+    {
+      "path": "src/yuzu/configuration/configure_web.ui",
+      "sha256_lf": "dcfc68f25f6f5734a482e3b7fa9be8eb402a98dc4b6aa32cb55329431ff9124d"
+    },
+    {
+      "path": "src/yuzu/configuration/system/new_user_dialog.cpp",
+      "sha256_lf": "ad5a7196d71f60d99719fbe713fbb2147e96196ddc37d8ed7c04093340a50abe"
+    },
+    {
+      "path": "src/yuzu/configuration/system/new_user_dialog.ui",
+      "sha256_lf": "87cd61b4cc9be763d726992885d6003128f0fbcb0228ca961f0a8a74cf8b0e5a"
+    },
+    {
+      "path": "src/yuzu/game/game_card.cpp",
+      "sha256_lf": "25078f69f47ce2295b9cfb7be0bdb526490d7e2d41bbbfc10a565c46242ed288"
+    },
+    {
+      "path": "src/yuzu/game/game_grid.cpp",
+      "sha256_lf": "daa5ee390f9643b5b3598492dd21d7631f6f42b4383207c6291617b3f0e2a7eb"
+    },
+    {
+      "path": "src/yuzu/game/game_list.cpp",
+      "sha256_lf": "693b5ddb562ff90c6e2b6e60e06153a730c88569e57ff5f0213bc7f1909cd7b7"
+    },
+    {
+      "path": "src/yuzu/game/game_list.h",
+      "sha256_lf": "1f2ff12aec14601b1d8fddcd6fd5fa8d9a0d5901437294c48e0c9bc51eda94ab"
+    },
+    {
+      "path": "src/yuzu/game/search_field.cpp",
+      "sha256_lf": "2adfda99891fa268ae5416bef5ba839fd9e46cdf3db7c707ac1810ad97106616"
+    },
+    {
+      "path": "src/yuzu/game/search_field.h",
+      "sha256_lf": "4cc937cc75ec74c27227acee64ed7e18af874a83767aa36a2df58d985bb9d05b"
+    },
+    {
+      "path": "src/yuzu/jinra.qss",
+      "sha256_lf": "64ac843631b4d7008bc92baebfdec83dd6e94931fd728a71e0c5192eec1094ff"
+    },
+    {
+      "path": "src/yuzu/jinra_home.cpp",
+      "sha256_lf": "b52463052e39242250259388d998c45c420d8b19b627091cbd1ce9f6dfe34e0a"
+    },
+    {
+      "path": "src/yuzu/jinra_home.h",
+      "sha256_lf": "6cf142d1ecb41c3fe42a600618a0d043205028d4788ae1f4d14e9cde352a5db6"
+    },
+    {
+      "path": "src/yuzu/main.cpp",
+      "sha256_lf": "d3eb700422cad4190703f04fc4149e65588c8f4906276a0c8219d4fb1f06810f"
+    },
+    {
+      "path": "src/yuzu/main.ui",
+      "sha256_lf": "88685e0e6568a7a8257aec179486b7f8f2152010e4b08879b21db6602f95ea87"
+    },
+    {
+      "path": "src/yuzu/main_window.cpp",
+      "sha256_lf": "a59cfae7f4cb8a502088d3222c9db56b59e5758d59806f2a6132aa6784c1860e"
+    },
+    {
+      "path": "src/yuzu/main_window.h",
+      "sha256_lf": "0c6d7b256cc4aae357bbfd662145ca49f8602889c467894fbd75ea5810b9d5fa"
+    },
+    {
+      "path": "src/yuzu/yuzu.qrc",
+      "sha256_lf": "11183d6d124dd19c2551745641b056d3ecd9c37929cc9eb848ddf9f3994ee868"
+    }
+  ],
+  "file_count": 116,
+  "contains_private_user_data": false,
+  "testing_scope": "Donkey Kong Bananza only; Windows and NVIDIA; AMD results unknown",
+  "nup_validation": "Donkey Kong Bananza .nup successfully tested by project owner"
+}
