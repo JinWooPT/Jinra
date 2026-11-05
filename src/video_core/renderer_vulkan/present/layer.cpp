@@ -107,7 +107,14 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
     static const bool source_diagnostic = std::getenv("EDEN_PRESENT_SOURCE_DIAGNOSTIC") != nullptr;
     if (source_diagnostic) {
         static u32 reports{};
-        if (reports++ < 16) {
+        static std::array<u32, 9> previous{};
+        const std::array<u32, 9> dimensions{
+            framebuffer.width, framebuffer.height, texture_width, texture_height,
+            scaled_width, scaled_height, anti_alias_extent.width, anti_alias_extent.height,
+            static_cast<u32>(use_accelerated)};
+        if (dimensions != previous && reports < 64) {
+            previous = dimensions;
+            ++reports;
             LOG_INFO(Render_Vulkan,
                      "Present source: guest={}x{} texture={}x{} scaled={}x{} aa={}x{} accelerated={}",
                      framebuffer.width, framebuffer.height, texture_width, texture_height,

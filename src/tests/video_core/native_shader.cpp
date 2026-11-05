@@ -49,8 +49,13 @@
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/ir_opt/buffer_texture.h"
 #include "shader_recompiler/ir_opt/conditional_phi.h"
+#include "shader_recompiler/ir_opt/control_flow_reachability.h"
 #include "shader_recompiler/frontend/maxwell/translate/impl/impl.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_push_constant_state.h"
+#include "video_core/renderer_vulkan/vk_depth_bias_state.h"
+#include "video_core/renderer_vulkan/vk_buffer_texture_array.h"
+#include "video_core/renderer_vulkan/vk_shader_output.h"
 
 namespace {
 namespace IR = Shader::IR;
@@ -321,6 +326,7 @@ void ExecuteNativeWarp(IR::Block& block, u32 active,
                 case IR::Opcode::SelectU32: case IR::Opcode::SelectU1: result[lane] = a ? b : c; break;
                 case IR::Opcode::BitwiseAnd32: result[lane] = a & b; break;
                 case IR::Opcode::BitwiseOr32: result[lane] = a | b; break;
+                case IR::Opcode::BitwiseXor32: result[lane] = a ^ b; break;
                 case IR::Opcode::BitwiseNot32: result[lane] = ~a; break;
                 case IR::Opcode::UMin32: result[lane] = std::min(a, b); break;
                 case IR::Opcode::UMax32: result[lane] = std::max(a, b); break;
@@ -403,7 +409,7 @@ u16 EncodeTestHalf(double value) {
 struct ScalarNativeMachine {
     std::array<u32, IR::NUM_REGS> regs{};
     std::array<bool, 7> predicates{};
-    std::unordered_map<u64, u32> constants, global, shared, local;
+    std::unordered_map<u64, u32> constants, global, shared, local, stage_attributes;
     std::unordered_map<u32, u32> attributes;
     u32 workgroup_barriers{}, device_barriers{}, shared_memory_barriers{};
     bool carry{}, zero{}, sign{}, overflow{};
@@ -475,6 +481,7 @@ struct ScalarNativeMachine {
                 break;
             }
             case IR::Opcode::ConvertF32U32: result = std::bit_cast<u32>(static_cast<float>(static_cast<u32>(arg(0)))); break;
+            case IR::Opcode::ConvertF32S32: result = std::bit_cast<u32>(static_cast<float>(static_cast<s32>(arg(0)))); break;
             case IR::Opcode::ConvertU32F32: result = static_cast<u32>(std::bit_cast<float>(static_cast<u32>(arg(0)))); break;
             case IR::Opcode::FPTrunc32: result = std::bit_cast<u32>(std::trunc(std::bit_cast<float>(static_cast<u32>(arg(0))))); break;
             case IR::Opcode::FPTanh: result = std::bit_cast<u32>(std::tanh(std::bit_cast<float>(static_cast<u32>(arg(0))))); break;
@@ -579,6 +586,7 @@ struct ScalarNativeMachine {
             case IR::Opcode::WriteGlobalU8: global[arg(0)] = static_cast<u32>(arg(1)) & 0xff; break;
             case IR::Opcode::WriteGlobal32: global[arg(0)] = static_cast<u32>(arg(1)); break;
             case IR::Opcode::WriteSharedU32: shared[arg(0)] = static_cast<u32>(arg(1)); break;
+            case IR::Opcode::IsbeWriteAttribute: stage_attributes[arg(0)] = static_cast<u32>(arg(1)); break;
             case IR::Opcode::LoadSharedU32: result = shared.at(arg(0)); break;
             case IR::Opcode::GlobalAtomicIAdd32: result = global.at(arg(0)); global[arg(0)] += static_cast<u32>(arg(1)); break;
             case IR::Opcode::GlobalAtomicUMax32: result = global.at(arg(0)); global[arg(0)] = std::max(global[arg(0)], static_cast<u32>(arg(1))); break;
@@ -612,6 +620,52 @@ void TranslateScalarNative(std::span<const Native> input, IR::Block& block, bool
         }
     }
 }
+}
+
+TEST_CASE("Native stage buffer stores read shadowed high values without corrupting borrowed registers",
+          "[native-shader][mesh-register-shadow]") {
+    const auto stage = GENERATE(Shader::Stage::Task, Shader::Stage::Mesh);
+    const u32 source = GENERATE(8U, 248U, 250U, 252U);
+    const u32 address = GENERATE(3U, 249U);
+    // The captured material mesh writes position X/Z from R252/R250 with a low address.
+    // These sources must come from the guest shadow bank, not the lowering scratch bank.
+    constexpr u32 payload = 0x3f7cbf4dU;
+    const std::array<Native, 4> input{{
+        {{(address << 16) | 0x7802U, 64U, 0x00000f00, 0}},
+        {{(source << 16) | 0x7802U, payload, 0x00000f00, 0}},
+        {{(address << 24) | 0x7927U, (256U << 8) | source, 0x0000f800, 0}},
+        VertexTransform.back(),
+    }};
+    const auto lowered = Shader::Ampere::LowerToMaxwell(input, {}, true, true);
+    INFO(lowered.error << " offset=" << lowered.error_offset);
+    REQUIRE(lowered);
+
+    class StageEnvironment final : public EmptyEnvironment {
+    public:
+        explicit StageEnvironment(Shader::Stage selected) { this->stage = selected; }
+    } env{stage};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    Shader::Maxwell::TranslatorVisitor visitor{env, block};
+    for (const u64 word : lowered.instructions) {
+        switch (Shader::Maxwell::Decode(word)) {
+        case Shader::Maxwell::Opcode::MOV32I: visitor.MOV32I(word); break;
+        case Shader::Maxwell::Opcode::MOV_reg: visitor.MOV_reg(word); break;
+        case Shader::Maxwell::Opcode::ISBE_nx2: visitor.ISBE_nx2(word); break;
+        case Shader::Maxwell::Opcode::EXIT: break;
+        default: FAIL("Unexpected stage buffer lowering opcode");
+        }
+    }
+    ScalarNativeMachine machine;
+    for (u32 reg = 0; reg < IR::NUM_REGS; ++reg) machine.regs[reg] = 0xa5000000U + reg;
+    const auto original = machine.regs;
+    machine.Execute(block);
+    REQUIRE(machine.stage_attributes.size() == 1);
+    REQUIRE(machine.stage_attributes.at(64U + 256U) == payload);
+    REQUIRE(machine.regs[source < 248 ? source : source + 256] == payload);
+    for (u32 reg = 0; reg < 248; ++reg) {
+        if (reg != source && reg != address) REQUIRE(machine.regs[reg] == original[reg]);
+    }
 }
 
 TEST_CASE("Signed native float-to-int conversion saturates without undefined inputs",
@@ -1289,6 +1343,23 @@ TEST_CASE("Native integer shader forms preserve signed arithmetic and immediate 
 }
 
 
+TEST_CASE("Native uniform multiply lowers to the corresponding general form", "[native-shader]") {
+    const bool wide = GENERATE(true, false);
+    const std::array<Native, 2> uniform{{
+        wide ? Native{{0x060478a5, 0x88888889, 0x0f8e003f, 0x002fc600}}
+             : Native{{0x040474a4, 0x00003c00, 0x0f8e0208, 0x000fe200}},
+        VertexTransform.back(),
+    }};
+    auto general = uniform;
+    general[0] = wide ? Native{{0xdedc7825, 0x88888889, 0x078e00ff, 0x002fc600}}
+                      : Native{{0xdcdc7424, 0x00003c00, 0x078e02e0, 0x000fe200}};
+    const auto expected = Shader::Ampere::LowerToMaxwell(general);
+    const auto actual = Shader::Ampere::LowerToMaxwell(uniform);
+    REQUIRE(expected);
+    REQUIRE(actual);
+    REQUIRE(actual.instructions == expected.instructions);
+}
+
 TEST_CASE("Native single-channel texel fetch writes only its selected result", "[native-shader]") {
     std::array<Native, 2> input{{
         {{0x04017b66, 0x30800805, 0x049e01ff, 0x001fc200}},
@@ -1539,6 +1610,25 @@ TEST_CASE("Native depth-comparison sample preserves XY coordinates and reference
     }
     REQUIRE(samples == 1);
     REQUIRE(writes == std::vector<u32>{1});
+}
+
+TEST_CASE("Ocarina bindless shadow samples keep the descriptor and depth reference", "[native-shader]") {
+    const std::array<Native, 2> input{{
+        {{0x26307361, 0x38000010, 0x041e41ff, 0x00014200}},
+        VertexTransform.back(),
+    }};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    u32 samples{};
+    for (const auto& inst : block.Instructions()) {
+        if (inst.GetOpcode() != IR::Opcode::BindlessImageSampleDrefImplicitLod) continue;
+        ++samples;
+        REQUIRE(inst.Arg(0).Inst()->Arg(0).Reg() == IR::Reg{16});
+        REQUIRE(inst.Arg(2).Inst()->Arg(0).Inst()->Arg(0).Reg() == IR::Reg{17});
+        REQUIRE(inst.Flags<IR::TextureInstInfo>().is_depth == 1);
+    }
+    REQUIRE(samples == 1);
 }
 
 
@@ -2616,9 +2706,13 @@ TEST_CASE("Native uniform 64-bit loads populate consecutive registers", "[native
 }
 
 
-TEST_CASE("Native texture dimension queries retain mip input and width-height outputs", "[native-shader]") {
+TEST_CASE("Native texture dimension queries retain the mip input and requested dimensions", "[native-shader]") {
     const u32 binding = GENERATE(0U, 2U, 17U);
-    const std::array<Native, 2> source{{{{0x03027b6f, 0x00000800U | (binding << 22), 0x000003ff, 0}}, VertexTransform.back()}};
+    const u32 mask = GENERATE(3U, 4U);
+    const std::array<Native, 2> source{{
+        {{0x03027b6f, 0x00000800U | (binding << 22), 0xffU | (mask << 8), 0}},
+        VertexTransform.back(),
+    }};
     const auto lowered = Shader::Ampere::LowerToMaxwell(source);
     REQUIRE(lowered);
     REQUIRE(lowered.required_texture_buffer == binding);
@@ -2644,7 +2738,11 @@ TEST_CASE("Native texture dimension queries retain mip input and width-height ou
         }
     }
     REQUIRE(queries == 1);
-    REQUIRE(outputs == std::vector<std::pair<u32, u32>>{{2, 0}, {3, 1}});
+    if (mask == 3) {
+        REQUIRE(outputs == std::vector<std::pair<u32, u32>>{{2, 0}, {3, 1}});
+    } else {
+        REQUIRE(outputs == std::vector<std::pair<u32, u32>>{{2, 2}});
+    }
     auto invalid = source;
     invalid[0].words[1] |= 1U << 30;
     REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
@@ -3062,8 +3160,34 @@ TEST_CASE("Native extended equality comparisons retain the low-word predicate", 
             REQUIRE(machine.regs[1] == static_cast<u32>(a >> 32));
         }
     auto invalid = input;
-    invalid[1].words[2] ^= 1U << 23;
+    invalid[1].words[2] ^= 1U << 20;
     REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+}
+
+TEST_CASE("Ocarina extended inequality retains the accumulated predicate", "[native-shader]") {
+    const std::array<Native, 2> input{{
+        {{0xff007c0c, 7, 0x08f05100, 0}},
+        VertexTransform.back(),
+    }};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    const auto lower = Shader::Ampere::LowerToMaxwell(input);
+    REQUIRE(lower);
+    const u32 uniform = (lower.instructions[1] >> 20) & 0xff;
+    for (const bool low : {false, true}) {
+        for (const bool high : {false, true}) {
+            for (const bool accumulate : {false, true}) {
+                ScalarNativeMachine machine;
+                machine.regs[uniform] = high ? 1U : 0U;
+                machine.predicates = {low, accumulate, true, false, true, false, true};
+                auto expected = machine.predicates;
+                expected[0] = (low || high) && accumulate;
+                machine.Execute(block);
+                REQUIRE(machine.predicates == expected);
+            }
+        }
+    }
 }
 
 
@@ -3351,6 +3475,8 @@ TEST_CASE("Buffer-backed texture arrays retain record indices and root descripto
     const bool decomposed = GENERATE(false, true);
     const bool constant_index = GENERATE(false, true);
     const bool query = GENERATE(false, true);
+    const auto texture_type = GENERATE(Shader::TextureType::ColorCube,
+                                      Shader::TextureType::ColorArray2D, Shader::TextureType::Color3D);
     const u32 failure = GENERATE(0U, 1U, 2U, 3U, 4U);
     class BufferEnvironment final : public EmptyEnvironment {
     public:
@@ -3385,7 +3511,7 @@ TEST_CASE("Buffer-backed texture arrays retain record indices and root descripto
     const auto load = block.PrependNewInst(block.end(), IR::Opcode::LoadStorage64, {constant(0), offset});
     const IR::U32 handle{ir.CompositeExtract(IR::Value{&*load}, 0)};
     IR::TextureInstInfo flags{};
-    flags.type.Assign(Shader::TextureType::ColorCube);
+    flags.type.Assign(texture_type);
     const auto coordinates = ir.CompositeConstruct(ir.Imm32(0.0f), ir.Imm32(1.0f), ir.Imm32(0.0f));
     if (query) {
         const auto dimensions = ir.ImageQueryDimension(handle, constant(0), ir.Imm1(true));
@@ -3406,9 +3532,9 @@ TEST_CASE("Buffer-backed texture arrays retain record indices and root descripto
     Shader::HostTranslateInfo host;
     host.ApplyDescriptorLimitPolicy();
     host.support_buffer_texture_handles = true;
-    if (failure == 1) env.size -= 1;
+    if (failure == 1) env.size = 3;
     if (failure == 2) env.high = 1;
-    if (failure == 3) host.max_per_stage_descriptor_sampled_images = 255;
+    if (failure == 3) host.max_per_stage_descriptor_sampled_images = constant_index ? 0 : 255;
     if (failure == 4) host.support_buffer_texture_handles = false;
     if (failure) {
         REQUIRE_THROWS_AS(Shader::Optimization::TexturePass(env, program, host), Shader::NotImplementedException);
@@ -3416,7 +3542,7 @@ TEST_CASE("Buffer-backed texture arrays retain record indices and root descripto
         REQUIRE_NOTHROW(Shader::Optimization::TexturePass(env, program, host));
         REQUIRE(program.info.texture_descriptors.size() == 1);
         const auto& desc = program.info.texture_descriptors.front();
-        REQUIRE(desc.count == 256);
+        REQUIRE(desc.count == (constant_index ? 1 : 256));
         REQUIRE(desc.cbuf_index == 0);
         REQUIRE(desc.cbuf_offset == 0x510);
         REQUIRE(desc.buffer_source.enabled);
@@ -3424,13 +3550,142 @@ TEST_CASE("Buffer-backed texture arrays retain record indices and root descripto
         REQUIRE(desc.buffer_source.stride == 160);
         REQUIRE(desc.buffer_source.size == 40960);
         REQUIRE(desc.buffer_source.width_query == query);
+        REQUIRE(desc.buffer_source.uniform_index.empty() != constant_index);
+        REQUIRE(desc.type == (query ? Shader::TextureType::Color2D : texture_type));
         for (const auto& inst : block.Instructions()) {
             if (inst.GetOpcode() == IR::Opcode::ImageSampleExplicitLod || inst.GetOpcode() == IR::Opcode::ImageQueryDimensions)
-                REQUIRE(inst.Arg(0).Resolve() == index.Resolve());
+                REQUIRE((constant_index ? inst.Arg(0).IsEmpty() : inst.Arg(0).Resolve() == index.Resolve()));
         }
     }
 }
 
+
+TEST_CASE("Ocarina uniform material indices follow current constants without descriptor arrays", "[native-shader][oot-textures]") {
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::IREmitter ir{block};
+    const auto material = ir.GetCbuf(ir.Imm32(4U), ir.Imm32(132U));
+    const auto selector = ir.BitwiseAnd(material, ir.Imm32(0x30000000U));
+    const auto index = ir.BitFieldExtract(material, ir.Imm32(0U), ir.Imm32(18U));
+    const auto selected = ir.Select(ir.IEqual(selector, ir.Imm32(0U)), ir.Imm32(0U), index);
+    const auto shuffled = ir.ShuffleIndex(IR::U32{selected}, ir.GetReg(IR::Reg::R7), ir.Imm32(31U), ir.Imm32(0U));
+    const auto program = Shader::Optimization::BufferTexture::UniformIndex(shuffled);
+    REQUIRE_FALSE(program.empty());
+    for (u32 value : {0U, 1U, 0x10000000U, 0x10001234U, 0x3003ffffU, 0xffffffffU}) {
+        u32 reads{};
+        const auto result = Shader::EvaluateTextureIndex(program,
+            [&](u32 bank, u32 offset) -> std::optional<u32> {
+                REQUIRE(bank == 4); REQUIRE(offset == 132); ++reads; return value;
+            });
+        REQUIRE(result == ((value & 0x30000000U) ? value & 0x3ffffU : 0U));
+        REQUIRE(reads == 1);
+    }
+    REQUIRE(Shader::Optimization::BufferTexture::UniformIndex(ir.GetReg(IR::Reg::R1)).empty());
+    const auto divergent = ir.Select(ir.GetPred(IR::Pred::P0), material, ir.Imm32(0U));
+    REQUIRE(Shader::Optimization::BufferTexture::UniformIndex(divergent).empty());
+}
+
+TEST_CASE("Uniform texture index evaluation rejects invalid graphs and skips unused reads", "[native-shader][oot-textures]") {
+    using Op = Shader::TextureIndexOp;
+    Shader::TextureIndexProgram code{{Op::Immediate, 1}, {Op::Immediate, 7},
+                                    {Op::Cbuf, 17, 1}, {Op::Select, 0, 1, 2}};
+    u32 reads{};
+    const auto absent = [&](u32, u32) -> std::optional<u32> { ++reads; return {}; };
+    REQUIRE(Shader::EvaluateTextureIndex(code, absent) == 7U);
+    REQUIRE(reads == 0);
+    code[0].a = 0;
+    REQUIRE_FALSE(Shader::EvaluateTextureIndex(code, absent));
+    REQUIRE(reads == 1);
+    code = {{Op::Add, 0, 0}};
+    REQUIRE_FALSE(Shader::EvaluateTextureIndex(code, absent));
+    code = {{Op::Add, 1, 2}};
+    REQUIRE_FALSE(Shader::EvaluateTextureIndex(code, absent));
+    code = {{Op::Immediate, 0xffffffffU}, {Op::Immediate, 32}, {Op::Shr, 0, 1}};
+    REQUIRE(Shader::EvaluateTextureIndex(code, absent) == 0U);
+    code.back().op = Op::Sar;
+    REQUIRE(Shader::EvaluateTextureIndex(code, absent) == 0xffffffffU);
+    code[1].a = 1;
+    code.back().op = Op::Add;
+    REQUIRE(Shader::EvaluateTextureIndex(code, absent) == 0U);
+}
+
+TEST_CASE("Native wrapped register shifts use the low five shift bits", "[native-shader][oot-uniform]") {
+    const std::array<Native, 2> input{{{{0x04047219, 3, 0x00001eff, 0x000fc800}}, VertexTransform.back()}};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    for (u32 shift : {0U, 1U, 31U, 32U, 33U, 63U, 64U, 0xffffffffU}) {
+        ScalarNativeMachine machine;
+        machine.regs[4] = 0xfedcba98U;
+        machine.regs[3] = shift;
+        machine.Execute(block);
+        REQUIRE(machine.regs[4] == (0xfedcba98U >> (shift & 31U)));
+    }
+}
+
+TEST_CASE("Ocarina record indices preserve byte addresses across selected and advanced records", "[native-shader][oot-textures]") {
+    const u32 mode = GENERATE(0U, 1U, 2U);
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::IREmitter ir{block};
+    const auto index = ir.GetReg(IR::Reg::R1);
+    const IR::U32 scaled = mode == 2 ? ir.IMul(index, ir.Imm32(96U)) : IR::U32{ir.ShiftLeftLogical(index, ir.Imm32(5U))};
+    IR::U32 relative = ir.IAdd(scaled, ir.Imm32(mode == 2 ? 96U : 16U));
+    if (mode == 1) relative = IR::U32{ir.Select(ir.GetPred(IR::Pred::P0), ir.Imm32(16U), relative)};
+    auto record = Shader::Optimization::BufferTexture::RelativeRecord(relative, &ir);
+    REQUIRE(record);
+    REQUIRE(Shader::Optimization::BufferTexture::NormalizeRecordOffset(*record, record->stride, &ir));
+    REQUIRE(record->stride == (mode == 2 ? 96 : 32));
+    REQUIRE(record->offset == (mode == 2 ? 0 : 16));
+    ir.SetReg(IR::Reg::R2, relative);
+    ir.SetReg(IR::Reg::R3, ir.IAdd(ir.IMul(IR::U32{record->index}, ir.Imm32(record->stride)),
+                                  ir.Imm32(static_cast<u32>(record->offset))));
+    for (u32 value : {0U, 1U, 2047U, 0x7fffffffU, 0xffffffffU}) for (bool selected : {false, true}) {
+        ScalarNativeMachine machine;
+        machine.regs[1] = value;
+        machine.predicates[0] = selected;
+        machine.Execute(block);
+        const u32 expected = mode == 2 ? value * 96 + 96 : mode == 1 && selected ? 16 : value * 32 + 16;
+        REQUIRE(machine.regs[2] == expected);
+        REQUIRE(machine.regs[3] == expected);
+    }
+}
+
+TEST_CASE("Ocarina shuffled texture handles retain the selected lane and reject unknown guards", "[native-shader][oot-textures]") {
+    const bool known_guard = GENERATE(false, true);
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::IREmitter ir{block};
+    const auto pointer = ir.GetCbuf(ir.Imm32(0U), ir.Imm32(0x520U));
+    const auto index = ir.GetReg(IR::Reg::R1);
+    const auto relative = ir.IAdd(ir.ShiftLeftLogical(index, ir.Imm32(5U)), ir.Imm32(16U));
+    const auto address = ir.ISub(ir.IAdd(pointer, relative), ir.BitwiseAnd(pointer, ir.Imm32(0xfffffff0U)));
+    const auto load = block.PrependNewInst(block.end(), IR::Opcode::LoadStorage64, {ir.Imm32(0U), address});
+    const IR::U32 handle{ir.CompositeExtract(IR::Value{&*load}, 0)};
+    const auto lane = ir.GetReg(IR::Reg::R2);
+    const auto shuffle = ir.ShuffleIndex(handle, lane, ir.Imm32(31U), ir.Imm32(0U));
+    const auto undefined = block.PrependNewInst(block.end(), IR::Opcode::UndefU32);
+    const auto guard = ir.VoteAny(known_guard ? ir.Imm1(true) : ir.GetPred(IR::Pred::P0));
+    const auto selected = ir.Select(guard, shuffle, IR::U32{IR::Value{&*undefined}});
+    IR::Program program;
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    program.info.storage_buffers_descriptors.push_back({0, 0x520, 1, false});
+    Shader::Optimization::BufferTexture::Tracker tracker{program};
+    const auto result = tracker.Find(selected);
+    REQUIRE(bool(result) == known_guard);
+    if (result) {
+        REQUIRE(result->cbuf_offset == 0x520);
+        REQUIRE(result->stride == 32);
+        REQUIRE(result->offset == 16);
+        const auto* source = result->index.InstRecursive();
+        REQUIRE(source->GetOpcode() == IR::Opcode::ShuffleIndex);
+        REQUIRE(source->Arg(0).Resolve() == index.Resolve());
+        REQUIRE(source->Arg(1).Resolve() == lane.Resolve());
+        REQUIRE(source->Arg(2).U32() == 31);
+        REQUIRE(source->Arg(3).U32() == 0);
+    }
+}
 
 TEST_CASE("Buffer texture choices preserve their select and Phi indices", "[native-shader]") {
     const bool phi_choice = GENERATE(false, true);
@@ -3555,6 +3810,7 @@ TEST_CASE("Native global stores carry a register offset into the high address wo
 TEST_CASE("Native high LEA adds the base after unsigned scaling", "[native-shader]") {
     const bool uniform = GENERATE(false, true);
     const bool signed_scale = GENERATE(false, true);
+    const bool negate_base = GENERATE(false, true);
     std::array<Native, 2> input{{
         {{0x00007211, 1, 0x078ff8ff, 0}},
         VertexTransform.back(),
@@ -3565,6 +3821,7 @@ TEST_CASE("Native high LEA adds the base after unsigned scaling", "[native-shade
         input[0].words[2] |= 0x08000000;
     }
     if (signed_scale) input[0].words[2] |= 0x200;
+    if (negate_base && !uniform) input[0].words[1] |= 0x80000000U;
     const u32 shift = GENERATE(0U, 1U, 16U, 28U, 31U);
     input[0].words[2] = (input[0].words[2] & ~(31U << 11)) | (shift << 11);
     Shader::ObjectPool<IR::Inst> pool;
@@ -3577,7 +3834,8 @@ TEST_CASE("Native high LEA adds the base after unsigned scaling", "[native-shade
             machine.regs[uniform ? 220 : 1] = base;
             machine.Execute(block);
             const u64 extended = signed_scale ? static_cast<u64>(static_cast<s64>(static_cast<s32>(value))) : u64{value};
-            REQUIRE(machine.regs[0] == static_cast<u32>((extended << shift) >> 32) + base);
+            REQUIRE(machine.regs[0] == static_cast<u32>((extended << shift) >> 32) +
+                                          (negate_base && !uniform ? 0U - base : base));
         }
     }
 }
@@ -4153,15 +4411,16 @@ TEST_CASE("Native histogram pointer carry and global reduction retain the addres
 
 
 TEST_CASE("Native histogram shared increment scales its address and increments once", "[native-shader]") {
-    const std::array<Native, 2> input{{{{0x03ff7f8c, 0, 0x0d00403f, 0}}, VertexTransform.back()}};
+    const u32 offset = GENERATE(0U, 4U, 0x400U);
+    const std::array<Native, 2> input{{{{0x03ff7f8c, offset << 8, 0x0d00403f, 0}}, VertexTransform.back()}};
     Shader::ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     TranslateScalarNative(input, block);
     ScalarNativeMachine machine;
     machine.regs[3] = 63;
-    machine.shared[252] = 0xffffffffU;
+    machine.shared[252 + offset] = 0xffffffffU;
     machine.Execute(block);
-    REQUIRE(machine.shared == std::unordered_map<u64, u32>{{252, 0}});
+    REQUIRE(machine.shared == std::unordered_map<u64, u32>{{252 + offset, 0}});
 }
 
 
@@ -5162,6 +5421,29 @@ TEST_CASE("Native byte float conversions select all four bytes", "[native-shader
     }
 }
 
+TEST_CASE("Native halfword float conversions select either signed or unsigned half", "[native-shader][oot-uniform]") {
+    const u32 half = GENERATE(0U, 1U);
+    const bool sign = GENERATE(false, true);
+    const bool uniform = GENERATE(false, true);
+    const std::array<Native, 2> input{{
+        {{uniform ? 0x003b7d06U : 0x003b7306U, 5U | (half << 28),
+          0x00101000U | (sign ? 0x400U : 0U) | (uniform ? 0x08000000U : 0U), 0}},
+        VertexTransform.back(),
+    }};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    for (u32 value : {0U, 0x7fff8000U, 0xffff0001U, 0x1234abcdU}) {
+        ScalarNativeMachine machine;
+        machine.regs[uniform ? 221 : 5] = value;
+        const u16 selected = static_cast<u16>(value >> (half * 16));
+        const float expected = sign ? static_cast<float>(static_cast<s16>(selected)) : static_cast<float>(selected);
+        machine.Execute(block);
+        REQUIRE(machine.regs[59] == std::bit_cast<u32>(expected));
+        REQUIRE(machine.regs[uniform ? 221 : 5] == value);
+    }
+}
+
 
 TEST_CASE("Native predicate LUT negates both first inputs", "[native-shader]") {
     const std::array<Native, 2> input{{{{0x0000781c, 0, 0x027c0072, 0}}, VertexTransform.back()}};
@@ -5299,14 +5581,15 @@ TEST_CASE("Native uniform register effective addresses preserve scaled addition 
 
 
 TEST_CASE("Native uniform global reduction preserves its full pointer and wrapping addend", "[native-shader]") {
-    const std::array<Native, 2> input{{{{0xff00798e, 0, 0x0c10e104, 0}}, VertexTransform.back()}};
+    const s32 offset = GENERATE(0, 4, -4, 0x7ffff, -0x80000);
+    const std::array<Native, 2> input{{{{0xff00798e, static_cast<u32>(offset) << 8, 0x0c10e104, 0}}, VertexTransform.back()}};
     Shader::ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     TranslateScalarNative(input, block);
     for (u32 low : {0U, 0xfffffff0U, 0xfffffffcU}) {
         ScalarNativeMachine machine;
         machine.regs[220] = low; machine.regs[221] = 0x21; machine.regs[0] = 17;
-        const u64 address = 0x2100000000ULL | low;
+        const u64 address = (0x2100000000ULL | low) + static_cast<s64>(offset);
         machine.global[address] = 0xfffffff8;
         machine.Execute(block);
         REQUIRE(machine.global == std::unordered_map<u64, u32>{{address, 9}});
@@ -6057,6 +6340,65 @@ TEST_CASE("Native volume samples pack exactly the selected channels without clob
         REQUIRE(copies[3 + i] == std::pair<u32, u32>{i < 2 ? dest + i : second + i - 2, 250 + i});
 }
 
+
+TEST_CASE("Native generic half texture results preserve numeric channel order",
+          "[native-shader][half-texture-pack]") {
+    const u32 mask = GENERATE(1U, 3U, 4U, 5U, 7U, 15U);
+    const u32 destination = GENERATE(4U, 16U, 64U);
+    const u32 components = static_cast<u32>(std::popcount(mask));
+    const u32 second = components > 2 ? destination == 16 ? 64U : 16U : 255U;
+    // Vector 2D.LL.F16 reaches the generic TEX path; A holds XY and disjoint B holds LOD.
+    const std::array<Native, 2> input{{
+        {{(16U << 24) | (destination << 16) | 0x7b60U,
+          64U | (8U << 8) | (2U << 22) | (1U << 29),
+          second | (mask << 8) | (1U << 15) | (7U << 17) | (3U << 23), 0}},
+        VertexTransform.back(),
+    }};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    IR::Inst* sample{};
+    for (auto& inst : block.Instructions()) {
+        if (inst.GetOpcode() != IR::Opcode::BoundImageSampleExplicitLod) continue;
+        REQUIRE(sample == nullptr);
+        sample = &inst;
+    }
+    REQUIRE(sample != nullptr);
+    // Supply distinct exact texels to the sample extracts, then execute the actual emitted
+    // conversion/packing instructions. This isolates packing from a GPU texture fetch.
+    for (auto& inst : block.Instructions()) {
+        if (inst.GetOpcode() == IR::Opcode::CompositeExtractF32x4 &&
+            inst.Arg(0).TryInstRecursive() == sample) {
+            const f32 channel = static_cast<f32>(inst.Arg(1).U32() + 1);
+            inst.ReplaceUsesWith(IR::Value{channel});
+        }
+    }
+    sample->Invalidate();
+    IR::Program program;
+    program.blocks = {&block};
+    Shader::Optimization::IdentityRemovalPass(program);
+    // Keep architectural register writes for the scalar executor; discard now-unused
+    // coordinate construction and the removed sample's dependencies.
+    for (auto it = block.end(); it != block.begin();) {
+        --it;
+        if (!it->HasUses() && it->GetOpcode() != IR::Opcode::SetRegister &&
+            !it->MayHaveSideEffects()) {
+            it->Invalidate();
+            it = block.Instructions().erase(it);
+        }
+    }
+    ScalarNativeMachine machine;
+    machine.regs.fill(0x13579bdfU);
+    machine.Execute(block);
+    constexpr std::array<u16, 4> channels{0x3c00, 0x4000, 0x4200, 0x4400};
+    std::array<u16, 4> selected{};
+    u32 count{};
+    for (u32 channel = 0; channel < channels.size(); ++channel)
+        if (mask & (1U << channel)) selected[count++] = channels[channel];
+    REQUIRE(machine.regs[destination] == (u32{selected[0]} | (u32{selected[1]} << 16)));
+    if (components > 2)
+        REQUIRE(machine.regs[second] == (u32{selected[2]} | (u32{selected[3]} << 16)));
+}
 
 TEST_CASE("Native half texture samples pack RG and BA into separate registers", "[native-shader]") {
     const bool half = GENERATE(false, true);
@@ -7377,6 +7719,7 @@ TEST_CASE("Unanchored boolean Phi cycles do not become constants", "[native-shad
 
 TEST_CASE("Texture Phi specialization requires an infeasible incoming edge", "[native-shader]") {
     const u32 mode = GENERATE(0U, 1U, 2U, 3U, 4U, 5U, 6U);
+    const bool next_record = GENERATE(false, true);
     class RootEnvironment final : public EmptyEnvironment {
     public:
         u32 ReadCbufValue(u32 bank, u32 offset) override {
@@ -7400,7 +7743,7 @@ TEST_CASE("Texture Phi specialization requires an infeasible incoming edge", "[n
     IR::IREmitter ir{root};
     const auto index = ir.GetReg(IR::Reg::R1);
     const auto pointer = ir.GetCbuf(ir.Imm32(0U), ir.Imm32(0x510U));
-    const auto relative = ir.IAdd(ir.IMul(index, ir.Imm32(160U)), ir.Imm32(152U));
+    const auto relative = ir.IAdd(ir.IMul(index, ir.Imm32(160U)), ir.Imm32(next_record ? 312U : 152U));
     const auto offset = ir.ISub(ir.IAdd(pointer, relative), ir.BitwiseAnd(pointer, ir.Imm32(0xfffffff0U)));
     const auto load = root.PrependNewInst(root.end(), IR::Opcode::LoadStorage64, {ir.Imm32(0U), offset});
     const IR::U32 handle{ir.CompositeExtract(IR::Value{&*load}, 0)};
@@ -7443,11 +7786,125 @@ TEST_CASE("Texture Phi specialization requires an infeasible incoming edge", "[n
     if (mode == 0 || mode == 5 || mode == 6) {
         REQUIRE_NOTHROW(Shader::Optimization::TexturePass(env, program, host));
         REQUIRE(program.info.texture_descriptors.size() == 1);
-        for (const auto& inst : sample.Instructions()) if (inst.GetOpcode() == IR::Opcode::ImageSampleExplicitLod)
-            REQUIRE(inst.Arg(0).Resolve() == index.Resolve());
+        for (const auto& inst : sample.Instructions()) if (inst.GetOpcode() == IR::Opcode::ImageSampleExplicitLod) {
+            if (next_record) {
+                const auto* advanced = inst.Arg(0).InstRecursive();
+                REQUIRE(advanced->GetOpcode() == IR::Opcode::IAdd32);
+                REQUIRE(advanced->Arg(0).Resolve() == index.Resolve());
+                REQUIRE(advanced->Arg(1).U32() == 1);
+            } else REQUIRE(inst.Arg(0).Resolve() == index.Resolve());
+        }
     } else {
         REQUIRE_THROWS_AS(Shader::Optimization::TexturePass(env, program, host), Shader::NotImplementedException);
     }
+}
+
+
+TEST_CASE("Texture Phi reachability uses inductive loop predicates", "[native-shader][oot-textures]") {
+    const auto mode = GENERATE(0, 1, 2, 3, 4);
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block entry{pool}, header{pool}, body{pool}, clobber{pool}, merge{pool}, sample{pool},
+        latch{pool};
+    entry.AddBranch(&header);
+    if (mode == 4) entry.AddBranch(&latch);
+    header.AddBranch(&body);
+    body.AddBranch(&clobber);
+    body.AddBranch(&merge);
+    clobber.AddBranch(&merge);
+    merge.AddBranch(&sample);
+    sample.AddBranch(&latch);
+    latch.AddBranch(&header);
+    if (mode == 3) latch.AddBranch(&latch);
+
+    const auto carried = header.PrependNewInst(header.begin(), IR::Opcode::Phi);
+    carried->SetFlags(IR::Type::U1);
+    carried->AddPhiOperand(&entry, IR::Value{mode == 1});
+    const auto next = merge.PrependNewInst(merge.begin(), IR::Opcode::Phi);
+    next->SetFlags(IR::Type::U1);
+    next->AddPhiOperand(&body, IR::Value{mode == 2});
+    next->AddPhiOperand(&clobber, IR::Value{true});
+    IR::Value next_value{&*next};
+    if (mode == 4) {
+        const auto alternative = latch.PrependNewInst(latch.begin(), IR::Opcode::Phi);
+        alternative->SetFlags(IR::Type::U1);
+        alternative->AddPhiOperand(&entry, IR::Value{true});
+        alternative->AddPhiOperand(&sample, next_value);
+        next_value = IR::Value{&*alternative};
+    }
+    carried->AddPhiOperand(&latch, next_value);
+
+    IR::IREmitter body_ir{body};
+    const auto condition = body_ir.ConditionRef(IR::U1{&*carried});
+    IR::AbstractSyntaxNode branch;
+    branch.type = IR::AbstractSyntaxNode::Type::If;
+    branch.data.if_node = {condition, &clobber, &merge};
+    IR::Program program;
+    program.blocks = {&entry, &header, &body, &clobber, &merge, &sample, &latch};
+    program.syntax_list = {branch};
+
+    Shader::Optimization::ControlFlowReachability paths{program, &body, &sample};
+    REQUIRE_FALSE(paths.IsUnreachable());
+    REQUIRE(paths.ExcludesEdge(&clobber, &merge) == (mode == 0));
+}
+
+
+TEST_CASE("Texture Phi proof reuse stays local to each use block and pass", "[native-shader][oot-textures]") {
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block root{pool}, clobber{pool}, merge{pool}, safe{pool}, unsafe{pool}, exit{pool};
+    root.AddBranch(&clobber);
+    root.AddBranch(&merge);
+    clobber.AddBranch(&merge);
+    merge.AddBranch(&safe);
+    merge.AddBranch(&unsafe);
+    safe.AddBranch(&exit);
+    unsafe.AddBranch(&exit);
+    IR::IREmitter ir{root};
+    const auto index = ir.GetReg(IR::Reg::R1);
+    const auto pointer = ir.GetCbuf(ir.Imm32(0U), ir.Imm32(0x520U));
+    const auto relative = ir.IAdd(ir.IMul(index, ir.Imm32(96U)), ir.Imm32(96U));
+    const auto offset = ir.ISub(ir.IAdd(pointer, relative), ir.BitwiseAnd(pointer, ir.Imm32(0xfffffff0U)));
+    const auto load = root.PrependNewInst(root.end(), IR::Opcode::LoadStorage64, {ir.Imm32(0U), offset});
+    const IR::U32 handle{ir.CompositeExtract(IR::Value{&*load}, 0)};
+    const auto selector = ir.GetReg(IR::Reg::R2);
+    const auto clobber_condition = ir.ConditionRef(ir.IEqual(selector, ir.Imm32(1U)));
+    IR::IREmitter clobber_ir{clobber};
+    const auto invalid = clobber_ir.GetReg(IR::Reg::R8);
+    const auto phi = merge.PrependNewInst(merge.begin(), IR::Opcode::Phi);
+    phi->SetFlags(IR::Type::U32);
+    phi->AddPhiOperand(&root, handle);
+    phi->AddPhiOperand(&clobber, invalid);
+    IR::IREmitter merge_ir{merge};
+    const auto safe_condition = merge_ir.ConditionRef(merge_ir.IEqual(selector, merge_ir.Imm32(0U)));
+    IR::AbstractSyntaxNode first, second;
+    first.type = second.type = IR::AbstractSyntaxNode::Type::If;
+    first.data.if_node = {clobber_condition, &clobber, &merge};
+    second.data.if_node = {safe_condition, &safe, &unsafe};
+    IR::Program program;
+    program.blocks = {&root, &clobber, &merge, &safe, &unsafe, &exit};
+    program.syntax_list = {first, second};
+    program.info.storage_buffers_descriptors.push_back({0, 0x520, 1, false});
+    const IR::Value selected{&*phi};
+    {
+        Shader::Optimization::BufferTexture::Tracker tracker{program};
+        REQUIRE_FALSE(tracker.FindForUse(selected, &unsafe));
+        const auto original = tracker.FindForUse(selected, &safe);
+        REQUIRE(original);
+        const auto repeated = tracker.FindForUse(selected, &safe);
+        REQUIRE(repeated);
+        REQUIRE(repeated->index.Resolve() == original->index.Resolve());
+        REQUIRE(repeated->cbuf_offset == 0x520);
+        REQUIRE(repeated->stride == 96);
+        REQUIRE(repeated->offset == 0);
+        const auto* advanced = repeated->index.InstRecursive();
+        REQUIRE(advanced->GetOpcode() == IR::Opcode::IAdd32);
+        REQUIRE(advanced->Arg(0).Resolve() == index.Resolve());
+        REQUIRE(advanced->Arg(1).U32() == 1);
+        REQUIRE_FALSE(tracker.FindForUse(selected, &unsafe));
+    }
+    program.syntax_list[1].data.if_node.cond =
+        merge_ir.ConditionRef(merge_ir.GetPred(IR::Pred::P0));
+    Shader::Optimization::BufferTexture::Tracker next_pass{program};
+    REQUIRE_FALSE(next_pass.FindForUse(selected, &safe));
 }
 
 
@@ -8048,12 +8505,17 @@ TEST_CASE("Native low-word logical right shifts preserve bounds aliases and guar
     const u32 shift = GENERATE(0U, 1U, 8U, 16U, 31U, 32U);
     const u32 destination = GENERATE(0U, 4U);
     const u32 guard = GENERATE(0U, 8U, 7U);
+    const bool shift_register = GENERATE(false, true);
+    const u32 opcode = shift_register ? 0x219U : 0x819U;
     const std::array<Native, 2> input{{
-        {{(4U << 24) | (destination << 16) | (guard << 12) | 0x819U, shift, 0x16ff, 0}}, VertexTransform.back(),
+        {{(4U << 24) | (destination << 16) | (guard << 12) | opcode,
+          shift_register ? 5U : shift, 0x16ff, 0}},
+        VertexTransform.back(),
     }};
     for (u32 value : {0U, 1U, 0x80000000U, 0xffffffffU, 0x12345678U}) for (bool enabled : {false, true}) {
         ScalarNativeMachine machine;
         machine.regs[4] = value;
+        machine.regs[5] = shift;
         machine.predicates = {enabled, true, false, true, false, true, false};
         const auto predicates = machine.predicates;
         const u32 before = machine.regs[destination];
@@ -8062,6 +8524,49 @@ TEST_CASE("Native low-word logical right shifts preserve bounds aliases and guar
         REQUIRE(machine.regs[destination] == (active ? shift == 32 ? 0U : value >> shift : before));
         REQUIRE(machine.predicates == predicates);
     }
+}
+
+TEST_CASE("Ocarina variable pair shifts retain both words and clamp at 64", "[native-shader][oot-pair-shift]") {
+    const bool uniform = GENERATE(false, true);
+    const u32 destination = GENERATE(4U, 5U, 6U, 7U);
+    const u32 guard = GENERATE(0U, 8U, 7U);
+    for (const u32 amount : {0U, 1U, 16U, 24U, 31U, 32U, 33U, 63U, 64U, 65U, 0xffffffffU}) {
+        const std::array<Native, 2> input{{
+            {{(4U << 24) | (destination << 16) | (guard << 12) | (uniform ? 0x899U : 0x219U),
+              uniform ? amount : 6U, (uniform ? 0x08001200U : 0x00001200U) | 5U, 0}},
+            VertexTransform.back(),
+        }};
+        for (const u64 value : {0ULL, 1ULL, 0x8000000000000000ULL, 0xffffffffffffffffULL,
+                                0xfedcba9876543210ULL}) for (const bool enabled : {false, true}) {
+            ScalarNativeMachine machine;
+            const u32 bank = uniform ? 216U : 0U;
+            machine.regs[bank + 4] = static_cast<u32>(value);
+            machine.regs[bank + 5] = static_cast<u32>(value >> 32);
+            if (!uniform) machine.regs[6] = amount;
+            machine.predicates = {enabled, true, false, true, false, true, false};
+            if (uniform) machine.regs[239] = enabled ? 0x40 : 0;
+            const auto predicates = machine.predicates;
+            const u32 before = machine.regs[bank + destination];
+            const bool active = ((guard & 7) == 7 ? true : enabled) != bool(guard & 8);
+            ExecutePredicatedScalarNative(input, machine);
+            const u32 expected = amount < 64 ? static_cast<u32>(value >> amount) : 0;
+            REQUIRE(machine.regs[bank + destination] == (active ? expected : before));
+            REQUIRE(machine.predicates == predicates);
+        }
+    }
+}
+
+TEST_CASE("Ocarina pair shifts include the high register in the low result", "[native-shader]") {
+    const u32 shift = GENERATE(0U, 1U, 21U, 31U, 32U);
+    const std::array<Native, 2> input{{
+        {{0x0e0e7819, shift, 0x00001211, 0x020fe200}},
+        VertexTransform.back(),
+    }};
+    ScalarNativeMachine machine;
+    machine.regs[14] = 0x76543210U;
+    machine.regs[17] = 0xfedcba98U;
+    ExecutePredicatedScalarNative(input, machine);
+    REQUIRE(machine.regs[14] == static_cast<u32>(0xfedcba9876543210ULL >> shift));
 }
 
 
@@ -8235,9 +8740,11 @@ TEST_CASE("Native biased samples preserve XY bias and selected output channels",
 
 TEST_CASE("Native scalar texture samples read their descriptor from the uniform bank", "[native-shader]") {
     const u32 mask = GENERATE(1U, 3U, 5U, 6U, 7U, 15U);
+    const bool array = GENERATE(false, true);
     const u32 count = std::popcount(mask);
     const std::array<Native, 2> input{{{{mask == 1 ? 0x1e097f60U : 0x1e087f60U,
-        0x30000409, 0x081e0000U | (mask << 8) | (count > 2 ? 12U : 255U), 0x000f4200}}, VertexTransform.back()}};
+        array ? 0xb0000409U : 0x30000409U,
+        0x081e0000U | (mask << 8) | (count > 2 ? 12U : 255U), 0x000f4200}}, VertexTransform.back()}};
     Shader::ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     TranslateScalarNative(input, block);
@@ -8253,9 +8760,12 @@ TEST_CASE("Native scalar texture samples read their descriptor from the uniform 
         }
         if (inst.GetOpcode() != IR::Opcode::BindlessImageSampleImplicitLod) continue;
         REQUIRE(inst.Arg(0).Inst()->Arg(0).Reg() == IR::Reg{220});
-        REQUIRE(inst.Flags<IR::TextureInstInfo>().type.Value() == Shader::TextureType::Color2D);
-        REQUIRE(inst.Arg(1).Inst()->Arg(0).Inst()->Arg(0).Inst()->Arg(0).Reg() == IR::Reg{250});
-        REQUIRE(inst.Arg(1).Inst()->Arg(1).Inst()->Arg(0).Inst()->Arg(0).Reg() == IR::Reg{251});
+        REQUIRE(inst.Flags<IR::TextureInstInfo>().type.Value() ==
+                (array ? Shader::TextureType::ColorArray2D : Shader::TextureType::Color2D));
+        REQUIRE(inst.Arg(1).Inst()->Arg(0).Inst()->Arg(0).Inst()->Arg(0).Reg() ==
+                IR::Reg{array ? 251U : 250U});
+        REQUIRE(inst.Arg(1).Inst()->Arg(1).Inst()->Arg(0).Inst()->Arg(0).Reg() ==
+                IR::Reg{array ? 252U : 251U});
         ++samples;
     }
     REQUIRE(samples == 1);
@@ -8387,6 +8897,186 @@ TEST_CASE("Native texture samples retain packed signed offsets and consecutive c
             REQUIRE(offset->Arg(0).Inst()->Arg(0).Reg() == IR::Reg{mixed ? 249U : 5U});
         }
         ++samples;
+    }
+    REQUIRE(samples == 1);
+}
+
+
+TEST_CASE("Native vector texture coordinates stay together across operand counts",
+          "[native-shader][vector-texture-layout]") {
+    const bool scalar = GENERATE(false, true);
+    const u32 alias_mode = GENERATE(0U, 1U, 2U);
+    struct Mode { u32 dimension; u32 lod; bool offset; bool dref; };
+    constexpr std::array modes{
+        Mode{0, 0, false, false}, Mode{0, 1, false, false}, Mode{0, 2, false, false},
+        Mode{0, 3, false, false}, Mode{0, 3, true, false},
+        Mode{1, 0, false, false}, Mode{1, 1, false, false}, Mode{1, 3, false, false},
+        Mode{1, 6, false, false}, Mode{1, 7, false, false},
+        Mode{2, 3, false, false}, Mode{2, 3, true, false},
+        Mode{2, 6, false, false}, Mode{2, 7, false, false},
+        Mode{2, 6, true, false}, Mode{2, 7, true, false},
+        Mode{3, 2, false, false}, Mode{3, 6, false, false}, Mode{3, 7, false, false},
+        Mode{4, 0, false, false}, Mode{4, 2, false, false}, Mode{4, 3, true, false},
+        Mode{5, 0, false, false}, Mode{5, 1, false, false}, Mode{5, 3, false, false},
+        Mode{5, 3, true, false}, Mode{5, 3, false, true},
+        Mode{7, 0, false, false}, Mode{7, 2, false, false}, Mode{7, 3, false, false},
+    };
+    constexpr std::array<u32, 8> coordinate_counts{1, 2, 3, 3, 2, 3, 0, 4};
+    constexpr std::array types{
+        Shader::TextureType::Color1D, Shader::TextureType::Color2D,
+        Shader::TextureType::Color3D, Shader::TextureType::ColorCube,
+        Shader::TextureType::ColorArray1D, Shader::TextureType::ColorArray2D,
+        Shader::TextureType::Buffer, Shader::TextureType::ColorArrayCube};
+    for (const auto& mode : modes) {
+        CAPTURE(mode.dimension, mode.lod, mode.offset, mode.dref, scalar, alias_mode);
+        constexpr u32 source_a = 16, source_b = 64;
+        const u32 destination = alias_mode == 1 ? source_a : alias_mode == 2 ? source_b : 4;
+        const u32 coordinates = coordinate_counts[mode.dimension];
+        const bool array = mode.dimension == 4 || mode.dimension == 5 || mode.dimension == 7;
+        const bool has_lod = mode.lod == 2 || mode.lod == 3 || mode.lod == 6 || mode.lod == 7;
+        const u32 count = coordinates + has_lod + mode.offset + mode.dref;
+        // Independent input fixtures describe the two native encodings: vectors keep the
+        // coordinate tuple at A; scalar operands are split into their two register groups.
+        const u32 a_count = scalar ? (count <= 4 ? (count + 1) / 2 : 4) : coordinates;
+        const auto native_register = [&](u32 operand) {
+            return operand < a_count ? source_a + operand : source_b + operand - a_count;
+        };
+        const std::array<Native, 2> input{{
+            {{(source_a << 24) | (destination << 16) | 0x7b60U,
+              source_b | (8U << 8) | (2U << 22) | (u32{scalar} << 28) | (mode.dimension << 29),
+              255U | (1U << 8) | (u32{mode.offset} << 12) | (u32{mode.dref} << 14) |
+                  (7U << 17) | (mode.lod << 23), 0}},
+            VertexTransform.back(),
+        }};
+        if (scalar && mode.dimension == 5 && mode.lod == 3 && mode.offset) {
+            // The earlier scalar Array2D LL specialization still rejects AOFFI.
+            REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(input));
+            continue;
+        }
+        Shader::ObjectPool<IR::Inst> pool;
+        IR::Block block{pool};
+        IR::IREmitter ir{block};
+        for (u32 index = 0; index < 8; ++index) {
+            ir.SetReg(IR::Reg{source_a + index}, ir.Imm32(std::bit_cast<u32>(99.0f)));
+            ir.SetReg(IR::Reg{source_b + index}, ir.Imm32(std::bit_cast<u32>(88.0f)));
+        }
+        std::array<f32, 4> expected_coords{};
+        for (u32 index = 0; index < coordinates; ++index) {
+            const f32 value = f32(index + 1 - u32{array}) * 0.25f;
+            const u32 raw = array && index == 0 ? 9U : std::bit_cast<u32>(value);
+            ir.SetReg(IR::Reg{native_register(index)}, ir.Imm32(raw));
+            expected_coords[array ? index == 0 ? coordinates - 1 : index - 1 : index] =
+                array && index == 0 ? 9.0f : value;
+        }
+        u32 metadata = coordinates;
+        if (has_lod) ir.SetReg(IR::Reg{native_register(metadata++)}, ir.Imm32(std::bit_cast<u32>(2.0f)));
+        if (mode.offset) ir.SetReg(IR::Reg{native_register(metadata++)}, ir.Imm32(0xf78U));
+        if (mode.dref) ir.SetReg(IR::Reg{native_register(metadata++)}, ir.Imm32(std::bit_cast<u32>(0.625f)));
+        TranslateScalarNative(input, block);
+        IR::Program program;
+        program.blocks = {&block};
+        program.post_order_blocks = {&block};
+        Shader::Optimization::SsaRewritePass(program);
+        EmptyEnvironment env;
+        Shader::Optimization::ConstantPropagationPass(env, program);
+        u32 samples{};
+        const bool explicit_lod = mode.lod == 1 || mode.lod == 3 || mode.lod == 7;
+        const auto opcode = mode.dref ?
+            (explicit_lod ? IR::Opcode::BoundImageSampleDrefExplicitLod : IR::Opcode::BoundImageSampleDrefImplicitLod) :
+            (explicit_lod ? IR::Opcode::BoundImageSampleExplicitLod : IR::Opcode::BoundImageSampleImplicitLod);
+        for (const auto& inst : block.Instructions()) {
+            if (inst.GetOpcode() != opcode) continue;
+            ++samples;
+            REQUIRE(inst.Flags<IR::TextureInstInfo>().type.Value() == types[mode.dimension]);
+            for (u32 index = 0; index < coordinates; ++index) {
+                const auto component = coordinates == 1 ? inst.Arg(1) : inst.Arg(1).InstRecursive()->Arg(index);
+                const auto value = component.Resolve();
+                if (value.IsImmediate()) {
+                    REQUIRE(value.F32() == expected_coords[index]);
+                } else {
+                    REQUIRE(array);
+                    REQUIRE(index == coordinates - 1);
+                    const auto* convert = value.TryInstRecursive();
+                    REQUIRE(convert != nullptr);
+                    REQUIRE(convert->GetOpcode() == IR::Opcode::ConvertF32U16);
+                    REQUIRE(convert->Arg(0).Resolve().U32() == 9U);
+                }
+            }
+            if (mode.dref) REQUIRE(inst.Arg(2).Resolve().F32() == 0.625f);
+            const u32 lod_argument = mode.dref ? 3 : 2;
+            if (explicit_lod || has_lod)
+                REQUIRE(inst.Arg(lod_argument).Resolve().F32() == (has_lod ? 2.0f : 0.0f));
+            if (mode.offset) {
+                const u32 offset_dimensions = coordinates - u32{array};
+                const auto offset = inst.Arg(mode.dref ? 4 : 3);
+                constexpr std::array<s32, 3> expected_offset{-8, 7, -1};
+                for (u32 index = 0; index < offset_dimensions; ++index) {
+                    const auto component = offset_dimensions == 1 ? offset : offset.InstRecursive()->Arg(index);
+                    REQUIRE(static_cast<s32>(component.Resolve().U32()) == expected_offset[index]);
+                }
+            }
+        }
+        REQUIRE(samples == 1);
+    }
+}
+
+TEST_CASE("Generic vector layout leaves earlier unsupported forms closed",
+          "[native-shader][vector-texture-layout]") {
+    for (const auto mode : std::array<std::pair<u32, u32>, 4>{{{1, 2}, {2, 0}, {3, 0}, {5, 2}}}) {
+        const std::array<Native, 2> input{{
+            {{0x10047b60U, 64U | (8U << 8) | (2U << 22) | (mode.first << 29),
+              255U | (1U << 8) | (7U << 17) | (mode.second << 23), 0}},
+            VertexTransform.back(),
+        }};
+        REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(input));
+    }
+}
+
+TEST_CASE("Ocarina vector 3D samples retain separate LOD and signed tap offsets",
+          "[native-shader][oot-textures]") {
+    const u32 coordinates = GENERATE(16U, 40U);
+    const u32 metadata = coordinates == 16 ? 20U : 10U;
+    const u32 alias_mode = GENERATE(0U, 1U, 2U);
+    const u32 alias = alias_mode == 1 ? coordinates : alias_mode == 2 ? metadata : 4U;
+    const u32 packed_offset = GENERATE(0x10U, 0xf78U);
+    std::array<Native, 2> input{{
+        {{0x10047b60, 0x40800814, 0x019e11ff, 0x1001c200}},
+        VertexTransform.back(),
+    }};
+    input[0].words[0] = (coordinates << 24) | (alias << 16) | 0x7b60U;
+    input[0].words[1] = (input[0].words[1] & ~0xffU) | metadata;
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::IREmitter ir{block};
+    const std::array<float, 3> xyz{0.25f, 0.5f, 0.75f};
+    for (u32 axis = 0; axis < xyz.size(); ++axis)
+        ir.SetReg(IR::Reg{coordinates + axis}, ir.Imm32(std::bit_cast<u32>(xyz[axis])));
+    ir.SetReg(IR::Reg{coordinates + 3}, ir.Imm32(std::bit_cast<u32>(99.0f)));
+    ir.SetReg(IR::Reg{metadata}, ir.Imm32(std::bit_cast<u32>(2.0f)));
+    ir.SetReg(IR::Reg{metadata + 1}, ir.Imm32(packed_offset));
+    TranslateScalarNative(input, block);
+    IR::Program program;
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    Shader::Optimization::SsaRewritePass(program);
+    EmptyEnvironment env;
+    Shader::Optimization::ConstantPropagationPass(env, program);
+    u32 samples{};
+    for (const auto& inst : block.Instructions()) {
+        if (inst.GetOpcode() != IR::Opcode::BoundImageSampleExplicitLod) continue;
+        ++samples;
+        REQUIRE(inst.Flags<IR::TextureInstInfo>().type.Value() == Shader::TextureType::Color3D);
+        REQUIRE(inst.Arg(2).Resolve().F32() == 2.0f);
+        const auto* coords = inst.Arg(1).InstRecursive();
+        REQUIRE(coords->GetOpcode() == IR::Opcode::CompositeConstructF32x3);
+        const auto* offset = inst.Arg(3).InstRecursive();
+        REQUIRE(offset->GetOpcode() == IR::Opcode::CompositeConstructU32x3);
+        const std::array<s32, 3> expected = packed_offset == 0x10 ?
+            std::array<s32, 3>{0, 1, 0} : std::array<s32, 3>{-8, 7, -1};
+        for (u32 axis = 0; axis < xyz.size(); ++axis) {
+            REQUIRE(coords->Arg(axis).Resolve().F32() == xyz[axis]);
+            REQUIRE(static_cast<s32>(offset->Arg(axis).Resolve().U32()) == expected[axis]);
+        }
     }
     REQUIRE(samples == 1);
 }
@@ -8700,6 +9390,153 @@ TEST_CASE("Merged high uniform bit reversal preserves the actual guest register 
     }
 }
 
+TEST_CASE("Ocarina depth gathers retain coordinates reference and split outputs", "[native-shader][oot-textures]") {
+    const std::array<Native, 2> input{{
+        {{0x180c7b63, 0x30800e1c, 0x001e4f0e, 0x000f4200}}, VertexTransform.back(),
+    }};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    u32 gathers = 0;
+    std::vector<std::pair<u32, u32>> copies;
+    for (const auto& inst : block.Instructions()) {
+        if (inst.GetOpcode() == IR::Opcode::BoundImageGatherDref) {
+            ++gathers;
+            REQUIRE(inst.Flags<IR::TextureInstInfo>().is_depth.Value() == 1);
+            REQUIRE(inst.Flags<IR::TextureInstInfo>().type.Value() == Shader::TextureType::Color2D);
+            REQUIRE(inst.Arg(0).U32() == 56);
+        }
+        if (inst.GetOpcode() == IR::Opcode::SetRegister &&
+            inst.Arg(1).Inst()->GetOpcode() == IR::Opcode::GetRegister)
+            copies.emplace_back(static_cast<u32>(inst.Arg(0).Reg()),
+                                static_cast<u32>(inst.Arg(1).Inst()->Arg(0).Reg()));
+    }
+    REQUIRE(gathers == 1);
+    REQUIRE(copies == std::vector<std::pair<u32,u32>>{{250,24},{251,25},{252,28},
+                                                   {12,250},{13,251},{14,252},{15,253}});
+}
+
+TEST_CASE("Ocarina gathers retain four constant tap offsets and output precision", "[native-shader][oot-textures]") {
+    const u32 channel = GENERATE(0U, 1U, 2U, 3U);
+    const bool half = GENERATE(false, true);
+    const std::array<Native, 4> input{{
+        {{0xff007424, 0x00010000, 0x078e00ff, 0}},
+        {{0xff017424, 0x01010100, 0x078e00ff, 0}},
+        {{0x0a0c7b63, 0x30003000, (half ? 0x001eaf0dU : 0x001e2f0eU) | (channel << 23), 0}}, VertexTransform.back(),
+    }};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    IR::Program program;
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    Shader::Optimization::SsaRewritePass(program);
+    EmptyEnvironment env;
+    Shader::Optimization::ConstantPropagationPass(env, program);
+    u32 gathers{}, conversions{};
+    for (const auto& inst : block.Instructions()) {
+        if (inst.GetOpcode() == IR::Opcode::ConvertF16F32 && !inst.Arg(0).IsImmediate()) ++conversions;
+        if (inst.GetOpcode() != IR::Opcode::BoundImageGather) continue;
+        ++gathers;
+        REQUIRE(inst.Flags<IR::TextureInstInfo>().gather_component.Value() == channel);
+        REQUIRE(inst.Arg(0).U32() == 0xc0);
+        const std::array<std::array<u32, 4>, 2> offsets{{{0, 0, 1, 0}, {0, 1, 1, 1}}};
+        for (u32 pair = 0; pair < 2; ++pair)
+            for (u32 axis = 0; axis < 4; ++axis)
+                REQUIRE(inst.Arg(2 + pair).InstRecursive()->Arg(axis).U32() == offsets[pair][axis]);
+    }
+    REQUIRE(gathers == 1);
+    REQUIRE(conversions == (half ? 4 : 0));
+}
+
+TEST_CASE("Native surface reductions preserve unsigned operations coordinates and ordering", "[native-shader][oot-textures]") {
+    const u32 operation = GENERATE(0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U);
+    const std::array<IR::Opcode, 8> expected{IR::Opcode::BoundImageAtomicIAdd32,
+        IR::Opcode::BoundImageAtomicUMin32, IR::Opcode::BoundImageAtomicUMax32,
+        IR::Opcode::BoundImageAtomicInc32, IR::Opcode::BoundImageAtomicDec32,
+        IR::Opcode::BoundImageAtomicAnd32, IR::Opcode::BoundImageAtomicOr32,
+        IR::Opcode::BoundImageAtomicXor32};
+    const std::array<Native, 2> input{{
+        {{0x0400759f, 0x60008400, 0x0010e000U | (operation << 23), 0}}, VertexTransform.back()}};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    std::vector<IR::Opcode> effects;
+    for (const auto& inst : block.Instructions()) {
+        if (inst.GetOpcode() == IR::Opcode::DeviceMemoryBarrier) effects.push_back(inst.GetOpcode());
+        if (inst.GetOpcode() == expected[operation]) {
+            effects.push_back(inst.GetOpcode());
+            REQUIRE(inst.Arg(0).U32() == 0x210);
+            REQUIRE(inst.Flags<IR::TextureInstInfo>().type.Value() == Shader::TextureType::Color2D);
+            REQUIRE(inst.Arg(2).InstRecursive()->Arg(0).Reg() == IR::Reg::R0);
+            const auto* coordinates = inst.Arg(1).InstRecursive();
+            REQUIRE(coordinates->Arg(0).InstRecursive()->Arg(0).Reg() == IR::Reg::R4);
+            REQUIRE(coordinates->Arg(1).InstRecursive()->Arg(0).Reg() == IR::Reg::R5);
+        }
+    }
+    REQUIRE(effects == std::vector<IR::Opcode>{IR::Opcode::DeviceMemoryBarrier, expected[operation],
+                                              IR::Opcode::DeviceMemoryBarrier});
+    auto invalid = input;
+    invalid[0].words[2] |= 0x04000000U;
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+}
+
+TEST_CASE("Ocarina uniform operations preserve inactive lanes and scalar predicates", "[native-shader][oot-uniform]") {
+    const u32 operation = GENERATE(0U, 1U, 2U, 3U);
+    const u32 guard = GENERATE(0U, 4U, 8U, 12U);
+    const std::array<Native, 4> operations{{
+        {{0x04057292, 6, 0x0f80c03f, 0}},
+        {{0x0400728c, 6, 0x0bf01070, 0}},
+        {{0x04057287, 6, 0x08000000, 0}},
+        {{0x3f057499, 0x12345678, 0x08010606, 0}},
+    }};
+    for (u32 bank : {0U, 0x2aU, 0x55U, 0x7fU}) for (u32 value : {0U, 4U, 32U, 0xffffffffU}) {
+        ScalarNativeMachine reference, guarded;
+        reference.regs[220] = 0xf0f0U;
+        reference.regs[221] = 0xabcdef01;
+        reference.regs[222] = value;
+        reference.regs[239] = bank;
+        reference.predicates = {true, false, true, false, true, false, true};
+        guarded = reference;
+        const auto original = reference;
+        std::array<Native, 2> input{operations[operation], VertexTransform.back()};
+        ExecutePredicatedScalarNative(input, reference);
+        input[0].words[0] = (input[0].words[0] & ~0xf000U) | (guard << 12);
+        ExecutePredicatedScalarNative(input, guarded);
+        const bool enabled = bool(bank & (1U << (6 - (guard & 7)))) != bool(guard & 8);
+        REQUIRE(guarded.regs[221] == (enabled ? reference.regs[221] : original.regs[221]));
+        REQUIRE(guarded.regs[239] == (enabled ? reference.regs[239] : original.regs[239]));
+        REQUIRE(guarded.predicates == original.predicates);
+        if (enabled && operation == 3)
+            REQUIRE(guarded.regs[221] == (value < 32 ? 0x12345678U << value : 0));
+    }
+}
+
+TEST_CASE("Ocarina signed warp extrema exclude inactive lanes", "[native-shader][oot-uniform]") {
+    const bool maximum = GENERATE(false, true);
+    const std::array<Native, 2> input{{
+        {{0x030573c4, 0, maximum ? 0x14200U : 0x10200U, 0}}, VertexTransform.back(),
+    }};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    for (u32 active : {1U, 0x80000000U, 0x80000001U, 0x55555555U, 0xffffffffU}) {
+        std::array<std::array<u32, IR::NUM_REGS>, 32> registers{};
+        std::array<std::array<bool, 7>, 32> predicates{};
+        s32 expected = maximum ? std::numeric_limits<s32>::min() : std::numeric_limits<s32>::max();
+        for (u32 lane = 0; lane < 32; ++lane) {
+            const s32 value = lane == 0 ? std::numeric_limits<s32>::min() :
+                              lane == 31 ? std::numeric_limits<s32>::max() : s32(lane) - 16;
+            registers[lane][3] = static_cast<u32>(value);
+            registers[lane][221] = 0xabcdef01;
+            if (active & (1U << lane)) expected = maximum ? std::max(expected, value) : std::min(expected, value);
+        }
+        ExecuteNativeWarp(block, active, registers, predicates);
+        for (u32 lane = 0; lane < 32; ++lane)
+            REQUIRE(registers[lane][221] == ((active & (1U << lane)) ? static_cast<u32>(expected) : 0xabcdef01));
+    }
+}
+
 TEST_CASE("Native partial gathers pack selected texels without overwriting aliased coordinates", "[native-shader]") {
     const u32 mask = GENERATE(1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 10U, 11U, 12U, 13U, 14U);
     const bool alias = GENERATE(false, true);
@@ -8844,7 +9681,7 @@ TEST_CASE("Native partial gathers respect the extended uniform shadow boundary",
         case 1: invalid[1].words[1] = (invalid[1].words[1] & ~0xffU) | 168U; break;
         case 2: invalid[1].words[0] = (invalid[1].words[0] & ~0x00ff0000U) | (168U << 16); break;
         case 3: invalid[1].words[2] = 0x001e07a8; break;
-        case 4: invalid[1].words[2] |= 0x4000; break; // Depth mode remains unsupported.
+        case 4: invalid[1].words[2] |= 0x6000; break; // Combined depth and per-tap offsets.
         }
         REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
     }
@@ -8884,7 +9721,9 @@ TEST_CASE("Native register matrix transpose preserves every b16 tag and source a
 
 TEST_CASE("Native packed half predicates retain unordered thresholds and independent outputs", "[native-shader]") {
     const bool broadcast = GENERATE(false, true);
-    const std::array<Native, 2> input{{{{0x13007434, 0x292d292d, broadcast ? 0x03c6e800U : 0x03c6e000U, 0}}, VertexTransform.back()}};
+    const bool flush = GENERATE(false, true);
+    const std::array<Native, 2> input{{{{0x13007434, 0x292d292d,
+        (broadcast ? 0x03c6e800U : 0x03c6e000U) | (flush ? 0x10000U : 0), 0}}, VertexTransform.back()}};
     Shader::ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     TranslateScalarNative(input, block);
@@ -8907,7 +9746,7 @@ TEST_CASE("Native packed half predicates retain unordered thresholds and indepen
         for (u32 reg = 0; reg < 240; ++reg) REQUIRE(machine.regs[reg] == original[reg]);
     }
     auto invalid = input;
-    invalid[0].words[2] |= 0x10000;
+    invalid[0].words[2] |= 0x60; // Invalid predicate combination.
     REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
 }
 
@@ -10676,6 +11515,99 @@ TEST_CASE("Predicate mask proofs preserve cycles and unsupported forms conservat
     }
 }
 
+TEST_CASE("Vulkan fragment attachments preserve numeric output types and integer bits",
+          "[native-shader][fragment-output]") {
+    using Format = Tegra::RenderTargetFormat;
+    using Type = Shader::AttributeType;
+    const std::array formats{
+        Format::R16G16B16A16_UINT, Format::R32_SINT, Format::R16G16B16A16_UNORM,
+        Format::A8B8G8R8_SRGB, Format::R32_FLOAT, Format::NONE,
+        Format::R16G16B16A16_SNORM, Format::A2B10G10R10_UINT};
+    const std::array expected{Type::UnsignedInt, Type::SignedInt, Type::Float, Type::Float,
+                              Type::Float, Type::Float, Type::Float, Type::UnsignedInt};
+    std::array<u8, 8> encoded{};
+    std::transform(formats.begin(), formats.end(), encoded.begin(), [](Format format) {
+        return static_cast<u8>(format);
+    });
+    Shader::RuntimeInfo runtime;
+    runtime.color_output_types = Vulkan::FragmentColorOutputTypes(encoded);
+    REQUIRE(runtime.color_output_types == expected);
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::IREmitter ir{block};
+    std::array<u32, 8> payloads{};
+    for (u32 index = 0; index < payloads.size(); ++index) {
+        payloads[index] = expected[index] == Type::UnsignedInt ? 0x80000005U :
+                          expected[index] == Type::SignedInt ? 0xfffffff9U : 0x3f000000U;
+        ir.SetFragColor(index, 0, ir.Imm32(std::bit_cast<f32>(payloads[index])));
+    }
+    IR::Program program;
+    program.stage = Shader::Stage::Fragment;
+    program.info.stores_frag_color.fill(true);
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    IR::AbstractSyntaxNode body, terminal;
+    body.type = IR::AbstractSyntaxNode::Type::Block;
+    body.data.block = &block;
+    terminal.type = IR::AbstractSyntaxNode::Type::Return;
+    program.syntax_list = {body, terminal};
+    Shader::Profile profile;
+    profile.supported_spirv = 0x00010300;
+    Shader::Backend::Bindings bindings;
+    const auto binary = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
+    std::unordered_map<u32, Type> scalar_types;
+    std::unordered_map<u32, u32> contained_type, variable_type, location, constants, bitcasts, bases;
+    std::vector<std::pair<u32, u32>> stores;
+    for (size_t cursor = 5; cursor < binary.size();) {
+        const auto* words = binary.data() + cursor;
+        const u32 count = words[0] >> 16;
+        REQUIRE(count != 0);
+        REQUIRE(cursor + count <= binary.size());
+        switch (static_cast<spv::Op>(words[0] & 0xffff)) {
+        case spv::Op::OpTypeFloat: scalar_types[words[1]] = Type::Float; break;
+        case spv::Op::OpTypeInt:
+            scalar_types[words[1]] = words[3] ? Type::SignedInt : Type::UnsignedInt;
+            break;
+        case spv::Op::OpTypeVector: contained_type[words[1]] = words[2]; break;
+        case spv::Op::OpTypePointer: contained_type[words[1]] = words[3]; break;
+        case spv::Op::OpVariable: variable_type[words[2]] = words[1]; break;
+        case spv::Op::OpDecorate:
+            if (words[2] == static_cast<u32>(spv::Decoration::Location))
+                location[words[1]] = words[3];
+            break;
+        case spv::Op::OpConstant: constants[words[2]] = words[3]; break;
+        case spv::Op::OpBitcast: bitcasts[words[2]] = words[3]; break;
+        case spv::Op::OpAccessChain: bases[words[2]] = words[3]; break;
+        case spv::Op::OpStore: stores.emplace_back(words[1], words[2]); break;
+        default: break;
+        }
+        cursor += count;
+    }
+    for (u32 index = 0; index < expected.size(); ++index) {
+        CAPTURE(index);
+        u32 matching_outputs{};
+        for (const auto& [variable, output_location] : location) {
+            if (output_location != index || !variable_type.contains(variable)) continue;
+            ++matching_outputs;
+            u32 type = variable_type.at(variable);
+            while (contained_type.contains(type)) type = contained_type.at(type);
+            REQUIRE(scalar_types.at(type) == expected[index]);
+            u32 matching_stores{};
+            for (const auto& [pointer, stored] : stores) {
+                if (!bases.contains(pointer) || bases.at(pointer) != variable) continue;
+                ++matching_stores;
+                // Integer outputs reinterpret the guest register bits, including values that
+                // would be negative or NaN as floats; numeric float-to-int conversion loses them.
+                REQUIRE(bitcasts.contains(stored) == (expected[index] != Type::Float));
+                const u32 source = bitcasts.contains(stored) ? bitcasts.at(stored) : stored;
+                REQUIRE(constants.at(source) == payloads[index]);
+            }
+            REQUIRE(matching_stores == 1);
+        }
+        REQUIRE(matching_outputs == 1);
+    }
+}
+
 TEST_CASE("Floating min and max preserve a defined NaN result in emitted fragment shaders",
           "[native-shader][nan-minmax]") {
     constexpr u32 nan = 0x7fc00000U;
@@ -10732,4 +11664,179 @@ TEST_CASE("Floating min and max preserve a defined NaN result in emitted fragmen
         REQUIRE(undefined_nan_minmax == 0);
         REQUIRE(output_stores >= 2);
     }
+}
+
+TEST_CASE("Native mesh push constants cover the active extended stages", "[native-shader][push-constants]") {
+    const VkShaderStageFlags classic = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    const auto normal = Vulkan::PushConstantStages(classic);
+    const auto mesh = Vulkan::PushConstantStages(VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT);
+    const auto task_mesh = Vulkan::PushConstantStages(VK_SHADER_STAGE_TASK_BIT_EXT |
+        VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT);
+    REQUIRE(normal == VK_SHADER_STAGE_ALL_GRAPHICS);
+    REQUIRE(mesh == (VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_MESH_BIT_EXT));
+    REQUIRE(task_mesh == (VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT));
+    REQUIRE(Vulkan::PushConstantStages(VK_SHADER_STAGE_COMPUTE_BIT) == VK_SHADER_STAGE_COMPUTE_BIT);
+}
+
+TEST_CASE("Native rescaling push constants are refreshed across stage layout transitions",
+          "[native-shader][push-constants]") {
+    Vulkan::RescalingPushConstantState state;
+    const auto classic = Vulkan::PushConstantStages(VK_SHADER_STAGE_VERTEX_BIT);
+    const auto mesh = Vulkan::PushConstantStages(VK_SHADER_STAGE_MESH_BIT_EXT);
+    const auto task_mesh = Vulkan::PushConstantStages(VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT);
+    for (const auto stages : {classic, mesh, task_mesh, mesh, classic}) {
+        REQUIRE(state.Update(false, stages));
+        REQUIRE_FALSE(state.Update(false, stages));
+    }
+    REQUIRE(state.Update(true, classic));
+    REQUIRE_FALSE(state.Update(true, classic));
+    state.Invalidate();
+    REQUIRE(state.Update(true, classic));
+    REQUIRE_FALSE(state.Update(true, classic));
+}
+
+TEST_CASE("Buffer texture arrays require their own read-only storage root",
+          "[native-shader][buffer-texture-array]") {
+    Shader::TextureDescriptor desc{};
+    desc.type = Shader::TextureType::Color2D;
+    desc.count = 5;
+    desc.cbuf_index = 7;
+    desc.cbuf_offset = 0x1b0;
+    desc.buffer_source.enabled = true;
+    desc.buffer_source.stride = 28;
+    desc.buffer_source.offset = 12;
+    desc.buffer_source.size = 128;
+    std::array roots{Shader::StorageBufferDescriptor{7, 0x1b0, 1, false}};
+
+    SECTION("arbitrary tracked bank, root, field and stride qualify") {
+        REQUIRE(Vulkan::IsReadOnlyBufferTextureArray(desc, roots));
+    }
+    SECTION("a nearby index-list root does not qualify the texture table") {
+        roots[0].cbuf_offset -= 16;
+        REQUIRE_FALSE(Vulkan::IsReadOnlyBufferTextureArray(desc, roots));
+    }
+    SECTION("the same offset in another bank does not qualify") {
+        roots[0].cbuf_index = 0;
+        REQUIRE_FALSE(Vulkan::IsReadOnlyBufferTextureArray(desc, roots));
+    }
+    SECTION("a writable texture table remains strict") {
+        roots[0].is_written = true;
+        REQUIRE_FALSE(Vulkan::IsReadOnlyBufferTextureArray(desc, roots));
+    }
+    SECTION("a storage root array remains strict") {
+        roots[0].count = 2;
+        REQUIRE_FALSE(Vulkan::IsReadOnlyBufferTextureArray(desc, roots));
+    }
+    SECTION("single and uniform texture selections remain strict") {
+        desc.count = 1;
+        REQUIRE_FALSE(Vulkan::IsReadOnlyBufferTextureArray(desc, roots));
+        desc.count = 5;
+        desc.buffer_source.uniform_index.emplace_back();
+        REQUIRE_FALSE(Vulkan::IsReadOnlyBufferTextureArray(desc, roots));
+    }
+    SECTION("untracked and width-query descriptors remain strict") {
+        desc.buffer_source.enabled = false;
+        REQUIRE_FALSE(Vulkan::IsReadOnlyBufferTextureArray(desc, roots));
+        desc.buffer_source.enabled = true;
+        desc.buffer_source.width_query = true;
+        REQUIRE_FALSE(Vulkan::IsReadOnlyBufferTextureArray(desc, roots));
+    }
+    SECTION("other shader texture types remain strict") {
+        for (const auto type : {Shader::TextureType::Color3D, Shader::TextureType::ColorCube,
+                                Shader::TextureType::ColorArray2D}) {
+            desc.type = type;
+            REQUIRE_FALSE(Vulkan::IsReadOnlyBufferTextureArray(desc, roots));
+        }
+    }
+    SECTION("integer, multisample and secondary-handle declarations remain strict") {
+        desc.is_integer = true;
+        REQUIRE_FALSE(Vulkan::IsReadOnlyBufferTextureArray(desc, roots));
+        desc.is_integer = false;
+        desc.is_multisample = true;
+        REQUIRE_FALSE(Vulkan::IsReadOnlyBufferTextureArray(desc, roots));
+        desc.is_multisample = false;
+        desc.has_secondary = true;
+        REQUIRE_FALSE(Vulkan::IsReadOnlyBufferTextureArray(desc, roots));
+    }
+}
+
+TEST_CASE("Buffer texture array views preserve only the supported guest mismatch families",
+          "[native-shader][buffer-texture-array]") {
+    using VideoCommon::ImageViewType;
+    for (const auto type : {ImageViewType::e1D, ImageViewType::e2D, ImageViewType::Cube,
+                            ImageViewType::e3D, ImageViewType::e1DArray, ImageViewType::e2DArray,
+                            ImageViewType::CubeArray, ImageViewType::Rect, ImageViewType::Buffer}) {
+        for (const bool integer : {false, true}) {
+            CAPTURE(type, integer);
+            const auto view = Vulkan::ActualBufferTextureView(type, integer);
+            if (type == ImageViewType::e3D && !integer) {
+                REQUIRE(view == Shader::TextureType::Color3D);
+            } else if (type == ImageViewType::e2D && integer) {
+                REQUIRE(view == Shader::TextureType::Color2D);
+            } else {
+                REQUIRE_FALSE(view.has_value());
+            }
+        }
+    }
+}
+
+
+TEST_CASE("Depth bias preserves a triangle's native offset across viewport scaling",
+          "[depth-bias-scaling]") {
+    const float scale = GENERATE(0.5f, 0.75f, 1.0f, 2.0f, 3.0f);
+    const float factor = GENERATE(-2.0f, -0.5f, 0.0f, 1.5f);
+    const float clamp = GENERATE(-0.002f, 0.0f, 0.002f);
+    struct Vertex { double x, y, z; };
+    constexpr std::array<Vertex, 3> triangle{{{20, 30, 0.1}, {220, 40, 0.55}, {40, 130, 0.8}}};
+    const auto depth_slope = [](const auto& points) {
+        const double dx1 = points[1].x - points[0].x, dy1 = points[1].y - points[0].y;
+        const double dx2 = points[2].x - points[0].x, dy2 = points[2].y - points[0].y;
+        const double dz1 = points[1].z - points[0].z, dz2 = points[2].z - points[0].z;
+        const double determinant = dx1 * dy2 - dx2 * dy1;
+        return std::max(std::abs((dz1 * dy2 - dz2 * dy1) / determinant),
+                        std::abs((dx1 * dz2 - dx2 * dz1) / determinant));
+    };
+    auto physical_triangle = triangle;
+    for (auto& vertex : physical_triangle) {
+        vertex.x = 11 + (vertex.x - 11) * scale;
+        vertex.y = 17 + (vertex.y - 17) * scale;
+    }
+    const auto bias = [](Vulkan::DepthBiasParameters parameters, double slope) {
+        const double offset = parameters.constant * std::ldexp(1.0, -16) + parameters.slope * slope;
+        return parameters.clamp > 0 ? std::min(offset, double(parameters.clamp)) :
+               parameters.clamp < 0 ? std::max(offset, double(parameters.clamp)) : offset;
+    };
+    const Vulkan::DepthBiasParameters native{8.0f, clamp, factor};
+    const auto physical = Vulkan::RescaleDepthBiasParameters(native, scale);
+    REQUIRE(std::bit_cast<u32>(physical.constant) == std::bit_cast<u32>(native.constant));
+    REQUIRE(std::bit_cast<u32>(physical.clamp) == std::bit_cast<u32>(native.clamp));
+    REQUIRE(std::abs(bias(physical, depth_slope(physical_triangle)) -
+                     bias(native, depth_slope(triangle))) < 1e-7);
+    if (scale != 1.0f && factor != 0.0f && clamp == 0.0f) {
+        REQUIRE(std::abs(bias(native, depth_slope(physical_triangle)) -
+                         bias(native, depth_slope(triangle))) > 1e-5);
+    }
+}
+
+TEST_CASE("Depth bias scaling follows effective viewport and command-buffer state",
+          "[depth-bias-scaling]") {
+    Vulkan::DepthBiasScaleState state;
+    const auto scale = [](bool enabled, bool rescaled, bool viewport_enabled, float factor) {
+        return Vulkan::DepthBiasViewportScale(enabled, rescaled, viewport_enabled, factor);
+    };
+    REQUIRE(state.Update(scale(true, false, true, 2.0f), false));
+    REQUIRE_FALSE(state.Update(scale(true, false, true, 2.0f), false));
+    REQUIRE(state.Update(scale(true, true, true, 2.0f), false));
+    // Switching classic/mesh pipelines alone preserves Vulkan dynamic state.
+    REQUIRE_FALSE(state.Update(scale(true, true, true, 2.0f), false));
+    REQUIRE(state.Update(scale(true, true, true, 2.0f), true)); // new command buffer or guest write
+    REQUIRE(state.Update(scale(true, false, true, 2.0f), false)); // same guest factor, native target
+    REQUIRE(state.Update(scale(true, true, true, 0.5f), false));
+    REQUIRE(state.Update(scale(true, true, false, 2.0f), false)); // fallback viewport remains native
+    REQUIRE_FALSE(state.Update(scale(false, true, true, 2.0f), false)); // flag off restores legacy
+    const Vulkan::DepthBiasParameters original{-0.0f, -1.0f, -0.0f};
+    const auto unchanged = Vulkan::RescaleDepthBiasParameters(original, 1.0f);
+    REQUIRE(std::bit_cast<u32>(unchanged.constant) == std::bit_cast<u32>(original.constant));
+    REQUIRE(std::bit_cast<u32>(unchanged.clamp) == std::bit_cast<u32>(original.clamp));
+    REQUIRE(std::bit_cast<u32>(unchanged.slope) == std::bit_cast<u32>(original.slope));
 }

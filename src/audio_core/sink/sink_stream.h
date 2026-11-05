@@ -58,7 +58,7 @@ struct SinkBuffer {
  */
 class SinkStream {
 public:
-    explicit SinkStream(Core::System& system_, StreamType type_) : system{system_}, type{type_} {}
+    explicit SinkStream(Core::System& system_, StreamType type_);
     virtual ~SinkStream() {}
 
     /**
@@ -237,6 +237,8 @@ protected:
     std::string name{};
 
 private:
+    void ReportUnderruns();
+
     /// Ring buffer of the samples waiting to be played or consumed
     Common::RingBuffer<s16, 0x10000> samples_buffer;
     /// Audio buffers queued and waiting to play
@@ -248,6 +250,20 @@ private:
     /// EDEN_NX2_AUDIO_LEVEL meter state.
     s32 level_peak{};
     u64 level_frames{};
+    const bool underrun_stats_enabled;
+    struct UnderrunStatistics {
+        std::atomic<u64> callbacks{};
+        std::atomic<u64> requested_frames{};
+        std::atomic<u64> underrun_callbacks{};
+        std::atomic<u64> missing_frames{};
+        std::atomic<u64> max_queue_gap_frames{};
+        std::atomic<u64> short_sample_callbacks{};
+        std::atomic<u64> short_sample_frames{};
+    } underrun_stats;
+    /// Consecutive missing frames, accessed only by the output callback.
+    u64 queue_gap_frames{};
+    /// Report timing, accessed only by the buffer producer.
+    std::chrono::steady_clock::time_point last_underrun_report{};
     /// Number of buffers waiting to be played
     std::atomic<u32> queued_buffers{};
     /// The ring size for audio out buffers (usually 4, rarely 2 or 8)

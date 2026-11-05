@@ -36,6 +36,11 @@
 
 namespace VideoCommon {
 
+inline bool TextureCacheMeasurementsEnabled() {
+    static const bool enabled = std::getenv("EDEN_MEASURE_PERF") != nullptr;
+    return enabled;
+}
+
 // EDEN_TC_WATCH_IMAGE=<hex GPU address>: log state changes of the image at that address.
 inline bool IsWatchedImage(u64 gpu_addr) {
     static const u64 watched = [] {
@@ -332,6 +337,14 @@ void TextureCache<P>::TickFrame() {
         created_shapes.clear();
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
         images_created = images_deleted = 0;
+        if (TextureCacheMeasurementsEnabled()) {
+            LOG_INFO(HW_GPU,
+                     "Texture view removals last 600 frames: empty={} nonempty={} scanned={} elapsed_ms={:.3f}",
+                     view_removal_empty_calls, view_removal_nonempty_calls,
+                     view_removal_scanned_entries, view_removal_duration_ns / 1e6);
+            view_removal_empty_calls = view_removal_nonempty_calls = 0;
+            view_removal_scanned_entries = view_removal_duration_ns = 0;
+        }
     }
     if (total_used_memory > minimum_memory) {
         RunGarbageCollector();
@@ -3214,8 +3227,25 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
 
 template <class P>
 void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> removed_views) {
+    const bool measure = TextureCacheMeasurementsEnabled();
+    const auto begin = measure ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+    if (removed_views.empty()) {
+        if (measure) {
+            ++view_removal_empty_calls;
+            view_removal_duration_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - begin).count();
+        }
+        return;
+    }
+    if (measure) {
+        ++view_removal_nonempty_calls;
+    }
     for (size_t c : active_channel_ids) {
         auto& channel_info = channel_storage[c];
+        if (measure) {
+            view_removal_scanned_entries += channel_info.image_views.size();
+        }
         auto it = channel_info.image_views.begin();
         while (it != channel_info.image_views.end()) {
             const auto found = std::ranges::find(removed_views, it->second);
@@ -3225,6 +3255,10 @@ void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> rem
                 ++it;
             }
         }
+    }
+    if (measure) {
+        view_removal_duration_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin).count();
     }
 }
 

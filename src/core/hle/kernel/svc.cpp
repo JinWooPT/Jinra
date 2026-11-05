@@ -506,7 +506,10 @@ static void SvcWrap_GetThreadContext364From32(Core::System& system, std::span<ui
 static void SvcWrap_WaitForAddress64From32(Core::System& system, std::span<uint64_t, 8> args) {
     uint32_t address = Convert<uint32_t>(GetArg32(args, 0));
     ArbitrationType arb_type = Convert<ArbitrationType>(GetArg32(args, 1));
-    int32_t value = Convert<int32_t>(GetArg32(args, 2));
+    std::array<uint32_t, 2> value_gather{};
+    value_gather[0] = GetArg32(args, 2);
+    value_gather[1] = GetArg32(args, 5);
+    int64_t value = Convert<int64_t>(value_gather);
     std::array<uint32_t, 2> timeout_ns_gather{};
     timeout_ns_gather[0] = GetArg32(args, 3);
     timeout_ns_gather[1] = GetArg32(args, 4);
@@ -1642,7 +1645,7 @@ static void SvcWrap_GetThreadContext364(Core::System& system, std::span<uint64_t
 static void SvcWrap_WaitForAddress64(Core::System& system, std::span<uint64_t, 8> args) {
     uint64_t address = Convert<uint64_t>(GetArg64(args, 0));
     ArbitrationType arb_type = Convert<ArbitrationType>(GetArg64(args, 1));
-    int32_t value = Convert<int32_t>(GetArg64(args, 2));
+    int64_t value = Convert<int64_t>(GetArg64(args, 2));
     int64_t timeout_ns = Convert<int64_t>(GetArg64(args, 3));
     Result ret = WaitForAddress64(system, address, arb_type, value, timeout_ns);
     SetArg64(args, 0, Convert<uint64_t>(ret));

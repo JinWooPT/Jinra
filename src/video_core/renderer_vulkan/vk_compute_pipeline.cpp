@@ -5,6 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -146,6 +150,41 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     } else {
         func();
     }
+}
+
+void ComputePipeline::RecordDispatchForProfile(bool indirect) const {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_COMPUTE_DISPATCH_PROFILE");
+        return value && std::string_view{value} == "1";
+    }();
+    if (!enabled) {
+        return;
+    }
+    using Clock = std::chrono::steady_clock;
+    struct Counts {
+        u64 direct{};
+        u64 indirect{};
+    };
+    static thread_local std::unordered_map<u64, Counts> counts;
+    static thread_local auto window_begin = Clock::now();
+    auto& count = counts[shader_hash];
+    if (indirect) {
+        ++count.indirect;
+    } else {
+        ++count.direct;
+    }
+    const auto now = Clock::now();
+    if (now - window_begin < std::chrono::seconds{10}) {
+        return;
+    }
+    const double window_ms = std::chrono::duration<double, std::milli>{now - window_begin}.count();
+    for (const auto& [hash, entry] : counts) {
+        LOG_INFO(Render_Vulkan,
+                 "Compute dispatch profile shader={:016x} window_ms={:.3f} direct={} indirect={}",
+                 hash, window_ms, entry.direct, entry.indirect);
+    }
+    counts.clear();
+    window_begin = now;
 }
 
 bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <vector>
 
 #include "common/common_types.h"
@@ -41,7 +42,8 @@ public:
     bool AcquireNextImage(bool may_flush = true);
 
     /// Presents the rendered image to the swapchain.
-    void Present(VkSemaphore render_semaphore);
+    void Present(VkSemaphore render_semaphore, VkResult* diagnostic_result = nullptr,
+                 std::chrono::steady_clock::time_point* diagnostic_return = nullptr);
 
     /// Returns true when the swapchain needs to be recreated.
     bool NeedsRecreation() const {

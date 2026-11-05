@@ -9,6 +9,7 @@
 #include "video_core/native_diagnostics.h"
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <memory>
 #include <cstdlib>
 #include <fstream>
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <tuple>
 #include <set>
+#include <string_view>
 #include <fstream>
 #include <mutex>
 
@@ -68,6 +70,30 @@ using VideoCommon::ImageViewType;
 
 
 namespace {
+bool DepthBiasScalingDiagnosticEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_DIAGNOSTIC_SCALE_DEPTH_BIAS");
+        const bool result = value && std::string_view{value} == "1";
+        if (result) LOG_INFO(Render_Vulkan, "Diagnostic: compensating depth-bias slope for viewport scaling");
+        return result;
+    }();
+    return enabled;
+}
+
+u32 DrawFlushThreshold(u32 fallback) {
+    const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS");
+    if (!value) {
+        return fallback;
+    }
+    const std::string_view text{value};
+    u32 threshold{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), threshold);
+    return error == std::errc{} && end == text.data() + text.size() && threshold >= 32 &&
+                   threshold <= 16384
+               ? threshold
+               : fallback;
+}
+
 struct DrawParams {
     u32 base_instance;
     u32 num_instances;
@@ -393,6 +419,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, u32 direct_instance_count, F
     if (!pipeline) {
         // A draw withheld for an asynchronous pipeline build is not a failure of the native work.
         submitted = pipeline_cache.TakeDeferredDraw();
+        return;
+    }
+    mesh_draw = pipeline->IsMeshPipeline();
+    if (mesh_draw && !device.IsExtMeshShaderSupported()) {
+        report_failure("VK_EXT_mesh_shader unavailable");
         return;
     }
     // Execute the native pointer-table initializer before its indirect arguments are consumed.
@@ -940,6 +971,12 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         const u32 num_instances{instance_count};
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
 
+        if (mesh_draw) {
+            scheduler.Record([groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
+                cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
+            });
+            return;
+        }
         scheduler.Record([draw_params](vk::CommandBuffer cmdbuf) {
             if (draw_params.is_indexed) {
                 cmdbuf.DrawIndexed(draw_params.num_vertices, draw_params.num_instances,
@@ -972,6 +1009,10 @@ void RasterizerVulkan::DrawIndirect() {
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, 0, [this, &params] {
+        if (mesh_draw) {
+            LOG_ERROR(Render_Vulkan, "Indirect task/mesh draws are not supported");
+            return;
+        }
         const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
         const auto& buffer = indirect_buffer.first;
         const auto& offset = indirect_buffer.second;
@@ -1198,7 +1239,11 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     }
 
     query_cache.NotifySegment(true);
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    // Deferred load-op clears produce no samples and have no render pass to scope a query.
+    if (!can_defer_clear) {
+        query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                                  maxwell3d->regs.zpass_pixel_count_enable);
+    }
     UpdateViewportsState(regs);
 
     const u32 color_attachment = regs.clear_surface.RT;
@@ -1328,6 +1373,7 @@ void RasterizerVulkan::DispatchCompute() {
                 return;
             }
             cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
+            pipeline->RecordDispatchForProfile(true);
         });
         dispatched = true;
         return;
@@ -1351,6 +1397,7 @@ void RasterizerVulkan::DispatchCompute() {
             return;
         }
         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
+        pipeline->RecordDispatchForProfile(false);
     });
     dispatched = true;
 
@@ -1899,7 +1946,8 @@ void RasterizerVulkan::FlushWork() {
     if ((++draw_counter & CHECK_MASK) != CHECK_MASK) {
         return;
     }
-    if (draw_counter < DRAWS_TO_DISPATCH) {
+    static const u32 draws_to_flush = DrawFlushThreshold(DRAWS_TO_DISPATCH);
+    if (draw_counter < draws_to_flush) {
         scheduler.DispatchWork();
         return;
     }
@@ -2189,7 +2237,13 @@ void RasterizerVulkan::UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs
 }
 
 void RasterizerVulkan::UpdateDepthBias(Tegra::Engines::Maxwell3D::Regs& regs) {
-    if (!state_tracker.TouchDepthBias()) {
+    const float viewport_scale = DepthBiasViewportScale(
+        DepthBiasScalingDiagnosticEnabled(), texture_cache.IsRescaling(),
+        regs.viewport_scale_offset_enabled != 0, Settings::values.resolution_info.up_factor);
+    // A target scale transition changes the required slope even when guest registers
+    // are unchanged. Command-buffer invalidation still forces the dynamic state write.
+    const bool dirty = state_tracker.TouchDepthBias();
+    if (!depth_bias_scale_state.Update(viewport_scale, dirty)) {
         return;
     }
     float units = regs.depth_bias / 2.0f;
@@ -2215,8 +2269,10 @@ void RasterizerVulkan::UpdateDepthBias(Tegra::Engines::Maxwell3D::Regs& regs) {
         }
     }
 
-    scheduler.Record([constant = units, clamp = regs.depth_bias_clamp,
-                      factor = regs.slope_scale_depth_bias, this](vk::CommandBuffer cmdbuf) {
+    const auto parameters = RescaleDepthBiasParameters(
+        {units, regs.depth_bias_clamp, regs.slope_scale_depth_bias}, viewport_scale);
+    scheduler.Record([constant = parameters.constant, clamp = parameters.clamp,
+                      factor = parameters.slope, this](vk::CommandBuffer cmdbuf) {
         if (device.IsExtDepthBiasControlSupported()) {
             static VkDepthBiasRepresentationInfoEXT bias_info{
                 .sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT,

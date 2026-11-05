@@ -71,9 +71,7 @@ public:
     using ConstantReader = std::function<std::optional<u32>(IR::Value)>;
     ControlFlowReachability(const IR::Program& program, const IR::Block* root_, const IR::Block* use_,
                             ConstantReader reader_ = {})
-        : root{root_}, use{use_}, reader{std::move(reader_)} {
-        try { Build(program); valid = true; } catch (const Limit&) {}
-    }
+        : ControlFlowReachability{program, root_, use_, std::move(reader_), 8} {}
 
     bool ExcludesEdge(const IR::Block* from, const IR::Block* to) {
         if (!valid) return false;
@@ -101,6 +99,13 @@ public:
     }
 
 private:
+    ControlFlowReachability(const IR::Program& program_, const IR::Block* root_, const IR::Block* use_,
+                            ConstantReader reader_, size_t invariant_budget_)
+        : program{program_}, root{root_}, use{use_}, reader{std::move(reader_)},
+          invariant_budget{invariant_budget_} {
+        try { Build(); valid = true; } catch (const Limit&) {}
+    }
+
     u32 Equality(IR::Value value, u32 constant) {
         value = value.Resolve();
         if (value.Type() != IR::Type::U32) throw Limit{};
@@ -143,6 +148,48 @@ private:
         return result;
     }
 
+    std::optional<bool> LoopInvariant(const IR::Inst* phi, const IR::Block* header) {
+        if (!invariant_budget || header == program.blocks.front() || phi->Type() != IR::Type::U1)
+            return {};
+        const auto predecessors = header->ImmPredecessors();
+        if (phi->NumArgs() != predecessors.size() || phi->NumArgs() > 8) return {};
+        std::unordered_set<const IR::Block*> seen;
+        std::optional<bool> initial;
+        for (size_t i = 0; i < phi->NumArgs(); ++i) {
+            const auto* predecessor = phi->PhiBlock(i);
+            if (std::ranges::find(predecessors, predecessor) == predecessors.end() ||
+                !seen.insert(predecessor).second) return {};
+            const auto input = ConditionalPhi::Resolve(phi->Arg(i));
+            if (!input.IsImmediate()) continue;
+            if (input.Type() != IR::Type::U1 || (initial && input.U1() != *initial)) return {};
+            initial = input.U1();
+        }
+        if (!initial) return {};
+
+        // Other inputs must come from within this iteration and preserve the initial value.
+        // The step uses only its induction hypothesis, with no assumptions about record data.
+        for (size_t i = 0; i < phi->NumArgs(); ++i) {
+            const auto input = ConditionalPhi::Resolve(phi->Arg(i));
+            if (input.IsImmediate()) continue;
+            if (!invariant_budget) return {};
+            --invariant_budget;
+            const auto* predecessor = phi->PhiBlock(i);
+            ControlFlowReachability step{program, header, predecessor, {}, 0};
+            if (!step.valid) return {};
+            try {
+                const u32 before = step.Atom(phi);
+                const u32 after = step.Expression(input);
+                const u32 changes = *initial ? step.booleans.And(before, step.booleans.Not(after))
+                                             : step.booleans.And(step.booleans.Not(before), after);
+                const u32 paths = step.booleans.And(step.constraints, step.reach.at(predecessor));
+                if (step.booleans.And(paths, changes) != 0) return {};
+            } catch (const Limit&) {
+                return {};
+            }
+        }
+        return initial;
+    }
+
     u32 Expression(IR::Value value) {
         value = ConditionalPhi::Resolve(value);
         if (value.IsImmediate()) {
@@ -175,8 +222,13 @@ private:
         }
         case IR::Opcode::Phi: {
             const auto found_owner = owners.find(inst);
-            if (found_owner == owners.end() || found_owner->second == root || !region.contains(found_owner->second)) {
+            if (found_owner == owners.end()) {
                 result = Atom(inst);
+                break;
+            }
+            if (found_owner->second == root || !region.contains(found_owner->second)) {
+                const auto invariant = LoopInvariant(inst, found_owner->second);
+                result = invariant ? static_cast<u32>(*invariant) : Atom(inst);
                 break;
             }
             result = 0;
@@ -194,7 +246,7 @@ private:
         return result;
     }
 
-    void Build(const IR::Program& program) {
+    void Build() {
         if (program.blocks.empty() || !root || !use) throw Limit{};
         // If an entry-to-use path bypasses root, its values cannot be specialized here.
         std::vector<const IR::Block*> pending{program.blocks.front()};
@@ -243,7 +295,8 @@ private:
         }
         if (order.size() != region.size()) throw Limit{};
         for (const auto* block : program.blocks)
-            for (const auto& inst : block->Instructions()) owners.emplace(&inst, block);
+            for (const auto& inst : block->Instructions())
+                if (inst.GetOpcode() == IR::Opcode::Phi) owners.emplace(&inst, block);
         const auto branches = ConditionalPhi::FindBranches(program);
         for (const auto* block : order) {
             u32 reached = block == root ? 1 : 0;
@@ -266,10 +319,12 @@ private:
         }
     }
 
+    const IR::Program& program;
     const IR::Block* root;
     const IR::Block* use;
     bool valid{};
     ConstantReader reader;
+    size_t invariant_budget;
     u32 constraints{1};
     std::unordered_set<const IR::Block*> region;
     std::unordered_set<const IR::Inst*> active;

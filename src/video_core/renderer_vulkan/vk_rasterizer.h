@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_depth_bias_state.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
@@ -231,7 +232,10 @@ private:
     std::array<VideoCommon::ImageViewId, MAX_IMAGE_VIEWS> image_view_ids;
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
+    DepthBiasScaleState depth_bias_scale_state;
+
     u32 draw_counter = 0;
+    bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
 };
 
 } // namespace Vulkan

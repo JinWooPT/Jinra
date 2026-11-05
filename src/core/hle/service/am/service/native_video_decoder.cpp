@@ -125,6 +125,7 @@ private:
             operation_syncpoint.reset();
         }
         started = false;
+        stream_ended = false;
         if (submission_event) submission_event->Clear(kernel);
     }
 
@@ -164,6 +165,7 @@ private:
                     result = Result{0x1c266f};
                     if (pending_inputs.size() < MaximumPendingInputs &&
                         pending_input_bytes + input.size() <= transfer_memory->GetSize()) {
+                        stream_ended = false;
                         submission_id = next_submission_id++;
                         const u64 timestamp = u64{packet[5]} | (u64{packet[6]} << 32);
                         consumed_size = input.size();
@@ -396,6 +398,7 @@ private:
             properties[8] = frame.eos ? 1 : 0;
             output_properties.push_back(properties);
             image->available = false;
+            stream_ended = frame.eos;
             system.Host1x().GetSyncpointManager().IncrementGuest(*operation_syncpoint);
             system.Host1x().GetSyncpointManager().IncrementHost(*operation_syncpoint);
             LOG_DEBUG(Service_AM, "native AV1 output written image={}, dimensions={}x{}, threshold={}",
@@ -443,7 +446,12 @@ private:
                     result = Kernel::ResultNotImplemented;
                     if (!(packet[4] || packet[5] || packet[6] || packet[7])) {
                         result = Kernel::ResultInvalidState;
-                        if (!image->available) {
+                        if (decoder && stream_ended && pending_inputs.empty() && decoded_frames.empty()) {
+                            // There is no next picture to fulfil a newly issued fence after EOS.
+                            completion_value = system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(*operation_syncpoint);
+                            image->available = true;
+                            result = ResultSuccess;
+                        } else if (!image->available) {
                             completion_value = ++next_completion_value;
                             image->completion_value = completion_value;
                             image->available = true;
@@ -578,7 +586,6 @@ private:
         if (packet[0] == 0x18 && packet[1] == 0) {
             result = Kernel::ResultInvalidState;
             if (started && configuration) {
-                result = Kernel::ResultNotImplemented;
                 if (h264_context) {
                     // Decode everything submitted, then drain the decoder so no frame stays queued.
                     result = PumpOutput();
@@ -586,6 +593,22 @@ private:
                         DrainH264();
                         result = PumpOutput();
                     }
+                } else if (decoder && decoder->SignalEOS() == libgav1::kStatusOk) {
+                    // Reset the AV1 stream while keeping frames already written to guest images.
+                    pending_inputs.clear();
+                    pending_input_bytes = 0;
+                    decoded_frames.clear();
+                    if (stream_ended && operation_syncpoint) {
+                        // The client may still be waiting on fences for unused output images.
+                        auto& syncpoints = system.Host1x().GetSyncpointManager();
+                        const u32 target = static_cast<u32>(next_completion_value);
+                        for (u32 current = syncpoints.GetGuestSyncpointValue(*operation_syncpoint);
+                             static_cast<s32>(target - current) > 0; ++current) {
+                            syncpoints.IncrementGuest(*operation_syncpoint);
+                            syncpoints.IncrementHost(*operation_syncpoint);
+                        }
+                    }
+                    result = PumpOutput();
                 }
             }
         }
@@ -695,7 +718,8 @@ private:
             // (NV12 pools): treated as the AV1 decoder, the only decoder whose input format is 3. This
             // pairing is inferred, the codec numbering of the real server was not decoded.
             const bool is_av1 = kind == NativeVideoKind::Decoder &&
-                                ((!is_200 && request->codec == 3 && request->output_format == 2) ||
+                                ((!is_200 && request->codec == 3 &&
+                                  (request->output_format == 2 || request->output_format == 3)) ||
                                  (is_200 && request->codec == 1 && request->output_format == 3)) &&
                                 request->input_format == 3 && request->output_mode == 1;
             const bool is_h264 = kind == NativeVideoKind::Decoder && request->codec == 0 &&
@@ -768,6 +792,7 @@ private:
     u64 pending_input_bytes{};
     u64 next_submission_id{1};
     bool started{};
+    bool stream_ended{};
     Kernel::KProcess* process;
     NativeVideoKind kind;
     Kernel::KTransferMemory* transfer_memory{};

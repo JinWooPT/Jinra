@@ -214,7 +214,8 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     return is_suboptimal || is_outdated;
 }
 
-void Swapchain::Present(VkSemaphore render_semaphore) {
+void Swapchain::Present(VkSemaphore render_semaphore, VkResult* diagnostic_result,
+                        std::chrono::steady_clock::time_point* diagnostic_return) {
     const auto present_queue{device.GetPresentQueue()};
     const VkPresentInfoKHR present_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -227,7 +228,10 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
         .pResults = nullptr,
     };
     std::scoped_lock lock{scheduler.submit_mutex};
-    switch (const VkResult result = present_queue.Present(present_info)) {
+    const VkResult result = present_queue.Present(present_info);
+    if (diagnostic_return) *diagnostic_return = std::chrono::steady_clock::now();
+    if (diagnostic_result) *diagnostic_result = result;
+    switch (result) {
     case VK_SUCCESS:
         break;
     case VK_SUBOPTIMAL_KHR:

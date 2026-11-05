@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -212,10 +213,20 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
             return FormatPatchNameVersions(patch, loader, loader.IsRomFSUpdatable());
         });
 
+    std::optional<QString> loader_version;
+    if (file_type == Loader::FileType::NUP) {
+        std::string version;
+        if (loader.ReadDisplayVersion(version) == Loader::ResultStatus::Success) {
+            loader_version = QString::fromStdString(version);
+        } else {
+            loader_version.emplace();
+        }
+    }
+
     u64 play_time = play_time_manager.GetPlayTime(program_id);
     return QList<QStandardItem*>{
         new GameListItemPath(FormatGameName(path), icon, QString::fromStdString(name),
-                             file_type_string, program_id, play_time, patch_versions),
+                             file_type_string, program_id, play_time, patch_versions, loader_version),
         new GameListItem(file_type_string),
         new GameListItemSize(size),
         new GameListItemPlayTime(play_time),

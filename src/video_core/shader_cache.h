@@ -156,6 +156,7 @@ private:
 
     /// @brief Create a new shader entry and register it
     const ShaderInfo* MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr);
+    u64 MeshStateHash() const;
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 

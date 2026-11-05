@@ -60,7 +60,7 @@ SVCS = [
      [0x31, "Result GetResourceLimitCurrentValue(int64_t* out_current_value, Handle resource_limit_handle, LimitableResource which);"],
      [0x32, "Result SetThreadActivity(Handle thread_handle, ThreadActivity thread_activity);"],
      [0x33, "Result GetThreadContext3(Address out_context, Handle thread_handle);"],
-     [0x34, "Result WaitForAddress(Address address, ArbitrationType arb_type, int32_t value, int64_t timeout_ns);"],
+     [0x34, "Result WaitForAddress(Address address, ArbitrationType arb_type, int64_t value, int64_t timeout_ns);"],
      [0x35, "Result SignalToAddress(Address address, SignalType signal_type, int32_t value, int32_t count);"],
      [0x36, "void SynchronizePreemptionState();"],
      [0x37, "Result GetResourceLimitPeakValue(int64_t* out_peak_value, Handle resource_limit_handle, LimitableResource which);"],
@@ -653,6 +653,12 @@ def main():
             return_type, name, arguments = parse_result
 
             register_info = get_registers(parse_result, bitness)
+            if bitness == BIT_32 and imm == 0x34:
+                # The widened value uses R5 for its high word, preserving R3/R4 for the timeout.
+                # See Atmosphere commit a0ad3ef9498e64d5d0e1a72b9c6e739e05af3ebc.
+                input_reads = register_info[2]
+                input_reads[2][2] = [2, 5]
+                input_reads[3][2] = [3, 4]
             wrapper_fns.append(
                 emit_wrapper(name, suffix, register_info, arguments, byte_size))
             arch_fw_declarations[bitness].append(

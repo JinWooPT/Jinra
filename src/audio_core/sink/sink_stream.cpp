@@ -24,6 +24,16 @@
 
 namespace AudioCore::Sink {
 
+SinkStream::SinkStream(Core::System& system_, StreamType type_)
+    : system{system_}, type{type_}, underrun_stats_enabled{[] {
+          const char* value = std::getenv("EDEN_AUDIO_UNDERRUN_STATS");
+          return value && value[0] != '0' && std::atomic<u64>::is_always_lock_free;
+      }()} {
+    if (underrun_stats_enabled) {
+        last_underrun_report = std::chrono::steady_clock::now();
+    }
+}
+
 void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     if (type == StreamType::In)
         return;
@@ -80,6 +90,31 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     }
 
     ++queued_buffers;
+    if (underrun_stats_enabled) {
+        ReportUnderruns();
+    }
+}
+
+void SinkStream::ReportUnderruns() {
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = now - last_underrun_report;
+    if (elapsed < std::chrono::seconds{2}) return;
+    last_underrun_report = now;
+    const auto callbacks = underrun_stats.callbacks.exchange(0, std::memory_order_relaxed);
+    const auto requested = underrun_stats.requested_frames.exchange(0, std::memory_order_relaxed);
+    const auto underruns = underrun_stats.underrun_callbacks.exchange(0, std::memory_order_relaxed);
+    const auto missing = underrun_stats.missing_frames.exchange(0, std::memory_order_relaxed);
+    const auto gap = underrun_stats.max_queue_gap_frames.exchange(0, std::memory_order_relaxed);
+    const auto short_callbacks = underrun_stats.short_sample_callbacks.exchange(0, std::memory_order_relaxed);
+    const auto short_frames = underrun_stats.short_sample_frames.exchange(0, std::memory_order_relaxed);
+    constexpr double frame_ms = 1000.0 / TargetSampleRate;
+    LOG_INFO(Audio,
+             "Audio sink underruns: stream={} type={} interval_ms={:.1f} callbacks={} "
+             "requested_frames={} underrun_callbacks={} missing_frames={} missing_ms={:.2f} "
+             "max_queue_gap_ms={:.2f} short_sample_callbacks={} short_sample_frames={}",
+             static_cast<const void*>(this), type == StreamType::Render ? "render" : "out",
+             std::chrono::duration<double, std::milli>(elapsed).count(), callbacks, requested,
+             underruns, missing, missing * frame_ms, gap * frame_ms, short_callbacks, short_frames);
 }
 
 std::vector<s16> SinkStream::ReleaseBuffer(u64 num_samples) {
@@ -172,8 +207,10 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
     const std::size_t frame_size_bytes = frame_size * sizeof(s16);
     size_t frames_written{0};
     size_t actual_frames_written{0};
+    size_t short_sample_frames{0};
 
     if (system.IsPaused() || system.IsShuttingDown()) {
+        if (underrun_stats_enabled) queue_gap_frames = 0;
         if (system.IsShuttingDown()) {
             std::scoped_lock lk{release_mutex};
             queued_buffers.store(0);
@@ -203,7 +240,14 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
 
         const size_t frames_available = std::min<u64>(playing_buffer.frames - playing_buffer.frames_played, num_frames - frames_written);
 
-        samples_buffer.Pop(&output_buffer[frames_written * frame_size], frames_available * frame_size);
+        const auto samples_read =
+            samples_buffer.Pop(&output_buffer[frames_written * frame_size], frames_available * frame_size);
+        // AppendBuffer publishes queue metadata before its samples. Count a short sample read
+        // separately from an empty queue so those two conditions can be distinguished.
+        if (underrun_stats_enabled && samples_read < frames_available * frame_size) {
+            short_sample_frames +=
+                (frames_available * frame_size - samples_read + frame_size - 1) / frame_size;
+        }
 
         frames_written += frames_available;
         actual_frames_written += frames_available;
@@ -211,6 +255,26 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
 
         if (playing_buffer.frames_played >= playing_buffer.frames)
             playing_buffer.consumed = true;
+    }
+
+    if (underrun_stats_enabled) {
+        underrun_stats.callbacks.fetch_add(1, std::memory_order_relaxed);
+        underrun_stats.requested_frames.fetch_add(num_frames, std::memory_order_relaxed);
+        const u64 missing_frames = num_frames - actual_frames_written;
+        if (actual_frames_written || !missing_frames) queue_gap_frames = 0;
+        if (missing_frames) {
+            queue_gap_frames += missing_frames;
+            underrun_stats.underrun_callbacks.fetch_add(1, std::memory_order_relaxed);
+            underrun_stats.missing_frames.fetch_add(missing_frames, std::memory_order_relaxed);
+            auto previous = underrun_stats.max_queue_gap_frames.load(std::memory_order_relaxed);
+            while (previous < queue_gap_frames &&
+                   !underrun_stats.max_queue_gap_frames.compare_exchange_weak(
+                       previous, queue_gap_frames, std::memory_order_relaxed)) {}
+        }
+        if (short_sample_frames) {
+            underrun_stats.short_sample_callbacks.fetch_add(1, std::memory_order_relaxed);
+            underrun_stats.short_sample_frames.fetch_add(short_sample_frames, std::memory_order_relaxed);
+        }
     }
 
     std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);

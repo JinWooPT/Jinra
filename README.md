@@ -16,6 +16,7 @@ and operating systems remains unverified.
 | --- | --- | --- |
 | Donkey Kong Bananza | Windows, NVIDIA GPU, Vulkan | Rendering and performance changes tested in gameplay. The owner also verified loading a `.nup` dump. |
 | Pokémon Pokopia | Windows, GeForce RTX 5090, Vulkan | Introductory cinematic, tutorial and movement verified. The project owner reported a stable 60 FPS at 2× in the tested gameplay. |
+| The Legend of Zelda: Ocarina of Time (tested NS2 build) | Windows, GeForce RTX 5090, Vulkan | Reaches gameplay. Shader translation and rendering fixes include the excessively bright doorway. Use **1× resolution for the best current experience**; remaining graphics issues and shader-compilation stutter are under investigation. |
 | All other games | No Jinra gameplay results | Compatibility and performance unknown |
 
 The 60 FPS result applies to the tested hardware, settings and gameplay.
@@ -41,6 +42,8 @@ The Windows session below automatically detected a DualSense controller.
   Donkey Kong Bananza on NVIDIA hardware.
 - A targeted NVIDIA Vulkan workaround for the Pokémon Pokopia introductory
   cinematic crash. See [the technical notes](docs/upstream-pokopia-fixes.md).
+- Zelda shader translation and rendering fixes, including preservation of mesh
+  shader register values that previously caused incorrect depth and bright surfaces.
 - Jinra branding, the samurai icon and a redesigned desktop library.
 - Library search, Recent and Favorites views, and a selected-game panel.
 - Xbox and DualSense layout previews, SDL device detection and physical button
@@ -79,6 +82,25 @@ for every PC. Existing saved preferences and per-game overrides take precedence.
 If 2x is too demanding for your system, try 1x. Resolution scaling multiplies the
 game's internal render size, which can vary by game, scene and console mode.
 
+### Zelda: recommended settings and remaining limitations
+
+**Play the tested Ocarina of Time build at 1× resolution for the best current
+experience.** Use Vulkan, High / Accurate GPU accuracy and 12 GB of emulated RAM.
+At 1×, the tested exterior scene renders the vases correctly and avoids the
+overly dark materials seen with higher resolution scales. This is a recommendation
+for this game, not a claim that every scene is graphically correct.
+
+In the tested build, both Handheld and Docked present a 2560×1440 base image.
+The measured final image is 3840×2160 (4K) at 1.5× and 5120×2880 (5K) at 2×.
+Individual rendering passes may use different or dynamic resolutions. These
+numbers do not apply universally to other games.
+
+Stable 60 FPS has **not** been achieved for this Zelda build. The tested exterior
+scene runs around 40–45 FPS when stationary on the development PC, with lower
+rates during movement and shader preparation. Compilation can still cause
+substantial pauses. Higher resolution scales can also make some materials too
+dark. Further graphics and performance fixes are in progress.
+
 See [the desktop interface notes](docs/jinra-ui.md) for controller, artwork,
 language and profile behavior. New initial profiles use the Jinra name and logo;
 existing profile identifiers and save associations are preserved.
@@ -97,6 +119,11 @@ the existing **Check for updates** preference. The updater recognizes newer Jinr
 preview and stable versions, verifies the downloaded installer's size and SHA-256
 digest, and asks before closing the app and starting the installer. Installation
 is blocked while a game is running. No game files or user data are uploaded.
+
+This version retains the Windows installer-handoff fix from preview.3. If you
+are upgrading from preview.1 or preview.2 and Jinra closes without opening Setup,
+download the current installer from Releases and install it over your existing
+installation.
 
 The installer and update support are for Windows x64. Other platforms remain
 unverified. Source builders can run the focused update tests by configuring

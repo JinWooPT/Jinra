@@ -11,6 +11,7 @@
 #include <map>
 
 #include "common/common_types.h"
+#include "shader_recompiler/buffer_texture_index.h"
 #include "shader_recompiler/frontend/ir/type.h"
 #include "shader_recompiler/varying_state.h"
 
@@ -257,6 +258,7 @@ struct BufferTextureSource {
     bool enabled{};
     bool width_query{};
     std::array<BufferTextureExclusion, 4> exclusions{};
+    TextureIndexProgram uniform_index;
 
     auto operator<=>(const BufferTextureSource&) const = default;
 };
@@ -297,7 +299,18 @@ struct ImageDescriptor {
 };
 using ImageDescriptors = boost::container::small_vector<ImageDescriptor, 4>;
 
+struct MeshInfo {
+    u32 payload_words{};
+    u32 max_vertices{};
+    u32 max_primitives{};
+    u32 topology{};
+    boost::container::static_vector<u32, 136> vertex_lines;
+    boost::container::static_vector<u32, 136> primitive_lines;
+};
+
 struct Info {
+    bool is_task{};
+    bool is_mesh{};
     static constexpr size_t MAX_INDIRECT_CBUFS{14};
     static constexpr size_t MAX_CBUFS{32};
     static constexpr size_t MAX_SSBOS{32};

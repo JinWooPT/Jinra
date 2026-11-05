@@ -197,6 +197,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_scheduler.h
     renderer_vulkan/vk_shader_util.cpp
     renderer_vulkan/vk_shader_util.h
+    renderer_vulkan/vk_shader_output.h
     renderer_vulkan/vk_staging_buffer_pool.cpp
     renderer_vulkan/vk_staging_buffer_pool.h
     renderer_vulkan/vk_state_tracker.cpp

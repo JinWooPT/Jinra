@@ -6,6 +6,10 @@
 
 #include <algorithm>
 #include <bit>
+#include <atomic>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include "common/container/unordered_map.h"
 #include <tuple>
@@ -557,28 +561,67 @@ TextureInst MakeInst(Environment& env, IR::Program& program, IR::Block* block, I
                 flags.type.Assign(TextureType::Color2D);
                 inst.SetFlags(flags);
             } else if ((inst.GetOpcode() != IR::Opcode::BindlessImageSampleImplicitLod &&
-                        inst.GetOpcode() != IR::Opcode::BindlessImageSampleExplicitLod) ||
-                       (flags.type != TextureType::Color2D && flags.type != TextureType::ColorCube) || flags.is_depth)
-                throw NotImplementedException("Buffer-backed texture operation or type");
+                        inst.GetOpcode() != IR::Opcode::BindlessImageSampleExplicitLod &&
+                        inst.GetOpcode() != IR::Opcode::BindlessImageSampleDrefImplicitLod &&
+                        inst.GetOpcode() != IR::Opcode::BindlessImageSampleDrefExplicitLod) ||
+                       flags.type >= TextureType::Buffer)
+                throw NotImplementedException("Buffer-backed texture operation {} or type {}",
+                                              IR::NameOf(inst.GetOpcode()), static_cast<u32>(flags.type.Value()));
             if (source->cbuf_index >= Info::MAX_CBUFS || source->cbuf_offset > 0xfff0)
                 throw NotImplementedException("Buffer-backed texture root descriptor bounds");
             const u32 size = ReadCbufCached(env, source->cbuf_index, source->cbuf_offset + 8);
+            auto uniform_index = BufferTexture::UniformIndex(source->index);
+            const bool contains_field = size >= source->offset + sizeof(u32);
+            const u32 count = uniform_index.empty() && contains_field
+                                  ? (size - source->offset - sizeof(u32)) / source->stride + 1 : 1U;
             if (!size || ReadCbufCached(env, source->cbuf_index, source->cbuf_offset + 12) ||
-                size % source->stride || size / source->stride > host_info.max_per_stage_descriptor_sampled_images ||
-                size / source->stride > host_info.max_descriptor_set_sampled_images ||
-                size / source->stride > host_info.max_descriptor_set_samplers)
-                throw NotImplementedException("Buffer-backed texture array bounds or descriptor limits");
+                !contains_field ||
+                count > host_info.max_per_stage_descriptor_sampled_images ||
+                count > host_info.max_descriptor_set_sampled_images ||
+                count > host_info.max_descriptor_set_samplers)
+                throw NotImplementedException("Buffer-backed texture array bounds or descriptor limits: size {}, stride {}, field {}",
+                                              size, source->stride, source->offset);
             addr.index = source->cbuf_index;
             addr.offset = source->cbuf_offset;
             addr.dynamic_offset = source->index;
-            addr.count = size / source->stride;
+            addr.count = count;
             addr.buffer_source = {source->offset, source->stride, size, true, query};
+            addr.buffer_source.uniform_index = std::move(uniform_index);
             addr.buffer_source.exclusions = buffer_tracker.Exclusions(*source, block,
                 [&](u32 bank, u32 offset) -> std::optional<u32> { return ReadCbufCached(env, bank, offset); });
             ++buffer_references;
             return TextureInst{addr, &inst, block};
         }
         if (BufferTexture::ContainsLoadedHandle(inst.Arg(0))) {
+            if (const char* directory = std::getenv("EDEN_NATIVE_TEXTURE_FAILURE_DIR")) {
+                static std::atomic<u32> captures{};
+                const u32 capture = captures.fetch_add(1);
+                if (capture < 8) {
+                    std::ofstream dump(std::filesystem::path{directory} /
+                                       ("texture-failure-" + std::to_string(capture) + ".ir.txt"));
+                    dump << IR::DumpProgram(program);
+                    std::ofstream graph(std::filesystem::path{directory} /
+                                        ("texture-failure-" + std::to_string(capture) + ".cfg.txt"));
+                    std::unordered_map<const IR::Block*, size_t> indices;
+                    for (size_t i = 0; i < program.blocks.size(); ++i) indices.emplace(program.blocks[i], i);
+                    std::ofstream failure(std::filesystem::path{directory} /
+                                          ("texture-failure-" + std::to_string(capture) + ".meta.txt"));
+                    failure << "stage " << static_cast<u32>(program.stage)
+                            << " block " << indices.at(block)
+                            << " instruction " << static_cast<const void*>(&inst)
+                            << " handle " << static_cast<const void*>(inst.Arg(0).TryInstRecursive())
+                            << " operation " << IR::NameOf(inst.GetOpcode()) << '\n';
+                    const auto branches = ConditionalPhi::FindBranches(program);
+                    for (const auto* node : program.blocks) {
+                        graph << indices.at(node) << " ->";
+                        for (const auto* next : node->ImmSuccessors()) graph << ' ' << indices.at(next);
+                        if (const auto found = branches.find(node); found != branches.end())
+                            graph << " condition " << static_cast<const void*>(found->second.condition.TryInstRecursive())
+                                  << " yes " << indices.at(found->second.yes);
+                        graph << '\n';
+                    }
+                }
+            }
             const auto* root = inst.Arg(0).TryInstRecursive();
             throw NotImplementedException("Unresolved buffer-backed texture expression {} after {} references ({} recovered origins)",
                 root ? IR::NameOf(root->GetOpcode()) : "immediate", buffer_references, buffer_tracker.ResolvedCount());
@@ -803,6 +846,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     env.track_cache.clear();
     TextureInstVector to_replace;
     u32 buffer_references{};
+    // Keep use-specific proofs local to collection, before rewriting texture instructions.
     BufferTexture::Tracker buffer_tracker{program};
     for (IR::Block* const block : program.post_order_blocks) {
         env.track_cache.clear();

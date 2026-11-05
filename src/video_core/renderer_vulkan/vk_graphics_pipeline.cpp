@@ -6,11 +6,16 @@
 
 #include "shader_recompiler/frontend/ampere/program_capture.h"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <span>
+#include <string>
+#include <string_view>
 #include <filesystem>
 
 #include <boost/container/small_vector.hpp>
@@ -60,6 +65,41 @@ using VideoCore::Surface::PixelFormatFromDepthFormat;
 using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
 
 constexpr size_t NUM_STAGES = Maxwell::MaxShaderStage;
+std::atomic_flag binding_capture_started;
+
+bool LegacyTextureArrayScopeEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NATIVE_TEXTURE_ARRAY_SCOPE");
+        return value && std::string_view{value} == "legacy";
+    }();
+    return enabled;
+}
+
+bool TextureArrayPipelineLogEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NATIVE_TEXTURE_ARRAY_PIPELINE_LOG");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+bool HasNativeCaptureIndexBuffer(const Shader::Info& info) {
+    return std::ranges::any_of(info.storage_buffers_descriptors, [](const auto& buffer) {
+        return buffer.cbuf_index == 0 && buffer.cbuf_offset == 0x510 &&
+               buffer.count == 1 && !buffer.is_written;
+    });
+}
+
+// The stage of a program: task and mesh programs sit in the vertex and tessellation slots.
+VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits slot_stage) {
+    if (info.is_task) {
+        return VK_SHADER_STAGE_TASK_BIT_EXT;
+    }
+    if (info.is_mesh) {
+        return VK_SHADER_STAGE_MESH_BIT_EXT;
+    }
+    return slot_stage;
+}
 
 DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
     DescriptorLayoutBuilder builder{device};
@@ -71,7 +111,7 @@ DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader
             VK_SHADER_STAGE_GEOMETRY_BIT,
             VK_SHADER_STAGE_FRAGMENT_BIT,
         };
-        builder.Add(infos[index], stages.at(index));
+        builder.Add(infos[index], StageFlag(infos[index], stages.at(index)));
     }
     return builder;
 }
@@ -291,8 +331,16 @@ GraphicsPipeline::GraphicsPipeline(
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
 
     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
-    uses_push_descriptor = builder.CanUsePushDescriptor();
-    uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
+    const bool preserve_actual_array_views =
+        device.IsDescriptorBindingPartiallyBoundSupported() &&
+        std::ranges::any_of(stage_infos.back().texture_descriptors, [&](const auto& desc) {
+            return IsReadOnlyBufferTextureArray(desc, stage_infos.back().storage_buffers_descriptors) &&
+                (!LegacyTextureArrayScopeEnabled() || MatchesLegacyBufferTextureArrayScope(
+                    desc, stage_infos.back().storage_buffers_descriptors));
+        });
+    uses_push_descriptor = !preserve_actual_array_views && builder.CanUsePushDescriptor();
+    uses_descriptor_buffer = !preserve_actual_array_views && builder.CanUseDescriptorBuffer() &&
+                             descriptor_buffer_ring.IsValid();
     descriptor_set_layout =
         builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
     if (uses_descriptor_buffer) {
@@ -308,7 +356,35 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }
 
+    if (TextureArrayPipelineLogEnabled()) {
+        const auto& fragment = stage_infos.back();
+        const bool has_candidate = std::ranges::any_of(fragment.texture_descriptors, [&](const auto& desc) {
+            return IsReadOnlyBufferTextureArray(desc, fragment.storage_buffers_descriptors);
+        });
+        static std::atomic_uint logged_pipelines{};
+        if (has_candidate && logged_pipelines.fetch_add(1, std::memory_order_relaxed) < 256) {
+            std::string roots;
+            for (const auto& desc : fragment.texture_descriptors) {
+                if (!IsReadOnlyBufferTextureArray(desc, fragment.storage_buffers_descriptors)) {
+                    continue;
+                }
+                fmt::format_to(std::back_inserter(roots),
+                               " CB{}+{:#x}/stride{}/field{:#x}/count{}/legacy{}",
+                               desc.cbuf_index, desc.cbuf_offset, desc.buffer_source.stride,
+                               desc.buffer_source.offset, desc.count,
+                               MatchesLegacyBufferTextureArrayScope(desc, fragment.storage_buffers_descriptors));
+            }
+            LOG_INFO(Render_Vulkan,
+                     "Texture array pipeline: pipeline {:016x}, fragment {:016x}, scope {}, partially_bound {}, preserve {}, layout {}, roots:{}",
+                     key.Hash(), key.unique_hashes.back(),
+                     LegacyTextureArrayScopeEnabled() ? "legacy" : "generic",
+                     device.IsDescriptorBindingPartiallyBoundSupported(), preserve_actual_array_views,
+                     uses_push_descriptor ? "push" : uses_descriptor_buffer ? "buffer" : "sets", roots);
+        }
+    }
+
     const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
+    push_constant_stages = builder.PushConstantStages();
     pipeline_layout = builder.CreatePipelineLayout(set_layout);
     if (!uses_descriptor_buffer) {
         descriptor_update_template =
@@ -422,12 +498,35 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&>) {
                 if (desc.buffer_source.enabled) {
                     const auto& source = desc.buffer_source;
+                    const bool uniform = !source.uniform_index.empty();
+                    if (uniform) {
+                        const auto selected = Shader::EvaluateTextureIndex(source.uniform_index,
+                            [&](u32 bank, u32 offset) -> std::optional<u32> {
+                                if (bank >= cbufs.size() || !cbufs[bank].enabled || (offset & 3) ||
+                                    u64{offset} + sizeof(u32) > cbufs[bank].size) return {};
+                                const GPUVAddr address = cbufs[bank].address + offset;
+                                if (!gpu_memory->IsFullyMappedRange(address, sizeof(u32))) return {};
+                                const auto device_address = gpu_memory->GpuToCpuAddress(address);
+                                if (!device_address) return {};
+                                buffer_cache.DownloadMemory(*device_address, sizeof(u32));
+                                return gpu_memory->Read<u32>(address);
+                            });
+                        if (!selected) throw Shader::RuntimeError("Invalid draw-uniform texture index");
+                        index = *selected;
+                    }
                     const GPUVAddr root = cbufs[desc.cbuf_index].address + desc.cbuf_offset;
                     const GPUVAddr base = gpu_memory->Read<u64>(root);
                     if (gpu_memory->Read<u64>(root + 8) != source.size || !base ||
                         base + source.size < base || !gpu_memory->IsFullyMappedRange(base, source.size))
                         throw Shader::RuntimeError("Buffer-backed texture array changed or is unmapped");
-                    if (index == 0) {
+                    const u64 offset = source.offset + u64{index} * source.stride;
+                    if (offset + sizeof(u32) > source.size)
+                        throw Shader::RuntimeError("Texture-handle record outside buffer");
+                    if (uniform) {
+                        const auto address = gpu_memory->GpuToCpuAddress(base + offset);
+                        if (!address) throw Shader::RuntimeError("Unmapped texture-handle record");
+                        buffer_cache.DownloadMemory(*address, sizeof(u32));
+                    } else if (index == 0) {
                         GPUVAddr expected = base;
                         for (const auto& [range_address, range_size] : gpu_memory->GetSubmappedRange(base, source.size)) {
                             const auto device_address = gpu_memory->GpuToCpuAddress(range_address);
@@ -446,9 +545,6 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                             dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
                         }
                     }
-                    const u64 offset = source.offset + u64{index} * source.stride;
-                    if (offset + sizeof(u32) > source.size)
-                        throw Shader::RuntimeError("Texture-handle record outside buffer");
                     const auto pair = TexturePair(gpu_memory->Read<u32>(base + offset), via_header_index);
                     if (pair.first > regs.tex_header.limit || pair.second > regs.tex_sampler.limit)
                         throw Shader::RuntimeError("Buffer-backed texture handle outside descriptor tables");
@@ -497,7 +593,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         for (const auto& desc : info.texture_descriptors) {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
-                if (desc.buffer_source.enabled) {
+                if (desc.buffer_source.enabled && desc.buffer_source.uniform_index.empty()) {
                     const auto& source = desc.buffer_source;
                     const GPUVAddr base = gpu_memory->Read<u64>(cbufs[desc.cbuf_index].address + desc.cbuf_offset);
                     for (const auto& exclusion : source.exclusions) {
@@ -848,12 +944,18 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         buffer_cache.BindHostStageBuffers(stage);
         const auto* stage_views = views_it;
         try {
+            const bool allow_actual_array_views = stage == NUM_STAGES - 1 && !uses_push_descriptor &&
+                !uses_descriptor_buffer && device.IsDescriptorBindingPartiallyBoundSupported();
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage], rescaling,
-                                 samplers_it, views_it);
+                                 samplers_it, views_it, allow_actual_array_views, key.unique_hashes[stage + 1],
+                                 LegacyTextureArrayScopeEnabled());
         } catch (const Shader::Exception&) {
             static u32 diagnostic_count{};
-            if (diagnostic_count++ < 8) {
-                if (std::getenv("EDEN_NATIVE_DRAW_ON_DEMAND")) {
+            const bool log_diagnostics = diagnostic_count++ < 8;
+            const bool capture_binding = stage == 4 && !binding_capture_started.test(std::memory_order_relaxed) &&
+                                         std::getenv("EDEN_NATIVE_BINDING_CAPTURE");
+            if (log_diagnostics || capture_binding) {
+                if (log_diagnostics && std::getenv("EDEN_NATIVE_DRAW_ON_DEMAND")) {
                     const auto& config = regs.pipelines[stage == 4 ? 5 : 1];
                     const GPUVAddr address = (GPUVAddr{config.reserved[0] & 0xff} << 32) | config.reserved[1];
                     size_t length{};
@@ -886,6 +988,69 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                         if (!VideoCore::Surface::IsPixelFormatInteger(cached.format) &&
                             cached.Handle(desc.type) != VK_NULL_HANDLE)
                             continue;
+                        if (capture_binding && desc.cbuf_index == 0 &&
+                            desc.cbuf_offset == 0x520 && desc.buffer_source.stride == 96 &&
+                            desc.buffer_source.offset == 0 && desc.buffer_source.uniform_index.empty() &&
+                            HasNativeCaptureIndexBuffer(info) &&
+                            !binding_capture_started.test_and_set(std::memory_order_relaxed)) {
+                            try {
+                                const auto read = [&](GPUVAddr address, u64 size) -> std::vector<u8> {
+                                    if (!address || !size || size > 16 * 1024 * 1024 ||
+                                        address + size < address ||
+                                        !gpu_memory->IsWithinGPUAddressRange(address) ||
+                                        !gpu_memory->IsWithinGPUAddressRange(address + size - 1) ||
+                                        !gpu_memory->IsFullyMappedRange(address, size)) return {};
+                                    GPUVAddr end = address;
+                                    for (const auto& [segment, length] :
+                                         gpu_memory->GetSubmappedRange(address, size)) {
+                                        const auto device_address = gpu_memory->GpuToCpuAddress(segment);
+                                        if (segment != end || !length || !device_address) return {};
+                                        buffer_cache.DownloadMemory(*device_address, length);
+                                        end += length;
+                                    }
+                                    if (end != address + size) return {};
+                                    std::vector<u8> bytes(size);
+                                    gpu_memory->ReadBlockUnsafe(address, bytes.data(), bytes.size());
+                                    return bytes;
+                                };
+                                const auto capture = [&] {
+                                    const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
+                                    if (!cbufs[0].enabled || !cbufs[3].enabled ||
+                                        cbufs[0].size > 65536 || cbufs[3].size > 65536) return;
+                                    const auto cb0 = read(cbufs[0].address, cbufs[0].size);
+                                    const auto cb3 = read(cbufs[3].address, cbufs[3].size);
+                                    if (cb0.size() < 0x530 || cb3.size() < 0x95c) return;
+                                    std::array<u64, 4> roots{};
+                                    std::memcpy(roots.data(), cb0.data() + 0x510, sizeof(roots));
+                                    const auto [index_address, index_size, texture_address, texture_size] = roots;
+                                    if (texture_size != desc.buffer_source.size) return;
+                                    const auto indices = read(index_address, index_size);
+                                    const auto textures = read(texture_address, texture_size);
+                                    if (indices.empty() || textures.empty()) return;
+
+                                    const auto& shader = regs.pipelines[5];
+                                    const GPUVAddr shader_address =
+                                        (GPUVAddr{shader.reserved[0] & 0xff} << 32) | shader.reserved[1];
+                                    const auto prefix = fmt::format("native-binding-capture-{}-{:x}-{:x}-{}",
+                                                                    stage, shader_address, texture_address, index);
+                                    const auto dump = [&](std::string_view name, const std::vector<u8>& bytes) {
+                                        std::ofstream file(prefix + std::string{name}, std::ios::binary);
+                                        file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                                        file.close();
+                                        return file.good();
+                                    };
+                                    if (dump("-cbuf0.bin", cb0) && dump("-cbuf3.bin", cb3) &&
+                                        dump("-indices.bin", indices) && dump("-textures.bin", textures)) {
+                                        LOG_INFO(Render_Vulkan, "Captured native texture binding {} (TIC {})",
+                                                 prefix, view.index);
+                                    }
+                                };
+                                capture();
+                            } catch (const std::exception& error) {
+                                LOG_WARNING(Render_Vulkan, "Native texture binding capture failed: {}", error.what());
+                            }
+                        }
+                        if (!log_diagnostics) continue;
                         const auto tic_address = regs.tex_header.Address() +
                             u64{view.index} * sizeof(Tegra::Texture::TICEntry);
                         Tegra::Texture::TICEntry tic{};
@@ -998,7 +1163,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         });
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
-    const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling)};
+    const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling, push_constant_stages)};
     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
     const bool bind_descriptor_buffer{
         descriptor_set_layout && uses_descriptor_buffer &&
@@ -1038,18 +1203,18 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             }
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
         }
-        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+        cmdbuf.PushConstants(*pipeline_layout, push_constant_stages,
                              RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
                              rescaling_data.data());
         if (update_rescaling) {
             const f32 config_down_factor{Settings::values.resolution_info.down_factor};
             const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+            cmdbuf.PushConstants(*pipeline_layout, push_constant_stages,
                                  RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
                                  &scale_down_factor);
         }
         if (uses_render_area) {
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+            cmdbuf.PushConstants(*pipeline_layout, push_constant_stages,
                                  RENDERAREA_LAYOUT_OFFSET, sizeof(render_area_data),
                                  &render_area_data);
         }
@@ -1431,6 +1596,19 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         }
     }
 
+    const bool is_mesh{IsMeshPipeline()};
+    if (is_mesh) {
+        // Mesh pipelines have no vertex input or input assembly.
+        dynamic_states.erase(std::remove_if(dynamic_states.begin(), dynamic_states.end(),
+                                            [](VkDynamicState state) {
+                                                return state == VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY_EXT ||
+                                                       state == VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE_EXT ||
+                                                       state == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT ||
+                                                       state == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT ||
+                                                       state == VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT;
+                                            }),
+                             dynamic_states.end());
+    }
     const VkPipelineDynamicStateCreateInfo dynamic_state_ci{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         .pNext = nullptr,
@@ -1453,7 +1631,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                 .pNext = nullptr,
                 .flags = 0,
-                .stage = MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)),
+                .stage = StageFlag(stage_infos[stage],
+                                   MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
                 .module = *spv_modules[stage],
                 .pName = "main",
                 .pSpecializationInfo = nullptr,
@@ -1467,15 +1646,21 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
+    static const bool profile_build = [] {
+        const char* value = std::getenv("EDEN_SHADER_BUILD_PROFILE");
+        return value && std::string_view{value} == "1";
+    }();
+    using Clock = std::chrono::steady_clock;
+    const auto driver_begin = profile_build ? Clock::now() : Clock::time_point{};
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
         .flags = flags,
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
-        .pVertexInputState = &vertex_input_ci,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = &tessellation_ci,
+        .pVertexInputState = is_mesh ? nullptr : &vertex_input_ci,
+        .pInputAssemblyState = is_mesh ? nullptr : &input_assembly_ci,
+        .pTessellationState = is_mesh ? nullptr : &tessellation_ci,
         .pViewportState = &viewport_ci,
         .pRasterizationState = &rasterization_ci,
         .pMultisampleState = &multisample_ci,
@@ -1488,6 +1673,11 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    if (profile_build) {
+        const auto elapsed = std::chrono::duration<double, std::milli>{Clock::now() - driver_begin};
+        LOG_INFO(Render_Vulkan, "Shader driver pipeline={:016x} kind=graphics create_ms={:.3f}",
+                 key.Hash(), elapsed.count());
+    }
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

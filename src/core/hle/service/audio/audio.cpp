@@ -4,8 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+
 #include "core/core.h"
 #include "core/hle/kernel/svc_results.h"
+#include "core/hle/service/audio/nx2_audio_device_manager.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/audio/audio.h"
 #include "core/hle/service/audio/audio_controller.h"
@@ -263,6 +265,11 @@ void LoopProcess(Core::System& system) {
     server_manager->RegisterNamedService("hwopus", std::make_shared<IHardwareOpusDecoderManager>(system), 25);
     server_manager->RegisterNamedService("aud:u",
         std::make_shared<INativeAudioManager>(system, audio_input, audio_output, audio_renderer), 30);
+    auto mixer_streams = std::make_shared<Nx2SysmixStreams>();
+    server_manager->RegisterNamedService("auddmg:u",
+        std::make_shared<INx2AudioDeviceManagerService>(system, mixer_streams), 30);
+    server_manager->RegisterNamedService("audsmx:u",
+        std::make_shared<INx2AudioSoundMixerService>(system, mixer_streams), 30);
     ServerManager::RunServer(std::move(server_manager));
 }
 

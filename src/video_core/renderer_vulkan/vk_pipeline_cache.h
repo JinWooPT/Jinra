@@ -81,6 +81,8 @@ struct hash<Vulkan::ComputePipelineCacheKey> {
 
 namespace Vulkan {
 
+namespace TaskShaderReuse { class Cache; }
+
 class ComputePipeline;
 class DescriptorPool;
 class Device;
@@ -176,6 +178,7 @@ private:
 
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
+    std::unique_ptr<TaskShaderReuse::Cache> task_shader_reuse;
 
     std::filesystem::path pipeline_cache_filename;
 

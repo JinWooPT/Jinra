@@ -56,6 +56,8 @@ public:
         return static_cast<bool>(pipeline);
     }
 
+    void RecordDispatchForProfile(bool indirect) const;
+
 private:
     const Device& device;
     vk::PipelineCache& pipeline_cache;

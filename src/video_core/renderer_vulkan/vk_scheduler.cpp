@@ -264,13 +264,8 @@ bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
     return true;
 }
 
-bool Scheduler::UpdateRescaling(bool is_rescaling) {
-    if (state.rescaling_defined && is_rescaling == state.is_rescaling) {
-        return false;
-    }
-    state.rescaling_defined = true;
-    state.is_rescaling = is_rescaling;
-    return true;
+bool Scheduler::UpdateRescaling(bool is_rescaling, VkShaderStageFlags push_constant_stages) {
+    return state.rescaling.Update(is_rescaling, push_constant_stages);
 }
 
 bool Scheduler::UpdateDescriptorBufferChunk(u32 descriptor_chunk) {
@@ -410,7 +405,7 @@ void Scheduler::AllocateNewContext() {
 
 void Scheduler::InvalidateState() {
     state.graphics_pipeline = nullptr;
-    state.rescaling_defined = false;
+    state.rescaling.Invalidate();
     state.descriptor_buffer_bound = false;
     state_tracker.InvalidateCommandBufferState();
 }

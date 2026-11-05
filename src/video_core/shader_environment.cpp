@@ -538,7 +538,8 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size,
                         native_program_key, reject_index * sizeof(Instruction), reject);
         }
     }
-    auto lowered = Shader::Ampere::LowerToMaxwell(native, verified_traps, true);
+    const bool mesh_stage = stage == Shader::Stage::Task || stage == Shader::Stage::Mesh;
+    auto lowered = Shader::Ampere::LowerToMaxwell(native, verified_traps, true, mesh_stage);
     if (!lowered) {
         dump_failure();
         if (const char* directory = std::getenv("EDEN_NATIVE_SHADER_OVERRIDE_DIR")) {
@@ -649,8 +650,16 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     : GenericEnvironment{gpu_memory_, program_base_, start_address_}, maxwell3d{&maxwell3d_} {
     gpu_memory->ReadBlock(program_base + start_address, &sph, sizeof(sph));
     initial_offset = sizeof(sph);
-    texture_bound = maxwell3d->regs.bindless_texture_const_buffer_slot;
-    if (maxwell3d->GetNativeMacroEngine().native_turing) {
+    const auto& regs{maxwell3d->regs};
+    texture_bound = regs.bindless_texture_const_buffer_slot;
+    const bool native{maxwell3d->GetNativeMacroEngine().native_turing};
+    const bool mesh_slot{native && regs.IsMeshEnabled() &&
+                         (program == Maxwell::ShaderType::VertexB ||
+                          program == Maxwell::ShaderType::Tessellation)};
+    const bool task_slot{mesh_slot && program == Maxwell::ShaderType::VertexB &&
+                         regs.IsShaderConfigEnabled(Maxwell::ShaderType::Tessellation)};
+    const auto mesh_stage{task_slot ? Shader::Stage::Task : Shader::Stage::Mesh};
+    if (native) {
         // Geometry stages are lowered by default (EDEN_NATIVE_LOWER_GS=0 rejects them);
         // EDEN_NATIVE_LOWER_GS=1 also lets tessellation stages through.
         static const char* const lower_stages = std::getenv("EDEN_NATIVE_LOWER_GS");
@@ -658,7 +667,7 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
         static const bool lower_all_stages = lower_stages && std::strcmp(lower_stages, "1") == 0;
         const bool allowed = program == Maxwell::ShaderType::VertexB || program == Maxwell::ShaderType::Pixel ||
                              (program == Maxwell::ShaderType::Geometry && lower_geometry);
-        if (!lower_all_stages && !allowed) {
+        if (!lower_all_stages && !allowed && !mesh_slot) {
             throw Shader::RuntimeError("Unsupported native graphics shader stage {}", static_cast<u32>(program));
         }
         if (VideoCommon::NativeDrawDiagnosticsEnabled()) {
@@ -674,6 +683,9 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
             }
         }
         stage = program == Maxwell::ShaderType::VertexB ? Shader::Stage::VertexB : Shader::Stage::Fragment;
+        if (mesh_slot) {
+            stage = mesh_stage;
+        }
         // The capture reads constant-buffer tables through ReadCbufValue, which indexes the stage's buffers.
         switch (program) {
         case Maxwell::ShaderType::TessellationInit:
@@ -720,6 +732,17 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     default:
         ASSERT_MSG(false, "Invalid program={}", program);
         break;
+    }
+    if (mesh_slot) {
+        stage = mesh_stage;
+        mesh_registers = {regs.reg_array[Maxwell::MeshShaderA], regs.reg_array[Maxwell::MeshShaderB],
+                          regs.reg_array[Maxwell::MeshInitShader]};
+        if (stage == Shader::Stage::Mesh && regs.IsShaderConfigEnabled(Maxwell::ShaderType::Geometry)) {
+            const auto& geometry{regs.pipelines[static_cast<size_t>(Maxwell::ShaderType::Geometry)]};
+            const GPUVAddr address{(static_cast<u64>(geometry.reserved[0] & 0xff) << 32) |
+                                   geometry.reserved[1]};
+            gpu_memory->ReadBlock(address, &mesh_primitive_header, sizeof(mesh_primitive_header));
+        }
     }
     const u64 local_size{sph.LocalMemorySize()};
     ASSERT(local_size <= (std::numeric_limits<u32>::max)());

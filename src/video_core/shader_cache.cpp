@@ -48,6 +48,20 @@ void ShaderCache::SyncGuestHost() {
 ShaderCache::ShaderCache(Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : device_memory{device_memory_} {}
 
+u64 ShaderCache::MeshStateHash() const {
+    using Regs = Tegra::Engines::Maxwell3D::Regs;
+    const auto& regs{maxwell3d->regs};
+    std::array<u32, 23> state{regs.reg_array[Regs::MeshShaderA], regs.reg_array[Regs::MeshShaderB],
+                              regs.reg_array[Regs::MeshInitShader]};
+    if (regs.IsShaderConfigEnabled(Regs::ShaderType::Geometry)) {
+        const auto& geometry{regs.pipelines[static_cast<size_t>(Regs::ShaderType::Geometry)]};
+        const GPUVAddr address{(static_cast<u64>(geometry.reserved[0] & 0xff) << 32) |
+                               geometry.reserved[1]};
+        gpu_memory->ReadBlock(address, state.data() + 3, 20 * sizeof(u32));
+    }
+    return Common::CityHash64(reinterpret_cast<const char*>(state.data()), sizeof(state)) | 1;
+}
+
 bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     auto& dirty{maxwell3d->dirty.flags};
     if (!dirty[VideoCommon::Dirty::Shaders]) {
@@ -57,6 +71,8 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
 
     const GPUVAddr base_addr{maxwell3d->regs.program_region.Address()};
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
+    const bool mesh{native && maxwell3d->regs.IsMeshEnabled()};
+    const u64 mesh_state{mesh ? MeshStateHash() : 0};
     for (size_t index = 0; index < Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram; ++index) {
         if (!maxwell3d->regs.IsShaderConfigEnabled(index)) {
             unique_hashes[index] = 0;
@@ -64,6 +80,11 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         }
         const auto& shader_config{maxwell3d->regs.pipelines[index]};
         const auto program{static_cast<Tegra::Engines::Maxwell3D::Regs::ShaderType>(index)};
+        using ShaderType = Tegra::Engines::Maxwell3D::Regs::ShaderType;
+        if (mesh && program == ShaderType::Geometry) {
+            unique_hashes[index] = 0;
+            continue;
+        }
         if (program == Tegra::Engines::Maxwell3D::Regs::ShaderType::Pixel &&
             !maxwell3d->regs.rasterize_enable) {
             unique_hashes[index] = 0;
@@ -95,7 +116,10 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
             }
         }
         shader_infos[index] = shader_info;
-        unique_hashes[index] = shader_info->unique_hash;
+        unique_hashes[index] = mesh && (program == ShaderType::VertexB ||
+                                        program == ShaderType::Tessellation)
+                                   ? shader_info->unique_hash ^ mesh_state
+                                   : shader_info->unique_hash;
     }
     last_shaders_valid = true;
     return true;

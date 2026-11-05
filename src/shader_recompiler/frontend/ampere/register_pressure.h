@@ -19,28 +19,55 @@ inline u64 NativeRegisterCopy(u32 destination_bank, u32 destination, u32 source_
 // for one native instruction. The expanded instruction owns its temporary bank.
 inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 reserved) {
     RegisterPressure result{input};
+    if (reserved < 4 || reserved > 248 || (reserved & 3)) {
+        result.valid = false;
+        return result;
+    }
     struct Operand { u32 bit, count; };
     std::vector<Operand> operands;
     const auto operand = [&](u32 bit, u32 count = 1) { operands.push_back({bit, count}); };
     const u32 opcode = input.Bits(0, 12);
     switch (opcode) {
-    case 0x802: case 0xb08: case 0xd08: operand(16); break;
-    case 0x308: operand(16); operand(32); break;
+    case 0x802: case 0xb08: case 0xd08: case 0x919: case 0x908: case 0xa02: case 0xc3e:
+        operand(16); break;
+    case 0x308: case 0x202: case 0x213: case 0x243: case 0x245: case 0x305: case 0x306: case 0x307:
+        operand(16); operand(32); break;
+    case 0x807: case 0x808: case 0x820: case 0xa20: case 0x421: case 0x827:
+    case 0xc17: case 0xc07: case 0x817: case 0x81a: case 0x621:
+        operand(16); operand(24); break;
+    case 0x207: case 0x208: case 0x220: case 0x221: case 0x209:
+        operand(16); operand(24); operand(32); break;
+    case 0x20c: case 0x20b:
+        operand(24); operand(32); break;
+    case 0xa0c: case 0x804: case 0x80b: case 0x80c:
+        operand(24); break;
     case 0x433: case 0x633: operand(16); operand(24); break;
     case 0x233: operand(16); operand(24); operand(32); break;
-    case 0x812: case 0x824: case 0x831: case 0x424: case 0x624:
+    case 0x810: case 0x812: case 0x824: case 0x831:
+    case 0x424: case 0x624: case 0xa23: case 0xa24: case 0x423: case 0x623:
+    case 0x823: case 0xa10: case 0xc10: case 0xc24: case 0xe24:
         operand(16); operand(24); operand(64); break;
     case 0x230: case 0x231:
         operand(16); operand(24); operand(32); operand(64); break;
     case 0x819:
         operand(16); operand(24); operand(64); break;
-    case 0x211:
+    case 0x210: case 0x211: case 0x212: case 0x219: case 0x223: case 0x224:
         operand(16); operand(24); operand(32); operand(64); break;
+    case 0x321:
+        operand(16, input.Bits(74, 2) + 1); operand(24); operand(32); break;
+    case 0x322:
+        operand(24); operand(32, input.Bits(74, 2) + 1); break;
+    case 0x59f:
+        operand(24, input.Bits(61, 3) == 3 ? 2 : 1); operand(32); break;
+    case 0x923:
+        operand(16); operand(24); break;
+    case 0x927:
+        operand(24); operand(32); break;
     case 0xa11:
         operand(16); operand(24); operand(64); break;
-    case 0x225: case 0x625: case 0x825:
-        operand(16, 2); operand(24);
-        if (opcode == 0x225) { operand(32); operand(64, 2); }
+    case 0x225: case 0x227: case 0x625: case 0x825:
+        operand(16, opcode == 0x227 ? 1 : 2); operand(24);
+        if (opcode == 0x225 || opcode == 0x227) { operand(32); operand(64, 2); }
         if (opcode == 0x625) operand(64);
         if (opcode == 0x825) operand(64, 2);
         break;
@@ -55,10 +82,10 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
     }
     case 0x387: case 0x983:
         operand(opcode == 0x387 ? 32 : 16); operand(24); break;
-    case 0x981: case 0x986: {
+    case 0x381: case 0x386: case 0x981: case 0x986: {
         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
-        operand(opcode == 0x981 ? 16 : 32, count);
-        operand(24, input.Bits(72, 1) ? 2 : 1); break;
+        operand(opcode == 0x981 || opcode == 0x381 ? 16 : 32, count);
+        operand(24, opcode == 0x381 || opcode == 0x386 || input.Bits(72, 1) ? 2 : 1); break;
     }
     default:
         result.valid = false; return result;
@@ -68,7 +95,11 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
     for (const auto [bit, count] : operands) {
         const u32 reg = input.Bits(bit, 8);
         if (reg == 255) continue;
-        if (reg + count > 255) { result.valid = false; return result; }
+        if (reg + count > 255 || (reg < reserved && reg + count > reserved) ||
+            (reg >= reserved && reg / 4 != (reg + count - 1) / 4)) {
+            result.valid = false;
+            return result;
+        }
         for (u32 component = 0; component < count; ++component) {
             used[reg + component] = true;
             if (reg + component >= reserved) groups[(reg + component) / 4] = true;

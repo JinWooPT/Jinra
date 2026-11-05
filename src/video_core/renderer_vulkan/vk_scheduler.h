@@ -20,6 +20,7 @@
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/renderer_vulkan/vk_push_constant_state.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCommon {
@@ -82,7 +83,7 @@ public:
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
 
     /// Update the rescaling state. Returns true if the state has to be updated.
-    bool UpdateRescaling(bool is_rescaling);
+    bool UpdateRescaling(bool is_rescaling, VkShaderStageFlags push_constant_stages);
 
     /// Returns true when the descriptor buffer chunk has to be bound into the command buffer.
     bool UpdateDescriptorBufferChunk(u32 descriptor_chunk);
@@ -283,8 +284,7 @@ private:
         VkFramebuffer framebuffer{};
         VkExtent2D render_area = {0, 0};
         GraphicsPipeline* graphics_pipeline = nullptr;
-        bool is_rescaling = false;
-        bool rescaling_defined = false;
+        RescalingPushConstantState rescaling;
         bool needs_state_enable_refresh = false;
         u32 descriptor_buffer_chunk = 0;
         bool descriptor_buffer_bound = false;

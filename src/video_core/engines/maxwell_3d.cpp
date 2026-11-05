@@ -346,6 +346,11 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
 }
 
 void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
+    // NVN restores base-instance state before its macro returns. Pending instances
+    // must use the constants and bindings from before that restoration.
+    if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) {
+        draw_manager.DrawDeferred(*this, true);
+    }
     regs.reg_array[method] = argument;
     for (auto const& table : dirty.tables)
         dirty.flags[table[method]] = true;
@@ -746,6 +751,9 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
 }
 
 void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
+    if (amount && draw_manager.HasDeferredDraw()) {
+        draw_manager.DrawDeferred(*this, true);
+    }
     // Write the input value to the current const buffer at the current position.
     const GPUVAddr buffer_address = regs.const_buffer.Address();
     ASSERT(buffer_address != 0);

@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -66,6 +67,11 @@ struct Product { IR::Value index; u32 stride; };
 inline std::optional<Product> Multiply(IR::Value value) {
     const auto* inst = value.TryInstRecursive();
     if (!inst) return {};
+    if (inst->GetOpcode() == IR::Opcode::ShiftLeftLogical32) {
+        const auto shift = Constant(inst->Arg(1));
+        if (shift && *shift < 32) return Product{inst->Arg(0), 1U << *shift};
+        return {};
+    }
     if (inst->GetOpcode() == IR::Opcode::IMul32) {
         if (const auto k = Constant(inst->Arg(1))) return Product{inst->Arg(0), *k};
         if (const auto k = Constant(inst->Arg(0))) return Product{inst->Arg(1), *k};
@@ -86,7 +92,51 @@ inline std::optional<Product> Multiply(IR::Value value) {
     return {};
 }
 
-inline std::optional<BufferTextureAddress> Track(IR::Value value, const Info& info) {
+struct RecordOffset { IR::Value index; u32 stride; u64 offset; };
+
+inline bool NormalizeRecordOffset(RecordOffset& record, u32 stride, IR::IREmitter* ir) {
+    if (!stride || (record.stride && record.stride != stride)) return false;
+    if (!record.stride) {
+        if (!ir) return false;
+        record.index = ir->Imm32(static_cast<u32>(record.offset / stride));
+        record.stride = stride;
+    } else if (record.offset >= stride) {
+        if (!ir) return false;
+        record.index = ir->IAdd(IR::U32{record.index}, ir->Imm32(static_cast<u32>(record.offset / stride)));
+    }
+    record.offset %= stride;
+    return true;
+}
+
+inline std::optional<RecordOffset> RelativeRecord(IR::Value value, IR::IREmitter* ir, u32 depth = 0) {
+    if (depth > 16) return {};
+    if (const auto constant = Constant(value)) return RecordOffset{{}, 0, *constant};
+    if (const auto product = Multiply(value)) return RecordOffset{product->index, product->stride, 0};
+    const auto* inst = value.TryInstRecursive();
+    if (!inst) return {};
+    if (inst->GetOpcode() == IR::Opcode::IAdd32) {
+        for (u32 side = 0; side < 2; ++side) if (const auto constant = Constant(inst->Arg(side))) {
+            auto result = RelativeRecord(inst->Arg(1 - side), ir, depth + 1);
+            if (!result || result->offset + *constant > 0xffffffffULL) return {};
+            result->offset += *constant;
+            return result;
+        }
+    }
+    if (ir && inst->GetOpcode() == IR::Opcode::SelectU32) {
+        auto a = RelativeRecord(inst->Arg(1), ir, depth + 1);
+        auto b = RelativeRecord(inst->Arg(2), ir, depth + 1);
+        if (!a || !b) return {};
+        const u32 stride = a->stride ? a->stride : b->stride;
+        if (!NormalizeRecordOffset(*a, stride, ir) || !NormalizeRecordOffset(*b, stride, ir) ||
+            a->offset != b->offset) return {};
+        a->index = ir->Select(IR::U1{inst->Arg(0)}, IR::U32{a->index}, IR::U32{b->index});
+        return a;
+    }
+    return {};
+}
+
+inline std::optional<BufferTextureAddress> Track(IR::Value value, const Info& info,
+                                                IR::IREmitter* ir = nullptr) {
     value = value.Resolve();
     auto* load = value.TryInstRecursive();
     u32 component{};
@@ -118,21 +168,116 @@ inline std::optional<BufferTextureAddress> Track(IR::Value value, const Info& in
     if (CbufLow(address->Arg(0), buffer.cbuf_index, buffer.cbuf_offset)) relative = address->Arg(1);
     else if (CbufLow(address->Arg(1), buffer.cbuf_index, buffer.cbuf_offset)) relative = address->Arg(0);
     else return {};
-    u64 offset = component;
-    const auto* add = relative.TryInstRecursive();
-    if (add && add->GetOpcode() == IR::Opcode::IAdd32) {
-        if (const auto right_constant = Constant(add->Arg(1))) { offset += *right_constant; relative = add->Arg(0); }
-        else if (const auto left_constant = Constant(add->Arg(0))) { offset += *left_constant; relative = add->Arg(1); }
-    }
-    const auto product = Multiply(relative);
-    if (!product || !product->stride || (product->stride & 3) ||
-        offset >= product->stride || product->stride - offset < 4) return {};
-    return BufferTextureAddress{buffer.cbuf_index, buffer.cbuf_offset, static_cast<u32>(offset),
-                                product->stride, IR::U32{product->index}};
+    auto record = RelativeRecord(relative, ir);
+    if (!record || !record->stride || (record->stride & 3) ||
+        record->offset + component > 0xffffffffULL) return {};
+    record->offset += component;
+    if (!NormalizeRecordOffset(*record, record->stride, ir) || record->stride - record->offset < 4) return {};
+    return BufferTextureAddress{buffer.cbuf_index, buffer.cbuf_offset, static_cast<u32>(record->offset),
+                                record->stride, IR::U32{record->index}};
 }
 inline bool SameArray(const BufferTextureAddress& a, const BufferTextureAddress& b) {
     return a.cbuf_index == b.cbuf_index && a.cbuf_offset == b.cbuf_offset &&
            a.offset == b.offset && a.stride == b.stride;
+}
+
+inline TextureIndexProgram UniformIndex(IR::Value value) {
+    TextureIndexProgram code;
+    std::unordered_map<const IR::Inst*, u32> cache;
+    std::unordered_set<const IR::Inst*> active;
+    const auto append = [&](TextureIndexOp op, u32 a = 0, u32 b = 0, u32 c = 0) -> std::optional<u32> {
+        if (code.size() >= 256) return {};
+        code.push_back({op, a, b, c});
+        return static_cast<u32>(code.size() - 1);
+    };
+    const auto build = [&](auto&& self, IR::Value input, u32 depth) -> std::optional<u32> {
+        if (depth > 64) return {};
+        input = input.Resolve();
+        if (input.IsImmediate()) {
+            if (input.Type() == IR::Type::U32) return append(TextureIndexOp::Immediate, input.U32());
+            if (input.Type() == IR::Type::U1) return append(TextureIndexOp::Immediate, input.U1());
+            return {};
+        }
+        const auto* inst = input.TryInstRecursive();
+        if (!inst) return {};
+        if (const auto found = cache.find(inst); found != cache.end()) return found->second;
+        if (!active.insert(inst).second) return {};
+        const auto result = [&]() -> std::optional<u32> {
+            const auto op = inst->GetOpcode();
+            if (op == IR::Opcode::ShuffleIndex || op == IR::Opcode::VoteAny || op == IR::Opcode::VoteAll ||
+                op == IR::Opcode::ConditionRef) return self(self, inst->Arg(0), depth + 1);
+            if (op == IR::Opcode::GetCbufU32) {
+                const auto bank = Constant(inst->Arg(0));
+                const auto offset = self(self, inst->Arg(1), depth + 1);
+                if (bank && *bank < Info::MAX_CBUFS && offset) return append(TextureIndexOp::Cbuf, *bank, *offset);
+                return {};
+            }
+            if (op == IR::Opcode::CompositeExtractU32x2) {
+                const auto part = Constant(inst->Arg(1));
+                const auto* source = inst->Arg(0).TryInstRecursive();
+                if (!part || *part > 1 || !source || source->GetOpcode() != IR::Opcode::GetCbufU32x2) return {};
+                const auto bank = Constant(source->Arg(0));
+                auto offset = self(self, source->Arg(1), depth + 1);
+                if (!bank || *bank >= Info::MAX_CBUFS || !offset) return {};
+                if (*part) {
+                    const auto amount = append(TextureIndexOp::Immediate, 4);
+                    if (!amount) return {};
+                    offset = append(TextureIndexOp::Add, *offset, *amount);
+                }
+                return offset ? append(TextureIndexOp::Cbuf, *bank, *offset) : std::nullopt;
+            }
+            TextureIndexOp operation;
+            u32 arguments = 2;
+            switch (op) {
+            case IR::Opcode::IAdd32: operation = TextureIndexOp::Add; break;
+            case IR::Opcode::ISub32: operation = TextureIndexOp::Sub; break;
+            case IR::Opcode::IMul32: operation = TextureIndexOp::Mul; break;
+            case IR::Opcode::BitwiseAnd32: operation = TextureIndexOp::And; break;
+            case IR::Opcode::BitwiseOr32: operation = TextureIndexOp::Or; break;
+            case IR::Opcode::BitwiseXor32: operation = TextureIndexOp::Xor; break;
+            case IR::Opcode::ShiftLeftLogical32: operation = TextureIndexOp::Shl; break;
+            case IR::Opcode::ShiftRightLogical32: operation = TextureIndexOp::Shr; break;
+            case IR::Opcode::ShiftRightArithmetic32: operation = TextureIndexOp::Sar; break;
+            case IR::Opcode::IEqual: operation = TextureIndexOp::Eq; break;
+            case IR::Opcode::INotEqual: operation = TextureIndexOp::Ne; break;
+            case IR::Opcode::ULessThan: operation = TextureIndexOp::ULt; break;
+            case IR::Opcode::ULessThanEqual: operation = TextureIndexOp::ULe; break;
+            case IR::Opcode::SLessThan: operation = TextureIndexOp::SLt; break;
+            case IR::Opcode::SLessThanEqual: operation = TextureIndexOp::SLe; break;
+            case IR::Opcode::UMin32: operation = TextureIndexOp::UMin; break;
+            case IR::Opcode::UMax32: operation = TextureIndexOp::UMax; break;
+            case IR::Opcode::SMin32: operation = TextureIndexOp::SMin; break;
+            case IR::Opcode::SMax32: operation = TextureIndexOp::SMax; break;
+            case IR::Opcode::LogicalAnd: operation = TextureIndexOp::LAnd; break;
+            case IR::Opcode::LogicalOr: operation = TextureIndexOp::LOr; break;
+            case IR::Opcode::LogicalXor: operation = TextureIndexOp::LXor; break;
+            case IR::Opcode::INeg32: operation = TextureIndexOp::Neg; arguments = 1; break;
+            case IR::Opcode::BitwiseNot32: operation = TextureIndexOp::Not; arguments = 1; break;
+            case IR::Opcode::LogicalNot: operation = TextureIndexOp::LNot; arguments = 1; break;
+            case IR::Opcode::SelectU32: operation = TextureIndexOp::Select; arguments = 3; break;
+            case IR::Opcode::BitFieldUExtract: operation = TextureIndexOp::ExtractU; arguments = 3; break;
+            case IR::Opcode::BitFieldSExtract: operation = TextureIndexOp::ExtractS; arguments = 3; break;
+            default: return {};
+            }
+            std::array<u32, 3> operands{};
+            for (u32 arg = 0; arg < arguments; ++arg) {
+                const auto child = self(self, inst->Arg(arg), depth + 1);
+                if (!child) return {};
+                operands[arg] = *child;
+            }
+            return append(operation, operands[0], operands[1], operands[2]);
+        }();
+        active.erase(inst);
+        if (result) cache.emplace(inst, *result);
+        return result;
+    };
+    const auto root = build(build, value, 0);
+    if (!root) return {};
+    if (*root != code.size() - 1) {
+        const auto zero = append(TextureIndexOp::Immediate, 0);
+        if (!zero || !append(TextureIndexOp::Add, *root, *zero)) return {};
+    }
+    return code;
 }
 
 class Tracker {
@@ -145,9 +290,30 @@ public:
         if (!inst) return {};
         if (const auto found = cache.find(inst); found != cache.end()) return found->second;
         if (active.size() >= 128 || !active.insert(inst).second) return {};
-        auto result = Track(value, program.info);
+        auto* owner = Owner(inst);
+        std::optional<BufferTextureAddress> result;
+        if (owner) {
+            IR::IREmitter ir{*owner, IR::Block::InstructionList::s_iterator_to(*inst)};
+            result = Track(value, program.info, &ir);
+        }
         if (!result && (inst->GetOpcode() == IR::Opcode::BitCastU32F32 || inst->GetOpcode() == IR::Opcode::BitCastF32U32))
             result = Find(inst->Arg(0));
+        if (!result && inst->GetOpcode() == IR::Opcode::ShuffleIndex) {
+            if (auto source = Find(inst->Arg(0)); source && owner) {
+                IR::IREmitter ir{*owner, IR::Block::InstructionList::s_iterator_to(*inst)};
+                source->index = ir.ShuffleIndex(source->index, IR::U32{inst->Arg(1)},
+                                                IR::U32{inst->Arg(2)}, IR::U32{inst->Arg(3)});
+                result = source;
+            }
+        }
+        if (!result && inst->GetOpcode() == IR::Opcode::SelectU32) {
+            auto condition = inst->Arg(0).Resolve();
+            if (const auto* vote = condition.TryInstRecursive(); vote &&
+                (vote->GetOpcode() == IR::Opcode::VoteAny || vote->GetOpcode() == IR::Opcode::VoteAll))
+                condition = vote->Arg(0).Resolve();
+            if (condition.IsImmediate() && condition.Type() == IR::Type::U1)
+                result = Find(inst->Arg(condition.U1() ? 1 : 2));
+        }
         if (!result && inst->GetOpcode() == IR::Opcode::SelectU32) {
             const auto a = Find(inst->Arg(1)), b = Find(inst->Arg(2));
             if (a && b && SameArray(*a, *b)) {
@@ -187,6 +353,9 @@ public:
 
     std::optional<BufferTextureAddress> FindForUse(IR::Value value, const IR::Block* use) {
         if (const auto result = Find(value)) return result;
+        value = value.Resolve();
+        const std::pair<const IR::Inst*, const IR::Block*> key{value.TryInstRecursive(), use};
+        if (const auto found = use_cache.find(key); found != use_cache.end()) return found->second;
         std::optional<BufferTextureAddress> source;
         const IR::Block* root{};
         std::vector<std::pair<const IR::Block*, const IR::Block*>> invalid_edges;
@@ -198,7 +367,7 @@ public:
             --budget;
             current = current.Resolve();
             auto* inst = current.TryInstRecursive();
-            if (const auto origin = Track(current, program.info)) {
+            if (const auto origin = Find(current)) {
                 const auto* owner = Owner(inst);
                 if (!owner || (source && (!SameArray(*source, *origin) ||
                     source->index.Resolve() != origin->index.Resolve() || root != owner))) return false;
@@ -225,6 +394,7 @@ public:
         ControlFlowReachability paths{program, root, use};
         for (const auto& [from, to] : invalid_edges)
             if (!paths.ExcludesEdge(from, to)) return {};
+        use_cache.emplace(key, *source);
         return source;
     }
 
@@ -341,6 +511,7 @@ private:
         return nullptr;
     }
     IR::Program& program;
+    std::map<std::pair<const IR::Inst*, const IR::Block*>, BufferTextureAddress> use_cache;
     std::unordered_map<const IR::Inst*, std::optional<BufferTextureAddress>> cache;
     std::unordered_set<const IR::Inst*> active;
 };

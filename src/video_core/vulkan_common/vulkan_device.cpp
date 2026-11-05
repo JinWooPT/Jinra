@@ -1498,6 +1498,14 @@ void Device::RemoveUnsuitableExtensions() {
                                        VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
 
     // Quad control requires maximal reconvergence and Vulkan 1.2 or KHR memory model.
+    features.mesh_shader.multiviewMeshShader = VK_FALSE;
+    features.mesh_shader.primitiveFragmentShadingRateMeshShader = VK_FALSE;
+    features.mesh_shader.meshShaderQueries = VK_FALSE;
+    extensions.mesh_shader =
+        extensions.mesh_shader && features.mesh_shader.taskShader && features.mesh_shader.meshShader;
+    RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
+                                       VK_EXT_MESH_SHADER_EXTENSION_NAME);
+
     extensions.shader_quad_control =
         extensions.shader_quad_control && features.shader_quad_control.shaderQuadControl &&
         extensions.shader_maximal_reconvergence &&

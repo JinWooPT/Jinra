@@ -140,6 +140,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 astc_alpha_images{};
     std::vector<u8> astc_scan_buffer;
     u64 images_deleted{};
+    u64 view_removal_empty_calls{};
+    u64 view_removal_nonempty_calls{};
+    u64 view_removal_scanned_entries{};
+    u64 view_removal_duration_ns{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
