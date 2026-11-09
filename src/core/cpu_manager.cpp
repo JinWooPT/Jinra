@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/dkb_cpu_trace.h"
 #include "common/fiber.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
@@ -12,7 +13,6 @@
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/hle/kernel/k_interrupt_manager.h"
-#include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
@@ -94,7 +94,7 @@ void CpuManager::MultiCoreRunIdleThread(Kernel::KernelCore& kernel) {
     while (true) {
         auto& physical_core = kernel.CurrentPhysicalCore();
         if (!physical_core.IsInterrupted()) {
-            physical_core.Idle();
+            physical_core.Idle(kernel);
         }
         HandleInterrupt(kernel);
     }
@@ -144,16 +144,7 @@ void CpuManager::PreemptSingleCore(Kernel::KernelCore& kernel, bool from_running
         system.CoreTiming().Advance();
         kernel.SetIsPhantomModeForSingleCore(false);
     }
-    // Cores past the Switch 1 count are only visited when the application may use them, so the
-    // single-core timing of Switch 1 titles stays as it was.
-    const auto* application = kernel.ApplicationProcess();
-    const u64 application_cores = application != nullptr ? application->GetPhysicalCoreMask() : 0;
-    std::size_t next_core = current_core;
-    do {
-        next_core = (next_core + 1) % Core::Hardware::NUM_CPU_CORES;
-    } while (next_core >= Core::Hardware::NUM_LEGACY_CPU_CORES &&
-             (application_cores & (1ULL << next_core)) == 0);
-    current_core.store(next_core);
+    current_core.store((current_core + 1) % Core::Hardware::NUM_CPU_CORES);
     system.CoreTiming().ResetTicks();
     kernel.Scheduler(current_core).PreemptSingleCore(kernel);
 
@@ -179,12 +170,19 @@ void CpuManager::ShutdownThread(Kernel::KernelCore& kernel) {
 }
 
 void CpuManager::RunThread(std::stop_token token, std::size_t core) {
+    static_assert(Hardware::NUM_CPU_CORES == Common::DkbCpuTrace::GuestCoreCount);
+    const Common::DkbCpuTrace::Registration cpu_trace{
+        is_multicore ? static_cast<Common::DkbCpuTrace::Role>(core)
+                     : Common::DkbCpuTrace::Role::GuestSingleCore};
     /// Initialization
     system.RegisterCoreThread(core);
     std::string name = is_multicore ? ("CPUCore_" + std::to_string(core)) : std::string{"CPUThread"};
     Common::SetCurrentThreadName(name.c_str());
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
+    if (Settings::values.pin_gpu_threads.GetValue()) {
+        Common::PinCurrentThread(Common::PinnedRole::GuestCore);
+    }
     auto& data = core_data[core];
     data.host_context = Common::Fiber::ThreadToFiber();
 

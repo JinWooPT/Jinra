@@ -2,4 +2,5 @@
 #pragma once
 namespace Jinra {
 inline constexpr char CurrentVersion[] = "@JINRA_VERSION@";
+inline constexpr bool PgoBuild = @JINRA_IS_PGO@;
 }

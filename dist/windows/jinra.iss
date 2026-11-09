@@ -8,6 +8,9 @@
 #ifndef AppVersion
   #define AppVersion "0.1.0-preview.1"
 #endif
+#ifndef PackageSuffix
+  #define PackageSuffix ""
+#endif
 
 [Setup]
 AppId={{5C9CB795-2BD3-4954-B7AE-9B0651B06A61}
@@ -25,8 +28,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\jinra.exe
 OutputDir={#OutputDir}
-OutputBaseFilename=Jinra-Setup-{#AppVersion}-x64
-SetupIconFile=..\eden.ico
+OutputBaseFilename=Jinra-Setup-{#AppVersion}-x64{#PackageSuffix}
+SetupIconFile=..\jinra.ico
 LicenseFile=..\..\LICENSE.txt
 Compression=lzma2
 SolidCompression=yes
@@ -49,11 +52,15 @@ Name: "{app}\user"; Flags: uninsneveruninstall
 
 [Files]
 Source: "{#PayloadDir}\jinra.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\jinra-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\nx2_switches.txt"; DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
 Source: "{#PayloadDir}\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\GETTING_STARTED.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\LICENSES\*"; DestDir: "{app}\LICENSES"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PayloadDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#PayloadDir}\plugins\*"; DestDir: "{app}\plugins"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "{#PayloadDir}\recipes\*.nx2recipe"; DestDir: "{app}\recipes"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#PayloadDir}\recipes\README.md"; DestDir: "{app}\recipes"; Flags: ignoreversion skipifsourcedoesntexist
 
 #ifndef TestMode
 [Icons]

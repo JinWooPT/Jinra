@@ -6,8 +6,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 #include "common/common_types.h"
@@ -107,13 +110,42 @@ namespace Vulkan {
         /// images would otherwise leave holes in the shared blocks).
         vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
 
+        /// CreateImage, but a null image instead of an exception when there is no memory for it.
+        vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
+
+        /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
+        /// a null image when the device can't make one.
+        /// aliased: its sparse blocks may share memory (VK_IMAGE_CREATE_SPARSE_ALIASED_BIT).
+        vk::Image CreateUnbackedImage(const VkImageCreateInfo &ci, bool aliased = false) const;
+
+        /// Device memory to bind to part of a sparse resource. Null when there is none left.
+        /// Device-local buffers in their own VMA pool; false when it doesn't apply or failed.
+        bool CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, MemoryUsage usage,
+                                        const VmaAllocationCreateInfo& alloc_ci, VkBuffer& handle,
+                                        VmaAllocation& allocation,
+                                        VmaAllocationInfo& alloc_info) const;
+
+        VmaAllocation AllocateSparseMemory(const VkMemoryRequirements &requirements,
+                                           VkDeviceMemory &memory, VkDeviceSize &offset) const;
+
+        void FreeSparseMemory(VmaAllocation allocation) const;
+
+        /// Counts the images that did not fit the device memory budget (made anyway, in host
+        /// memory or with nothing bound): the texture cache collects harder when it grows.
+        u32 MemoryPressureEvents() const noexcept {
+            return pressure_events.load(std::memory_order_relaxed);
+        }
+
+        /// Counts the images that could not be made at all (no memory left anywhere): the
+        /// texture cache collects aggressively when it grows.
+        u32 FailedImages() const noexcept {
+            return failed_images.load(std::memory_order_relaxed);
+        }
+
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
 
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
                                 VkDeviceSize min_alignment) const;
-
-        vk::Buffer TryCreateMappedDeviceBuffer(const VkBufferCreateInfo& ci,
-                                               VkDeviceSize min_alignment) const;
 
         /**
          * Commits a memory with the specified requirements.
@@ -140,11 +172,21 @@ namespace Vulkan {
             }
         }
 
+        /// CreateImage's fallbacks; the image is left null when the result is an error.
+        /// may_fail: the caller handles VK_ERROR_OUT_OF_DEVICE_MEMORY (see UsesUnbackedFallback).
+        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
+                               vk::Image &image) const;
+
         const Device &device;                              ///< Device handle.
         VmaAllocator allocator;                           ///< VMA allocator.
         const VkPhysicalDeviceMemoryProperties properties; ///< Physical device memory properties.
         VkDeviceSize buffer_image_granularity;            ///< Adjacent buffer/image granularity
         u32 valid_memory_types{~0u};
+        mutable std::atomic<u32> pressure_events{0};
+        mutable std::atomic<u32> failed_images{0};
+        mutable std::mutex buffer_type_mutex;
+        /// Memory type of device-local buffers by usage and flags (CreateBufferInSeparatePool).
+        mutable std::unordered_map<u64, u32> buffer_memory_types;
     };
 
     /// Logs VMA's blocks and allocations per memory type, and each heap's budget.

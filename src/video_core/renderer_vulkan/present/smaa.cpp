@@ -5,7 +5,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <list>
-#include <cstdlib>
 
 #include "common/assert.h"
 #include <ranges>
@@ -76,12 +75,9 @@ void SMAA::CreateImages(const Device& device) {
 }
 
 void SMAA::CreateRenderPasses(const Device& device) {
-    const char* setting = std::getenv("EDEN_SMAA_CLEAR_TARGETS");
-    const bool clear = !setting || setting[0] != '0';
-    m_renderpasses[EdgeDetection] = CreateWrappedRenderPass(device, VK_FORMAT_R16G16_SFLOAT,
-                                                           VK_IMAGE_LAYOUT_GENERAL, clear);
+    m_renderpasses[EdgeDetection] = CreateWrappedRenderPass(device, VK_FORMAT_R16G16_SFLOAT);
     m_renderpasses[BlendingWeightCalculation] =
-        CreateWrappedRenderPass(device, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_LAYOUT_GENERAL, clear);
+        CreateWrappedRenderPass(device, VK_FORMAT_R16G16B16A16_SFLOAT);
     m_renderpasses[NeighborhoodBlending] =
         CreateWrappedRenderPass(device, VK_FORMAT_R16G16B16A16_SFLOAT);
 

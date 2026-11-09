@@ -4,11 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <cstdlib>
-#include "common/logging.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
@@ -118,85 +113,6 @@ bool CanBlitToSwapchain(const vk::PhysicalDevice& physical_device, VkFormat form
 
 } // Anonymous namespace
 
-
-class PresentationTimingStats {
-public:
-    using Clock = std::chrono::steady_clock;
-    using Time = Clock::time_point;
-    static double Milliseconds(Time end, Time begin) {
-        return std::chrono::duration<double, std::milli>(end - begin).count();
-    }
-
-    void Reset() {
-        count = 0;
-        last_submit = {};
-        last_present = {};
-    }
-
-    // Called only by the presentation consumer: the present thread when enabled,
-    // otherwise the GPU thread. These are host API returns, not scanout timestamps.
-    void Record(const Frame& frame, Time copy_begin, Time acquired,
-                Time submit_lock_begin, Time submit_call_begin, Time submit_return,
-                Time present_begin, Time present_return, bool asynchronous) {
-        if (last_present != Time{}) {
-            samples[count++] = {
-                Milliseconds(submit_return, last_submit),
-                Milliseconds(present_return, last_present),
-                frame.diagnostic_reuse_wait_ms,
-                Milliseconds(copy_begin, frame.diagnostic_request),
-                Milliseconds(acquired, copy_begin),
-                Milliseconds(submit_call_begin, submit_lock_begin),
-                Milliseconds(submit_return, submit_call_begin),
-                Milliseconds(present_return, present_begin),
-                Milliseconds(present_return, frame.diagnostic_request),
-            };
-        }
-        last_submit = submit_return;
-        last_present = present_return;
-        if (count != samples.size()) return;
-        const auto submit = Summary(0);
-        const auto present = Summary(1);
-        const auto reuse = Summary(2);
-        const auto queue = Summary(3);
-        const auto acquire = Summary(4);
-        const auto lock = Summary(5);
-        const auto submit_call = Summary(6);
-        const auto present_call = Summary(7);
-        const auto request = Summary(8);
-        LOG_INFO(Render_Vulkan,
-                 "Presentation host timing: async={} intervals={} "
-                 "submit_interval_ms(mean/p95/p99/max)={:.3f}/{:.3f}/{:.3f}/{:.3f} "
-                 "present_interval_ms(mean/p95/p99/max)={:.3f}/{:.3f}/{:.3f}/{:.3f} "
-                 "reuse_wait_ms(p95/p99)={:.3f}/{:.3f} request_to_copy_ms(p95/p99)={:.3f}/{:.3f} "
-                 "acquire_ms(p95/p99)={:.3f}/{:.3f} submit_lock_ms(p95/p99)={:.3f}/{:.3f} "
-                 "submit_api_ms(p95/p99)={:.3f}/{:.3f} present_with_lock_ms(p95/p99)={:.3f}/{:.3f} "
-                 "request_to_present_return_ms(p95/p99)={:.3f}/{:.3f}",
-                 asynchronous, count, submit[0], submit[1], submit[2], submit[3],
-                 present[0], present[1], present[2], present[3], reuse[1], reuse[2],
-                 queue[1], queue[2], acquire[1], acquire[2], lock[1], lock[2],
-                 submit_call[1], submit_call[2], present_call[1], present_call[2],
-                 request[1], request[2]);
-        count = 0;
-    }
-
-private:
-    std::array<double, 4> Summary(size_t metric) const {
-        std::array<double, 600> sorted;
-        double sum{};
-        for (size_t i = 0; i < count; ++i) {
-            sorted[i] = samples[i][metric];
-            sum += sorted[i];
-        }
-        std::sort(sorted.begin(), sorted.begin() + count);
-        return {sum / count, sorted[(95 * count + 99) / 100 - 1],
-                sorted[(99 * count + 99) / 100 - 1], sorted[count - 1]};
-    }
-    std::array<std::array<double, 9>, 600> samples{};
-    size_t count{};
-    Time last_submit{};
-    Time last_present{};
-};
-
 PresentManager::PresentManager(const vk::Instance& instance_,
                                Core::Frontend::EmuWindow& render_window_,
                                const Device& device_,
@@ -215,9 +131,6 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
     , use_present_thread{Settings::values.async_presentation.GetValue()}
 {
-    if (std::getenv("EDEN_MEASURE_PERF")) {
-        timing_stats = std::make_unique<PresentationTimingStats>();
-    }
     SetImageCount();
 
     auto& dld = device.GetLogical();
@@ -257,8 +170,6 @@ PresentManager::PresentManager(const vk::Instance& instance_,
 PresentManager::~PresentManager() = default;
 
 Frame* PresentManager::GetRenderFrame() {
-    using Clock = PresentationTimingStats::Clock;
-    const auto wait_begin = timing_stats ? Clock::now() : Clock::time_point{};
 
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
@@ -271,17 +182,11 @@ Frame* PresentManager::GetRenderFrame() {
     // Wait for the presentation to be finished so all frame resources are free
     frame->present_done.Wait();
     frame->present_done.Reset();
-    if (timing_stats) {
-        frame->diagnostic_reuse_wait_ms = PresentationTimingStats::Milliseconds(Clock::now(), wait_begin);
-    }
 
     return frame;
 }
 
 void PresentManager::Present(Frame* frame) {
-    if (timing_stats) {
-        frame->diagnostic_request = PresentationTimingStats::Clock::now();
-    }
     if (use_present_thread) {
         scheduler.Record([this, frame](vk::CommandBuffer) {
             std::unique_lock lock{queue_mutex};
@@ -451,7 +356,6 @@ void PresentManager::PresentThread(std::stop_token token) {
 }
 
 void PresentManager::RecreateSwapchain(Frame* frame) {
-    if (timing_stats) timing_stats->Reset();
     swapchain.Create(*surface, frame->width, frame->height); // Pass raw pointer
     SetImageCount();
 }
@@ -474,7 +378,6 @@ void PresentManager::SetImageCount() {
 }
 
 void PresentManager::DiscardFrame(Frame* frame) {
-    if (timing_stats) timing_stats->Reset();
     static constexpr VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     const VkSemaphore render_ready = *frame->render_ready;
     const VkSubmitInfo submit_info{
@@ -509,7 +412,9 @@ void PresentManager::CopyToSwapchain(Frame* frame) {
             // Draw to swapchain.
             return CopyToSwapchainImpl(frame);
         } catch (const vk::Exception& except) {
-            if (except.GetResult() != VK_ERROR_SURFACE_LOST_KHR) {
+            const VkResult result = except.GetResult();
+            if (result != VK_ERROR_SURFACE_LOST_KHR && result != VK_INCOMPLETE &&
+                result != VK_ERROR_OUT_OF_DATE_KHR && result != VK_ERROR_NATIVE_WINDOW_IN_USE_KHR) {
                 throw;
             }
 
@@ -521,23 +426,24 @@ void PresentManager::CopyToSwapchain(Frame* frame) {
 }
 
 void PresentManager::CopyToSwapchainImpl(Frame* frame) {
-    using Clock = PresentationTimingStats::Clock;
-    const auto copy_begin = timing_stats ? Clock::now() : Clock::time_point{};
 
     // If the size of the incoming frames has changed, recreate the swapchain
     // to account for that.
-    const bool is_suboptimal = swapchain.NeedsRecreation();
+    const bool is_suboptimal = swapchain.NeedsRecreation() || swapchain.IsOutDated();
     const bool size_changed =
         swapchain.GetWidth() != frame->width || swapchain.GetHeight() != frame->height;
     if (is_suboptimal || size_changed) {
         RecreateSwapchain(frame);
+    }
+    if (!swapchain.IsCreated()) {
+        DiscardFrame(frame);
+        return;
     }
 
     while (swapchain.AcquireNextImage(!use_present_thread)) {
         RecreateSwapchain(frame);
     }
 
-    const auto acquired = timing_stats ? Clock::now() : Clock::time_point{};
     const vk::CommandBuffer cmdbuf{frame->cmdbuf};
     cmdbuf.Begin({
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -666,14 +572,10 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     };
 
     // Submit the image copy/blit to the swapchain
-    const auto lock_begin = timing_stats ? Clock::now() : Clock::time_point{};
-    Clock::time_point submit_begin{}, submit_return{};
     {
         std::scoped_lock submit_lock{scheduler.submit_mutex};
-        if (timing_stats) submit_begin = Clock::now();
-        const VkResult result = device.GetGraphicsQueue().Submit(submit_info, *frame->present_done);
-        if (timing_stats) submit_return = Clock::now();
-        switch (result) {
+        switch (const VkResult result =
+                    device.GetGraphicsQueue().Submit(submit_info, *frame->present_done)) {
         case VK_SUCCESS:
             break;
         case VK_ERROR_DEVICE_LOST:
@@ -686,19 +588,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
-    const auto present_begin = timing_stats ? Clock::now() : Clock::time_point{};
-    VkResult present_result{};
-    Clock::time_point present_return{};
-    swapchain.Present(render_semaphore, timing_stats ? &present_result : nullptr,
-                      timing_stats ? &present_return : nullptr);
-    if (timing_stats) {
-        if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
-            timing_stats->Record(*frame, copy_begin, acquired, lock_begin, submit_begin,
-                                 submit_return, present_begin, present_return, use_present_thread);
-        } else {
-            timing_stats->Reset();
-        }
-    }
+    swapchain.Present(render_semaphore);
 }
 
 } // namespace Vulkan

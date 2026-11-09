@@ -13,10 +13,10 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/ipc_helpers.h"
+#include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
-#include "core/hle/service/nvdrv/devices/native_gpu_characteristics.h"
 
 namespace Service::Nvidia {
 
@@ -35,8 +35,12 @@ void NVDRV::Open(HLERequestContext& ctx) {
 
     const auto& buffer = ctx.ReadBuffer();
     const std::string device_name(Common::StringFromBuffer(buffer));
+    LOG_DEBUG(Service_NVDRV, "device_name={}", device_name);
 
-    if (device_name == "/dev/nvhost-prof-gpu") {
+    // Switch 2 lists nvhost-prof-gpu with the other GPU nodes and the CUDA driver (Fire
+    // Emblem's subsdk1) opens it, so only refuse it to Switch 1 callers. Switch 2 opens get
+    // the logged stub device.
+    if (device_name == "/dev/nvhost-prof-gpu" && !Devices::g_nx2_driver) {
         rb.Push<DeviceFD>(0);
         rb.PushEnum(NvResult::NotSupported);
 
@@ -73,10 +77,6 @@ void NVDRV::Ioctl1(HLERequestContext& ctx) {
     const auto input_buffer = ctx.ReadBuffer(0);
 
     const auto nv_result = nvdrv->Ioctl1(fd, command, input_buffer, output_buffer);
-    if (nv_result != NvResult::Success && ctx.GetThread().GetOwnerProcess()->UsesPAuthReturns()) {
-        LOG_DEBUG(Service_NVDRV, "native ioctl failure fd={}, ioctl={:#x}, result={}, caller={:#x}",
-                  fd, command.raw, static_cast<u32>(nv_result), ctx.GetThread().GetContext().lr);
-    }
     if (command.is_out != 0) {
         ctx.WriteBuffer(output_buffer);
     }
@@ -104,10 +104,6 @@ void NVDRV::Ioctl2(HLERequestContext& ctx) {
 
     const auto nv_result =
         nvdrv->Ioctl2(fd, command, input_buffer, input_inlined_buffer, output_buffer);
-    if (nv_result != NvResult::Success && ctx.GetThread().GetOwnerProcess()->UsesPAuthReturns()) {
-        LOG_DEBUG(Service_NVDRV, "native ioctl failure fd={}, ioctl={:#x}, result={}, caller={:#x}",
-                  fd, command.raw, static_cast<u32>(nv_result), ctx.GetThread().GetContext().lr);
-    }
     if (command.is_out != 0) {
         ctx.WriteBuffer(output_buffer);
     }
@@ -135,21 +131,6 @@ void NVDRV::Ioctl3(HLERequestContext& ctx) {
 
     const auto nv_result =
         nvdrv->Ioctl3(fd, command, input_buffer, output_buffer, inline_output_buffer);
-    if (nv_result == NvResult::Success && native_gpu_profile != 0 &&
-        (command.raw == 0xc0e04705 || command.raw == 0xc0e84705) && output_buffer.size() >= 0x88) {
-        // GPU profile negotiation is independent of the characteristics reply size.
-        Devices::ApplyNativeGpuProfile(
-            std::span<u8>{output_buffer.data() + 0x10, output_buffer.size() - 0x10},
-            native_gpu_profile);
-        Devices::ApplyNativeGpuProfile(
-            std::span<u8>{inline_output_buffer.data(), inline_output_buffer.size()},
-            native_gpu_profile);
-    }
-    if (command.raw == 0xc0e04705 || command.raw == 0xc0e84705) {
-        LOG_DEBUG(Service_NVDRV, "native characteristics input={}, output={}, inline={}, result={}",
-                  input_buffer.size(), output_buffer.size(), inline_output_buffer.size(),
-                  static_cast<u32>(nv_result));
-    }
     if (command.is_out != 0) {
         ctx.WriteBuffer(output_buffer, 0);
         ctx.WriteBuffer(inline_output_buffer, 1);
@@ -205,14 +186,18 @@ void NVDRV::Initialize(HLERequestContext& ctx) {
     is_initialized = true;
 }
 
+void NVDRV::InitializeForProcess(Kernel::KProcess* process) {
+    if (is_initialized) {
+        return;
+    }
+    session_id = nvdrv->GetContainer().OpenSession(process);
+    is_initialized = true;
+}
+
 void NVDRV::QueryEvent(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
     const auto fd = rp.Pop<DeviceFD>();
     const auto event_id = rp.Pop<u32>();
-    if (ctx.GetThread().GetOwnerProcess()->UsesPAuthReturns()) {
-        LOG_DEBUG(Service_NVDRV, "native QueryEvent fd={}, id={}, caller={:#x}", fd, event_id,
-                  ctx.GetThread().GetContext().lr);
-    }
 
     if (!is_initialized) {
         ServiceError(ctx, NvResult::NotInitialized);
@@ -291,15 +276,6 @@ NVDRV::NVDRV(Core::System& system_, std::shared_ptr<Module> nvdrv_, const char* 
          "SetGraphicsFirmwareMemoryMarginEnabled"},
     };
     RegisterHandlers(functions);
-}
-
-NVDRV::NVDRV(Core::System& system, std::shared_ptr<Module> module, const char* name,
-             Kernel::KProcess* process, u64 aruid, u32 gpu_profile)
-    : NVDRV{system, std::move(module), name} {
-    native_gpu_profile = gpu_profile;
-    session_id = nvdrv->GetContainer().OpenSession(process);
-    pid = aruid;
-    is_initialized = true;
 }
 
 NVDRV::~NVDRV() {

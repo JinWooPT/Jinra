@@ -26,6 +26,7 @@ add_library(shader_recompiler STATIC
     backend/spirv/emit_spirv_shared_memory.cpp
     backend/spirv/emit_spirv_mesh.cpp
     backend/spirv/emit_spirv_special.cpp
+    backend/spirv/emit_spirv_tensor.cpp
     backend/spirv/emit_spirv_undefined.cpp
     backend/spirv/emit_spirv_warp.cpp
     backend/spirv/spirv_emit_context.cpp
@@ -59,28 +60,7 @@ add_library(shader_recompiler STATIC
     frontend/ir/type.h
     frontend/ir/value.cpp
     frontend/ir/value.h
-    frontend/ampere/ampere_isa_table.h
-    frontend/ampere/cfg_builder.h
-    frontend/ampere/classify.h
-    frontend/ampere/flow.cpp
-    frontend/ampere/flow.h
-    frontend/ampere/instruction.h
-    frontend/ampere/isa.h
     frontend/ampere/lower_to_maxwell.h
-    frontend/ampere/native.h
-    frontend/ampere/ops_alu.cpp
-    frontend/ampere/ops_attr.cpp
-    frontend/ampere/ops_convert.cpp
-    frontend/ampere/ops_float.cpp
-    frontend/ampere/ops_half.cpp
-    frontend/ampere/ops_int.cpp
-    frontend/ampere/ops_memory.cpp
-    frontend/ampere/ops_misc.cpp
-    frontend/ampere/ops_move.cpp
-    frontend/ampere/ops_texture.cpp
-    frontend/ampere/translate.cpp
-    frontend/ampere/visitor.cpp
-    frontend/ampere/visitor.h
     frontend/ampere/program_override.h
     frontend/ampere/program_address_map.h
     frontend/maxwell/control_flow.cpp
@@ -137,8 +117,8 @@ add_library(shader_recompiler STATIC
     frontend/maxwell/translate/impl/impl.cpp
     frontend/maxwell/translate/impl/impl.h
     frontend/maxwell/translate/impl/integer_add.cpp
-    frontend/maxwell/translate/impl/integer_add_three_input.cpp
     frontend/maxwell/translate/impl/integer_byte_permute.cpp
+    frontend/maxwell/translate/impl/integer_add_three_input.cpp
     frontend/maxwell/translate/impl/integer_compare.cpp
     frontend/maxwell/translate/impl/integer_compare_and_set.cpp
     frontend/maxwell/translate/impl/integer_floating_point_conversion.cpp
@@ -172,6 +152,7 @@ add_library(shader_recompiler STATIC
     frontend/maxwell/translate/impl/select_source_with_predicate.cpp
     frontend/maxwell/translate/impl/surface_atomic_operations.cpp
     frontend/maxwell/translate/impl/surface_load_store.cpp
+    frontend/maxwell/translate/impl/tensor_mul_add.cpp
     frontend/maxwell/translate/impl/texture_fetch.cpp
     frontend/maxwell/translate/impl/texture_fetch_swizzled.cpp
     frontend/maxwell/translate/impl/texture_gather.cpp
@@ -206,6 +187,7 @@ add_library(shader_recompiler STATIC
     ir_opt/lower_fp64_to_fp32.cpp
     ir_opt/lower_int64_to_int32.cpp
     ir_opt/passes.h
+    ir_opt/predicate_mask.h
     ir_opt/position_pass.cpp
     ir_opt/rescaling_pass.cpp
     ir_opt/ssa_rewrite_pass.cpp
@@ -217,6 +199,8 @@ add_library(shader_recompiler STATIC
     program_header.h
     runtime_info.h
     shader_info.h
+    info_serialize.cpp
+    info_serialize.h
     varying_state.h)
 
 if (ENABLE_OPENGL)
@@ -288,12 +272,6 @@ else()
         $<$<CXX_COMPILER_ID:Clang>:-fbracket-depth=1024>
         $<$<CXX_COMPILER_ID:AppleClang>:-fbracket-depth=1024>
     )
-endif()
-
-# Offline differential harness for the native Ampere frontend (not part of the emulator build).
-if (NS2_IRDIFF_SOURCE)
-    add_executable(irdiff ${NS2_IRDIFF_SOURCE})
-    target_link_libraries(irdiff PRIVATE shader_recompiler)
 endif()
 
 create_target_directory_groups(shader_recompiler)

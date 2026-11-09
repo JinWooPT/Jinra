@@ -41,6 +41,11 @@ void ConfigureGraphicsAdvanced::Setup(const ConfigurationShared::Builder& builde
 
     for (auto setting :
          Settings::values.linkage.by_category[Settings::Category::RendererAdvanced]) {
+        const auto id = setting->Id();
+        if (id == Settings::values.mkw_30fps.Id() ||
+            id == Settings::values.mkw_dynamic_fps.Id()) {
+            continue;
+        }
         ConfigurationShared::Widget* widget = builder.BuildWidget(setting, apply_funcs);
 
         if (widget == nullptr) {
@@ -50,8 +55,6 @@ void ConfigureGraphicsAdvanced::Setup(const ConfigurationShared::Builder& builde
             widget->deleteLater();
             continue;
         }
-
-        const auto id = setting->Id();
 
         normal_hold.emplace(id, widget);
 

@@ -47,6 +47,9 @@ add_library(audio_core STATIC
     in/audio_in_system.h
     opus/hardware_opus.cpp
     opus/hardware_opus.h
+    opus/batch_decoder.cpp
+    opus/batch_decoder.h
+    opus/opus_error.h
     opus/decoder_manager.cpp
     opus/decoder_manager.h
     opus/decoder.cpp
@@ -205,6 +208,7 @@ add_library(audio_core STATIC
     renderer/voice/voice_info.h
     renderer/voice/voice_state.h
     sink/null_sink.h
+    sink/input_processing.h
     sink/sink.h
     sink/sink_details.cpp
     sink/sink_details.h

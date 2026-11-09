@@ -31,6 +31,7 @@ enum class StreamType {
     Render,
     Out,
     In,
+    Sysmix,
 };
 
 struct SinkBuffer {
@@ -58,7 +59,7 @@ struct SinkBuffer {
  */
 class SinkStream {
 public:
-    explicit SinkStream(Core::System& system_, StreamType type_);
+    explicit SinkStream(Core::System& system_, StreamType type_) : system{system_}, type{type_} {}
     virtual ~SinkStream() {}
 
     /**
@@ -78,6 +79,16 @@ public:
      * Stop the sink stream.
      */
     virtual void Stop() {}
+
+    virtual bool IsReady() const {
+        return false;
+    }
+
+    void MarkFaulted() {
+        failed = true;
+    }
+
+    virtual bool TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples);
 
     /**
      * Check if the stream is paused.
@@ -161,6 +172,14 @@ public:
     }
 
     /**
+     * Whether the host still has audio to play: queued buffers or the rest of the one playing.
+     * GetQueueSize drops to zero as soon as the last buffer starts, while its frames still play.
+     */
+    bool HasPendingAudio() const {
+        return samples_buffer.Size() != 0;
+    }
+
+    /**
      * Set the maximum buffer queue size.
      */
     void SetRingSize(u32 ring_size) {
@@ -183,6 +202,9 @@ public:
      */
     virtual std::vector<s16> ReleaseBuffer(u64 num_samples);
 
+    /// Read only captured frames, without padding missing host input with silence.
+    std::vector<s16> DrainInputSamples(u64 max_frames);
+
     /**
      * Empty out the buffer queue.
      */
@@ -195,6 +217,19 @@ public:
      * @param num_frames - Number of frames to be filled.
      */
     void ProcessAudioIn(std::span<const s16> input_buffer, std::size_t num_frames);
+
+    // Preview captures never feed guest buffers or depend on emulation timing.
+    void EnableInputPreview() {
+        input_preview = true;
+    }
+
+    void SetInputPreviewGain(float gain) {
+        input_preview_gain.store(gain);
+    }
+
+    u32 TakeInputPeak() {
+        return input_peak.exchange(0);
+    }
 
     /**
      * Callback for AudioOut and AudioRenderer.
@@ -233,14 +268,16 @@ protected:
     u32 device_channels{2};
     /// Is this stream currently paused?
     std::atomic<bool> paused{true};
+    std::atomic<bool> failed{};
     /// Name of this stream
     std::string name{};
 
 private:
-    void ReportUnderruns();
-
     /// Ring buffer of the samples waiting to be played or consumed
     Common::RingBuffer<s16, 0x10000> samples_buffer;
+    bool input_preview{};
+    std::atomic<float> input_preview_gain{1.0f};
+    std::atomic<u32> input_peak{};
     /// Audio buffers queued and waiting to play
     Common::SPSCQueue<SinkBuffer, 0x10000> queue;
     /// The currently-playing audio buffer
@@ -250,20 +287,6 @@ private:
     /// EDEN_NX2_AUDIO_LEVEL meter state.
     s32 level_peak{};
     u64 level_frames{};
-    const bool underrun_stats_enabled;
-    struct UnderrunStatistics {
-        std::atomic<u64> callbacks{};
-        std::atomic<u64> requested_frames{};
-        std::atomic<u64> underrun_callbacks{};
-        std::atomic<u64> missing_frames{};
-        std::atomic<u64> max_queue_gap_frames{};
-        std::atomic<u64> short_sample_callbacks{};
-        std::atomic<u64> short_sample_frames{};
-    } underrun_stats;
-    /// Consecutive missing frames, accessed only by the output callback.
-    u64 queue_gap_frames{};
-    /// Report timing, accessed only by the buffer producer.
-    std::chrono::steady_clock::time_point last_underrun_report{};
     /// Number of buffers waiting to be played
     std::atomic<u32> queued_buffers{};
     /// The ring size for audio out buffers (usually 4, rarely 2 or 8)

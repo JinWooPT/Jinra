@@ -12,22 +12,15 @@ if (YUZU_USE_BUNDLED_QT AND LINUX)
     set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin/lib/")
 endif()
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
+find_package(Qt6 REQUIRED COMPONENTS Widgets)
+
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/VERSION")
 file(STRINGS "${PROJECT_SOURCE_DIR}/VERSION" JINRA_VERSION LIMIT_COUNT 1)
-configure_file(jinra_build_version.h.in jinra_build_version.h @ONLY)
-option(JINRA_UPDATE_TESTS "Build the focused Jinra release/update tests" OFF)
-if(JINRA_UPDATE_TESTS)
-    find_package(Catch2 REQUIRED)
-    add_executable(jinra_update_tests ../tests/common/jinra_update.cpp updater/jinra_release.cpp)
-    target_link_libraries(jinra_update_tests PRIVATE Catch2::Catch2WithMain Qt6::Core)
-    target_include_directories(jinra_update_tests PRIVATE "${PROJECT_SOURCE_DIR}/src")
-    target_compile_features(jinra_update_tests PRIVATE cxx_std_20)
-    if(MSVC)
-        target_compile_options(jinra_update_tests PRIVATE /Zc:preprocessor /permissive-)
-        target_compile_definitions(jinra_update_tests PRIVATE NOMINMAX)
-    endif()
+set(JINRA_IS_PGO false)
+if (JINRA_BUILD_PLATFORM STREQUAL "windows-x86_64-pgo")
+    set(JINRA_IS_PGO true)
 endif()
+configure_file(jinra_build_version.h.in jinra_build_version.h @ONLY)
 
 add_executable(yuzu
     Info.plist
@@ -89,6 +82,8 @@ add_executable(yuzu
     configuration/configure_general.ui
     configuration/configure_graphics.cpp
     configuration/configure_graphics.h
+    configuration/nvidia_dlss_panel.cpp
+    configuration/nvidia_dlss_panel.h
     configuration/configure_graphics.ui
     configuration/configure_graphics_advanced.cpp
     configuration/configure_graphics_advanced.h
@@ -119,6 +114,8 @@ add_executable(yuzu
     configuration/configure_mouse_panning.cpp
     configuration/configure_mouse_panning.h
     configuration/configure_mouse_panning.ui
+    configuration/configure_microphone.cpp
+    configuration/configure_microphone.h
     configuration/configure_motion_touch.cpp
     configuration/configure_motion_touch.h
     configuration/configure_motion_touch.ui
@@ -169,6 +166,7 @@ add_executable(yuzu
     debugger/controller.h
 
     game/game_list.cpp game/game_list.h
+    game/shader_sync.cpp game/shader_sync.h
     game/game_grid.cpp game/game_grid.h
 
     game/game_tree.h game/game_tree.cpp
@@ -184,6 +182,7 @@ add_executable(yuzu
     loading_screen.ui
 
     main.cpp
+    nx2_switches.h
 
     multiplayer/chat_room.cpp
     multiplayer/chat_room.h
@@ -228,12 +227,15 @@ add_executable(yuzu
     util/url_request_interceptor.h
     util/util.cpp
     util/util.h
+    util/icon_search.cpp
+    util/icon_search.h
 
     user_data_migration.h user_data_migration.cpp
 
     yuzu.qrc
     yuzu.rc
     migration_dialog.h migration_dialog.cpp
+    nup_dialogs.h nup_dialogs.cpp
     migration_worker.h migration_worker.cpp
     libqt_common.h libqt_common.cpp
 
@@ -242,7 +244,6 @@ add_executable(yuzu
     data_dialog.h data_dialog.cpp data_dialog.ui
     data_widget.ui
     ryujinx_dialog.h ryujinx_dialog.cpp ryujinx_dialog.ui
-    jinra_home.cpp jinra_home.h
     main_window.h main_window.cpp main.ui
 
     configuration/system/new_user_dialog.h configuration/system/new_user_dialog.cpp configuration/system/new_user_dialog.ui
@@ -250,14 +251,21 @@ add_executable(yuzu
     configuration/addon/mod_select_dialog.h configuration/addon/mod_select_dialog.cpp configuration/addon/mod_select_dialog.ui
 
     render/performance_overlay.h render/performance_overlay.cpp render/performance_overlay.ui
-    updater/update_dialog.h updater/update_dialog.cpp updater/update_dialog.ui
-    updater/jinra_updater.h updater/jinra_updater.cpp
+    jinra_home.cpp jinra_home.h
     updater/jinra_release.h updater/jinra_release.cpp
+    updater/jinra_updater.h updater/jinra_updater.cpp
     game/common.h
     game/carousel.h game/carousel.cpp
 )
 
 set_target_properties(yuzu PROPERTIES OUTPUT_NAME "jinra")
+
+# Shipped next to the executable: the NX2 switches a GUI launch cannot set another way. Read at
+# startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\eden overrides it.
+add_custom_command(TARGET yuzu POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt" "$<TARGET_FILE_DIR:yuzu>/nx2_switches.txt"
+    VERBATIM)
 
 if (YUZU_CRASH_DUMPS)
     target_sources(yuzu PRIVATE
@@ -376,20 +384,17 @@ target_sources(yuzu
 
 # TODO(crueter): Move Assets.car/icon/icns handling to its own Module.
 if (APPLE)
-    # Xcode will automatically generate the Assets.car and icns file for us.
-    set(_dist "${CMAKE_SOURCE_DIR}/dist")
-    if (CMAKE_GENERATOR MATCHES "Xcode")
-        set(_icons "${_dist}/eden.icon")
+    target_sources(yuzu PRIVATE util/macos_sleep.cpp util/macos_sleep.h)
 
-        set_target_properties(eden PROPERTIES
-            XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME eden
-            MACOSX_BUNDLE_ICON_FILE eden
+    # Use the supplied Jinra artwork for all macOS generators.
+    set(_dist "${CMAKE_SOURCE_DIR}/dist")
+    set(_icons "${_dist}/jinra.icns")
+    if (CMAKE_GENERATOR MATCHES "Xcode")
+        set_target_properties(yuzu PROPERTIES
+            MACOSX_BUNDLE_ICON_FILE jinra.icns
             # Also force xcode to manage signing for us.
             XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED ON
             XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED ON)
-    # Otherwise, we'll use our own.
-    else()
-        set(_icons "${_dist}/eden.icns" "${_dist}/Assets.car")
     endif()
 
     set_source_files_properties(${_icons} PROPERTIES
@@ -422,6 +427,11 @@ endif()
 target_link_libraries(yuzu PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(yuzu PRIVATE common core input_common frontend_common network video_core qt_common)
 target_link_libraries(yuzu PRIVATE Boost::headers Qt6::Widgets Qt6::Charts Qt6::Concurrent Qt6::Network)
+# Unpacks NVIDIA's files from the Streamline release (nvidia_dlss_panel.cpp).
+target_link_libraries(yuzu PRIVATE ZLIB::ZLIB)
+if (WIN32)
+    target_link_libraries(yuzu PRIVATE QuaZip::QuaZip)
+endif()
 target_link_libraries(yuzu PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
 if (ENABLE_OPENGL)
     target_link_libraries(yuzu PRIVATE glad)
@@ -450,8 +460,23 @@ if(UNIX AND NOT APPLE)
 endif()
 
 if (WIN32 AND NOT YUZU_USE_BUNDLED_QT)
-    set(YUZU_EXE_DIR "$<TARGET_FILE_DIR:yuzu>")
-    add_custom_command(TARGET yuzu POST_BUILD COMMAND ${WINDEPLOYQT_EXECUTABLE} "$<TARGET_FILE:yuzu>" --dir "${YUZU_EXE_DIR}" --libdir "${YUZU_EXE_DIR}" --plugindir "${YUZU_EXE_DIR}/plugins" --no-compiler-runtime --no-opengl-sw --no-system-d3d-compiler --no-translations --verbose 0)
+    # Copy the Qt DLLs and plugins next to the executable. WINDEPLOYQT_EXECUTABLE was never set, so
+    # this step ran the emulator itself with windeployqt's arguments and failed every build that
+    # uses an installed Qt (the Windows release workflow).
+    if (TARGET Qt6::windeployqt)
+        set(WINDEPLOYQT_EXECUTABLE "$<TARGET_FILE:Qt6::windeployqt>")
+    else()
+        find_program(WINDEPLOYQT_EXECUTABLE NAMES windeployqt6 windeployqt
+                     HINTS "${QT_HOST_PATH}/bin" "${QT_TARGET_PATH}/bin")
+    endif()
+    file(GENERATE OUTPUT "$<TARGET_FILE_DIR:yuzu>/qt.conf"
+         CONTENT "[Paths]\nPrefix=.\nPlugins=plugins\n")
+    if (WINDEPLOYQT_EXECUTABLE)
+        set(YUZU_EXE_DIR "$<TARGET_FILE_DIR:yuzu>")
+        add_custom_command(TARGET yuzu POST_BUILD COMMAND ${WINDEPLOYQT_EXECUTABLE} "$<TARGET_FILE:yuzu>" --dir "${YUZU_EXE_DIR}" --libdir "${YUZU_EXE_DIR}" --plugindir "${YUZU_EXE_DIR}/plugins" --no-compiler-runtime --no-opengl-sw --no-system-d3d-compiler --no-translations --verbose 0)
+    else()
+        message(WARNING "windeployqt not found: copy the Qt DLLs next to the executable yourself")
+    endif()
 endif()
 
 if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64)

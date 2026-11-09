@@ -79,7 +79,9 @@ void main() {
     offset += pos.x * bytes_per_block;
     offset += pos.y * pitch;
 
-    const uvec4 texel = ReadTexel(offset);
     const ivec2 coord = ivec2(gl_GlobalInvocationID.xy) + destination;
-    imageStore(output_image, coord, texel);
+    if (any(lessThan(coord, ivec2(0))) || any(greaterThanEqual(coord, imageSize(output_image)))) {
+        return;
+    }
+    imageStore(output_image, coord, ReadTexel(offset));
 }

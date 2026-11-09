@@ -19,9 +19,18 @@ public:
         ++num_building;
     }
 
+    void SetPrepareInBackground(bool enabled) noexcept {
+        prepare_in_background.store(enabled, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool PrepareInBackground() const noexcept {
+        return prepare_in_background.load(std::memory_order_relaxed);
+    }
+
 private:
     std::atomic_int num_building{};
     std::atomic_int num_complete{};
+    std::atomic_bool prepare_in_background{};
     int report_base{};
 
     bool completed{};

@@ -3,155 +3,164 @@
  <class>LoadingScreen</class>
  <widget class="QWidget" name="LoadingScreen">
   <property name="geometry">
-   <rect>
-    <x>0</x>
-    <y>0</y>
-    <width>746</width>
-    <height>495</height>
-   </rect>
+   <rect><x>0</x><y>0</y><width>746</width><height>495</height></rect>
   </property>
   <property name="styleSheet">
-   <string notr="true">background-color: rgb(0, 0, 0);</string>
+   <string notr="true"><![CDATA[
+QWidget#LoadingScreen { background: #080c16; }
+QWidget#fade_parent {
+ background: qradialgradient(cx: 0.5, cy: 0.43, radius: 0.75, fx: 0.5, fy: 0.43,
+                             stop: 0 #152741, stop: 0.56 #0b1425, stop: 1 #080c16);
+}
+QFrame#shaderPanel {
+ background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 1, stop: 0 #17253b, stop: 1 #111a2a);
+ border: 1px solid #2c4562;
+ border-radius: 16px;
+}
+QWidget#progressDetails, QLabel { background: transparent; border: none; }
+QLabel { color: #e6edf7; font-family: "Segoe UI"; font-size: 10pt; }
+QLabel#brandName { color: #35d9ed; font-size: 9pt; font-weight: 700; }
+QLabel#stage { color: #f3f8ff; font-size: 22pt; font-weight: 600; }
+QLabel#preparationNote, QLabel#value { color: #a4b7d1; }
+QLabel#progressPercent { color: #55ddf1; font-weight: 600; }
+QProgressBar#progress_bar {
+ background: #0a1220;
+ border: 1px solid #29415e;
+ border-radius: 5px;
+}
+QProgressBar#progress_bar::chunk {
+ background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 0, stop: 0 #087fe5, stop: 1 #35d9ed);
+ border-radius: 4px;
+}
+QPushButton#playNow {
+ background: #087fe5;
+ color: #ffffff;
+ border: 1px solid #278dff;
+ border-radius: 6px;
+ padding: 8px 20px;
+ font-family: "Segoe UI";
+ font-size: 10pt;
+ font-weight: 600;
+}
+QPushButton#playNow:hover { background: #2198ff; }
+QPushButton#playNow:focus { border-color: #7de9f6; }
+QPushButton#playNow:disabled { background: #192c43; color: #a4b7d1; border-color: #31445d; }
+]]></string>
   </property>
-  <layout class="QVBoxLayout">
-   <property name="spacing">
-    <number>0</number>
-   </property>
-   <property name="leftMargin">
-    <number>0</number>
-   </property>
-   <property name="topMargin">
-    <number>0</number>
-   </property>
-   <property name="rightMargin">
-    <number>0</number>
-   </property>
-   <property name="bottomMargin">
-    <number>0</number>
-   </property>
+  <layout class="QVBoxLayout" name="outerLayout">
+   <property name="spacing"><number>0</number></property>
+   <property name="leftMargin"><number>0</number></property>
+   <property name="topMargin"><number>0</number></property>
+   <property name="rightMargin"><number>0</number></property>
+   <property name="bottomMargin"><number>0</number></property>
    <item>
     <widget class="QWidget" name="fade_parent" native="true">
-     <layout class="QVBoxLayout" name="verticalLayout_2">
-      <property name="spacing">
-       <number>0</number>
-      </property>
-      <property name="leftMargin">
-       <number>0</number>
-      </property>
-      <property name="topMargin">
-       <number>0</number>
-      </property>
-      <property name="rightMargin">
-       <number>0</number>
-      </property>
-      <property name="bottomMargin">
-       <number>0</number>
-      </property>
-      <item alignment="Qt::AlignLeft|Qt::AlignTop">
-       <widget class="QLabel" name="logo">
-        <property name="text">
-         <string/>
-        </property>
-        <property name="alignment">
-         <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignTop</set>
-        </property>
-        <property name="margin">
-         <number>30</number>
-        </property>
+     <layout class="QVBoxLayout" name="canvas" stretch="0,1,0,1,0">
+      <property name="spacing"><number>0</number></property>
+      <property name="leftMargin"><number>24</number></property>
+      <property name="topMargin"><number>16</number></property>
+      <property name="rightMargin"><number>24</number></property>
+      <property name="bottomMargin"><number>16</number></property>
+      <item alignment="Qt::AlignLeft">
+       <widget class="QLabel" name="logo"/>
+      </item>
+      <item>
+       <spacer name="topSpace">
+        <property name="orientation"><enum>Qt::Vertical</enum></property>
+       </spacer>
+      </item>
+      <item alignment="Qt::AlignHCenter">
+       <widget class="QFrame" name="shaderPanel">
+        <property name="minimumSize"><size><width>460</width><height>0</height></size></property>
+        <property name="maximumSize"><size><width>520</width><height>16777215</height></size></property>
+        <layout class="QVBoxLayout" name="panelLayout">
+         <property name="spacing"><number>15</number></property>
+         <property name="leftMargin"><number>28</number></property>
+         <property name="topMargin"><number>24</number></property>
+         <property name="rightMargin"><number>28</number></property>
+         <property name="bottomMargin"><number>24</number></property>
+         <item>
+          <layout class="QHBoxLayout" name="headingLayout" stretch="0,1">
+           <property name="spacing"><number>14</number></property>
+           <item alignment="Qt::AlignVCenter">
+            <widget class="QLabel" name="brandIcon">
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+               <horstretch>0</horstretch><verstretch>0</verstretch>
+              </sizepolicy>
+             </property>
+             <property name="minimumSize"><size><width>44</width><height>44</height></size></property>
+             <property name="alignment"><set>Qt::AlignCenter</set></property>
+            </widget>
+           </item>
+           <item>
+            <layout class="QVBoxLayout" name="headingText">
+             <property name="spacing"><number>1</number></property>
+             <item>
+              <widget class="QLabel" name="brandName">
+               <property name="text"><string notr="true">JINRA</string></property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLabel" name="stage">
+               <property name="wordWrap"><bool>true</bool></property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+          </layout>
+         </item>
+         <item>
+          <widget class="QLabel" name="preparationNote">
+           <property name="wordWrap"><bool>true</bool></property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QWidget" name="progressDetails">
+           <layout class="QVBoxLayout" name="detailsLayout">
+            <property name="spacing"><number>8</number></property>
+            <property name="leftMargin"><number>0</number></property>
+            <property name="topMargin"><number>0</number></property>
+            <property name="rightMargin"><number>0</number></property>
+            <property name="bottomMargin"><number>0</number></property>
+            <item>
+             <layout class="QHBoxLayout" name="progressHeader">
+              <item><widget class="QLabel" name="progressCount"/></item>
+              <item alignment="Qt::AlignRight"><widget class="QLabel" name="progressPercent"/></item>
+             </layout>
+            </item>
+            <item>
+             <widget class="QProgressBar" name="progress_bar">
+              <property name="minimumSize"><size><width>0</width><height>10</height></size></property>
+              <property name="maximumSize"><size><width>16777215</width><height>10</height></size></property>
+              <property name="accessibleName"><string>Shader loading progress</string></property>
+              <property name="maximum"><number>10000</number></property>
+              <property name="value"><number>0</number></property>
+              <property name="textVisible"><bool>false</bool></property>
+             </widget>
+            </item>
+            <item alignment="Qt::AlignRight">
+             <widget class="QLabel" name="value"/>
+            </item>
+           </layout>
+          </widget>
+         </item>
+         <item alignment="Qt::AlignLeft">
+          <widget class="QPushButton" name="playNow">
+           <property name="text"><string>Play now</string></property>
+          </widget>
+         </item>
+        </layout>
        </widget>
       </item>
       <item>
-       <layout class="QVBoxLayout" name="verticalLayout" stretch="1,0,1">
-        <property name="spacing">
-         <number>15</number>
-        </property>
-        <property name="sizeConstraint">
-         <enum>QLayout::SetNoConstraint</enum>
-        </property>
-        <item alignment="Qt::AlignHCenter|Qt::AlignBottom">
-         <widget class="QLabel" name="stage">
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Minimum" vsizetype="Minimum">
-            <horstretch>0</horstretch>
-            <verstretch>0</verstretch>
-           </sizepolicy>
-          </property>
-          <property name="styleSheet">
-           <string notr="true">background-color: black; color: white;
-font: 75 20pt &quot;Arial&quot;;</string>
-          </property>
-          <property name="text">
-           <string>Loading Shaders 387 / 1628</string>
-          </property>
-         </widget>
-        </item>
-        <item alignment="Qt::AlignHCenter|Qt::AlignTop">
-         <widget class="QProgressBar" name="progress_bar">
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
-            <horstretch>0</horstretch>
-            <verstretch>0</verstretch>
-           </sizepolicy>
-          </property>
-          <property name="minimumSize">
-           <size>
-            <width>500</width>
-            <height>40</height>
-           </size>
-          </property>
-          <property name="styleSheet">
-           <string notr="true">QProgressBar {
-color: white;
-border: 2px solid white;
-outline-color: black;
-border-radius: 20px;
-}
-QProgressBar::chunk {
-background-color: white;
-border-radius: 15px;
-}</string>
-          </property>
-          <property name="value">
-           <number>50</number>
-          </property>
-          <property name="textVisible">
-           <bool>false</bool>
-          </property>
-          <property name="format">
-           <string>Loading Shaders %v out of %m</string>
-          </property>
-         </widget>
-        </item>
-        <item alignment="Qt::AlignHCenter|Qt::AlignTop">
-         <widget class="QLabel" name="value">
-          <property name="toolTip">
-           <string notr="true"/>
-          </property>
-          <property name="styleSheet">
-           <string notr="true">background-color: black; color: white;
-font: 75 15pt &quot;Arial&quot;;</string>
-          </property>
-          <property name="text">
-           <string>Estimated Time 5m 4s</string>
-          </property>
-         </widget>
-        </item>
-       </layout>
+       <spacer name="bottomSpace">
+        <property name="orientation"><enum>Qt::Vertical</enum></property>
+       </spacer>
       </item>
-      <item alignment="Qt::AlignRight|Qt::AlignBottom">
+      <item alignment="Qt::AlignRight">
        <widget class="QLabel" name="banner">
-        <property name="styleSheet">
-         <string notr="true">background-color: black;</string>
-        </property>
-        <property name="text">
-         <string/>
-        </property>
-        <property name="alignment">
-         <set>Qt::AlignCenter</set>
-        </property>
-        <property name="margin">
-         <number>30</number>
-        </property>
+        <property name="alignment"><set>Qt::AlignCenter</set></property>
        </widget>
       </item>
      </layout>

@@ -17,12 +17,10 @@ Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     return op;
 }
 
+// Maxwell's FMNMX and .SAT return the non-NaN operand (NaN saturates to 0). FMin/FMax/FClamp leave
+// NaN undefined and AMD's Windows compiler passes it through, so use the NaN-defined N variants.
 Id Clamp(EmitContext& ctx, Id type, Id value, Id zero, Id one) {
-    if (ctx.profile.has_broken_spirv_clamp) {
-        return ctx.OpFMin(type, ctx.OpFMax(type, value, zero), one);
-    } else {
-        return ctx.OpFClamp(type, value, zero, one);
-    }
+    return ctx.OpNMin(type, ctx.OpNMax(type, value, zero), one);
 }
 
 Id FPOrdNotEqual(EmitContext& ctx, Id lhs, Id rhs) {
@@ -89,7 +87,7 @@ Id EmitFPMax32(EmitContext& ctx, Id a, Id b) {
 }
 
 Id EmitFPMax64(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMax(ctx.F64[1], a, b);
+    return ctx.OpNMax(ctx.F64[1], a, b);
 }
 
 Id EmitFPMin32(EmitContext& ctx, Id a, Id b) {
@@ -97,7 +95,7 @@ Id EmitFPMin32(EmitContext& ctx, Id a, Id b) {
 }
 
 Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMin(ctx.F64[1], a, b);
+    return ctx.OpNMin(ctx.F64[1], a, b);
 }
 
 Id EmitFPMul16(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
@@ -137,23 +135,30 @@ Id EmitFPExp2(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPTanh(EmitContext& ctx, Id value) {
-    // Avoid cancellation near zero and overflow at large magnitudes. The native
-    // approximation permits relative error up to 2^-11 and preserves subnormals.
+    // MUFU.TANH (native programs). A series near zero avoids the cancellation of
+    // (1 - e^-2x) / (1 + e^-2x); tiny inputs (subnormals included) return themselves.
     const Id type = ctx.F32[1];
     const Id bits = ctx.OpBitcast(ctx.U32[1], value);
     const Id absolute_bits = ctx.OpBitwiseAnd(ctx.U32[1], bits, ctx.Const(0x7fffffffU));
     const Id absolute = ctx.OpBitcast(type, absolute_bits);
     const Id square = ctx.OpFMul(type, absolute, absolute);
-    const Id fifth = ctx.OpFAdd(type, ctx.Const(2.0f / 15.0f), ctx.OpFMul(type, square, ctx.Const(-17.0f / 315.0f)));
+    const Id fifth = ctx.OpFAdd(type, ctx.Const(2.0f / 15.0f),
+                                ctx.OpFMul(type, square, ctx.Const(-17.0f / 315.0f)));
     const Id third = ctx.OpFAdd(type, ctx.Const(-1.0f / 3.0f), ctx.OpFMul(type, square, fifth));
-    const Id polynomial = ctx.OpFAdd(type, absolute, ctx.OpFMul(type, ctx.OpFMul(type, absolute, square), third));
-    const Id exponential = ctx.OpExp2(type, ctx.OpFMul(type, absolute, ctx.Const(-2.8853900817779268f)));
-    const Id magnitude = ctx.OpFDiv(type, ctx.OpFSub(type, ctx.Const(1.0f), exponential), ctx.OpFAdd(type, ctx.Const(1.0f), exponential));
+    const Id polynomial =
+        ctx.OpFAdd(type, absolute, ctx.OpFMul(type, ctx.OpFMul(type, absolute, square), third));
+    const Id exponential =
+        ctx.OpExp2(type, ctx.OpFMul(type, absolute, ctx.Const(-2.8853900817779268f)));
+    const Id magnitude = ctx.OpFDiv(type, ctx.OpFSub(type, ctx.Const(1.0f), exponential),
+                                    ctx.OpFAdd(type, ctx.Const(1.0f), exponential));
     const Id small = ctx.OpULessThan(ctx.U1, absolute_bits, ctx.Const(0x3d800000U));
-    const Id selected = ctx.OpBitcast(ctx.U32[1], ctx.OpSelect(type, small, polynomial, magnitude));
+    const Id selected =
+        ctx.OpBitcast(ctx.U32[1], ctx.OpSelect(type, small, polynomial, magnitude));
     const Id tiny = ctx.OpULessThan(ctx.U1, absolute_bits, ctx.Const(0x39800000U));
     const Id preserved = ctx.OpSelect(ctx.U32[1], tiny, absolute_bits, selected);
-    return ctx.OpBitcast(type, ctx.OpBitwiseOr(ctx.U32[1], preserved, ctx.OpBitwiseAnd(ctx.U32[1], bits, ctx.Const(0x80000000U))));
+    return ctx.OpBitcast(type, ctx.OpBitwiseOr(ctx.U32[1], preserved,
+                                               ctx.OpBitwiseAnd(ctx.U32[1], bits,
+                                                                ctx.Const(0x80000000U))));
 }
 
 Id EmitFPLog2(EmitContext& ctx, Id value) {

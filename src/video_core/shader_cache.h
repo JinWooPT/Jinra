@@ -7,11 +7,12 @@
 #pragma once
 
 #include <array>
-#include <map>
+#include <atomic>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <span>
-#include <string>
+#include "video_core/page_filter.h"
 #include "common/container/unordered_map.h"
 #include <utility>
 #include <vector>
@@ -38,7 +39,8 @@ class GenericEnvironment;
 struct ShaderInfo {
     u64 unique_hash{};
     size_t size_bytes{};
-    std::vector<Shader::Ampere::Instruction> native_trap_prefix;
+    /// Lowered code of a native program, reused when its pipelines are built.
+    std::shared_ptr<const LoweredNativeCode> lowered_native;
 };
 
 class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
@@ -60,11 +62,16 @@ class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelI
     };
 
 public:
+    /// Device pages this cache ever registered objects on (InnerInvalidation skips the rest).
+    VideoCommon::PageFilter page_filter;
+
     /// @brief Removes shaders inside a given region
     /// @note Checks for ranges
     /// @param addr Start address of the invalidation
     /// @param size Number of bytes of the invalidation
     void InvalidateRegion(VAddr addr, size_t size);
+
+    void InvalidateRegions(std::span<const std::pair<DAddr, size_t>> sequences);
 
     /// @brief Unmarks a memory region as cached and marks it for removal
     /// @param addr Start address of the CPU write operation
@@ -73,6 +80,11 @@ public:
 
     /// @brief Flushes delayed removal operations
     void SyncGuestHost();
+
+    /// Drops the native programs the debug server rejects so their next draw or dispatch lowers
+    /// them again (and fails); after an un-reject, forgets every rejection so they are retried.
+    /// Runs on the thread that owns the cache, between frames.
+    void RefreshDebugRejections(bool unrejected);
 
 protected:
     struct GraphicsEnvironments {
@@ -103,22 +115,13 @@ protected:
     bool last_shaders_valid = false;
 
 private:
+    friend struct ShaderCacheTestAccess;
+
     /// @brief Tries to obtain a cached shader starting in a given address
     /// @note Doesn't check for ranges, the given address has to be the start of the shader
     /// @param addr Start address of the shader, this doesn't cache for region
     /// @return Pointer to a valid shader, nullptr when nothing is found
     ShaderInfo* TryGet(VAddr addr) const;
-
-    /// @brief Rethrows the remembered rejection of the shader at a given address, if any
-    /// @note The remembered entry is dropped when the first bytes of the shader changed
-    void ThrowIfRejected(VAddr cpu_addr, GPUVAddr gpu_addr);
-
-    /// @brief Remembers that the shader at a given address was rejected by the compiler
-    void RememberRejection(VAddr cpu_addr, GPUVAddr gpu_addr, const char* error);
-
-    /// @brief Forgets remembered rejections overlapping a written region
-    /// @pre invalidation_mutex is locked
-    void DropRejections(VAddr addr, size_t size);
 
     /// @brief Register in the cache a given entry
     /// @param data Shader to store in the cache
@@ -156,6 +159,14 @@ private:
 
     /// @brief Create a new shader entry and register it
     const ShaderInfo* MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr);
+
+    /// Rethrows the error a native program at this address was rejected with, if any.
+    void RethrowIfRejected(VAddr addr);
+    /// Whether a native program at this address was rejected.
+    bool IsRejected(VAddr addr);
+    /// Remembers the exception being handled as this address's rejection.
+    void RememberRejection(VAddr addr);
+    /// Hash of the state task and mesh programs are translated with.
     u64 MeshStateHash() const;
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
@@ -168,16 +179,13 @@ private:
     std::vector<std::unique_ptr<ShaderInfo>> storage;
     std::vector<Entry*> marked_for_removal;
 
-    /// Shaders whose environment could not be built (native dry run and lowering both failed). Without
-    /// this every draw or dispatch analysed and lowered the same rejected shader again.
-    struct RejectedShader {
-        u64 prefix_hash;
-        size_t prefix_size;
-        std::string error;
-    };
-    /// Ordered by address: invalidations (every guest write to a cached page) look up only the
-    /// entries they can overlap.
-    std::map<u64, RejectedShader> rejected_shaders;
+    /// Native programs the lowering rejected, by address, so each draw or dispatch rethrows the
+    /// first error instead of lowering again; dropped when guest memory there is written.
+    std::mutex rejected_mutex;
+    ::Common::unordered_map<u64, std::exception_ptr> rejected_native;
+    /// Bounds of every address ever rejected (never shrinks): a quick test for invalidations.
+    std::atomic<VAddr> rejected_lowest{~VAddr{}};
+    std::atomic<VAddr> rejected_highest{};
 };
 
 } // namespace VideoCommon

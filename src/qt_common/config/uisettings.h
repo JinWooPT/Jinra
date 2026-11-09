@@ -134,6 +134,9 @@ struct Values {
                                       true};
 
     Setting<bool> check_for_updates{linkage, true, "check_for_updates", Category::UiGeneral};
+    // Release tag the user chose to skip, and the epoch second before which updates stay quiet.
+    Setting<std::string> skipped_update_tag{linkage, {}, "skipped_update_tag", Category::Ui};
+    Setting<unsigned long long> update_remind_at{linkage, 0, "update_remind_at", Category::Ui};
 
     // Linux/MinGW may support (requires libdl support)
     SwitchableSetting<bool> enable_gamemode{linkage,
@@ -166,6 +169,9 @@ struct Values {
     QVector<GameDir> game_dirs;
     QStringList recent_files;
     Setting<std::string> language{linkage, "en", "language", Category::Paths};
+
+    // Optional key that enables the SteamGridDB icon fallback
+    Setting<std::string> steamgriddb_api_key{linkage, {}, "steamgriddb_api_key", Category::Ui};
 
     std::string theme;
 
@@ -239,7 +245,7 @@ void SaveWindowState();
 void RestoreWindowState(std::unique_ptr<QtConfig>& qtConfig);
 
 // sync with uisettings.cpp
-extern const std::array<Shortcut, 33> default_hotkeys;
+extern const std::array<Shortcut, 32> default_hotkeys;
 
 } // namespace UISettings
 

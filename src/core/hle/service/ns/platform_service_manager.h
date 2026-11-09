@@ -9,7 +9,6 @@
 #include <memory>
 #include <vector>
 #include "core/hle/service/cmif_types.h"
-#include "core/hle/service/ns/builtin_font.h"
 #include "core/hle/service/service.h"
 #include "core/hle/service/set/settings_types.h"
 
@@ -62,10 +61,6 @@ public:
     ~IPlatformServiceManager() override;
 
 private:
-    Result GetBuiltInFontSharedMemory(OutCopyHandle<Kernel::KSharedMemory> out_handle,
-                                      Out<u32> out_size);
-    Result GetBuiltInFontData(Out<bool> out_available, Out<BuiltInFontDescriptor> out_descriptor,
-                              u8 type, bool option);
     Result RequestLoad(SharedFontType type);
     Result GetLoadState(Out<LoadState> out_load_state, SharedFontType type);
     Result GetSize(Out<u32> out_size, SharedFontType type);
@@ -77,6 +72,9 @@ private:
                                           OutArray<u32, BufferAttr_HipcMapAlias> out_font_sizes,
                                           Out<bool> out_fonts_are_loaded, Out<u32> out_font_count,
                                           Set::LanguageCode language_code);
+
+    void GetBuiltInFontSharedMemory(HLERequestContext& ctx);
+    void GetBuiltInFontData(HLERequestContext& ctx);
 
     struct Impl;
     std::unique_ptr<Impl> impl;

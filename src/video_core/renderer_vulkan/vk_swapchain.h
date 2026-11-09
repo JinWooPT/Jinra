@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include <chrono>
 #include <vector>
 
 #include "common/common_types.h"
@@ -37,17 +36,21 @@ public:
         u32 width,
         u32 height);
 
-    /// Acquires the next image in the swapchain, waits as needed.
+    /// Acquires the next image in the swapchain, waits as needed. Returns true when no image was
+    /// acquired (out of date) and the swapchain has to be recreated first.
     /// `may_flush`: false on the async present thread (see Scheduler::Wait).
     bool AcquireNextImage(bool may_flush = true);
 
     /// Presents the rendered image to the swapchain.
-    void Present(VkSemaphore render_semaphore, VkResult* diagnostic_result = nullptr,
-                 std::chrono::steady_clock::time_point* diagnostic_return = nullptr);
+    void Present(VkSemaphore render_semaphore);
 
     /// Returns true when the swapchain needs to be recreated.
     bool NeedsRecreation() const {
-        return IsSubOptimal() || NeedsPresentModeUpdate();
+        return !swapchain || IsSubOptimal() || NeedsPresentModeUpdate();
+    }
+
+    bool IsCreated() const {
+        return static_cast<bool>(swapchain);
     }
 
     /// Returns true when the swapchain is outdated.

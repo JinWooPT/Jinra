@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$PayloadDir,
     [Parameter(Mandatory)][string]$OutputDir,
-    [string]$Compiler
+    [string]$Compiler,
+    [switch]$Pgo
 )
 $ErrorActionPreference = 'Stop'
 $packageRoot = (Resolve-Path -LiteralPath $PayloadDir).Path
@@ -29,9 +30,12 @@ if (!$Compiler -or !(Test-Path -LiteralPath $Compiler)) {
 }
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 $outputRoot = (Resolve-Path -LiteralPath $OutputDir).Path
-& $Compiler '/Qp' "/DPayloadDir=$packageRoot" "/DOutputDir=$outputRoot" "/DAppVersion=$version" (Join-Path $PSScriptRoot 'jinra.iss')
+$suffix = if ($Pgo) { '-pgo' } else { '' }
+$defines = @("/DPayloadDir=$packageRoot", "/DOutputDir=$outputRoot", "/DAppVersion=$version")
+if ($Pgo) { $defines += "/DPackageSuffix=$suffix" }
+& $Compiler '/Qp' @defines (Join-Path $PSScriptRoot 'jinra.iss')
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
-$installer = Join-Path $outputRoot "Jinra-Setup-$version-x64.exe"
+$installer = Join-Path $outputRoot "Jinra-Setup-$version-x64$suffix.exe"
 $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
 "$hash  $([IO.Path]::GetFileName($installer))" | Set-Content -LiteralPath (Join-Path $outputRoot 'SHA256SUMS.txt') -Encoding ascii
 Get-Item -LiteralPath $installer

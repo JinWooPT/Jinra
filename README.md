@@ -1,192 +1,75 @@
+<!--
+# SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+-->
+
 <p align="center"><img src="dist/jinra.png" alt="Jinra" width="160"></p>
 
 # Jinra
 
-Jinra is an experimental fork of [Eden-NS2](https://github.com/0x2593/Eden-NS2),
-building on the work of Eden and yuzu. It combines Switch 2 emulation changes,
-Donkey Kong Bananza rendering and performance work, and a new desktop interface.
+Jinra is an experimental fork of [Eden-NS2](https://github.com/0x2593/Eden-NS2).
+The desktop interface includes a game library, per-game settings, controller
+layouts for Xbox and DualSense, and a Windows update checker.
 
-## Testing scope — please read first
+## Windows downloads
 
-Jinra is optimized and tested on Windows with NVIDIA graphics and Vulkan.
-Results on AMD graphics are unknown. Compatibility on other GPU configurations
-and operating systems remains unverified.
+Download an installer or portable archive from
+[GitHub Releases](https://github.com/JinWooPT/Jinra/releases). Both Standard and
+PGO are Windows x64 builds. The PGO edition uses a gameplay profile to guide
+compiler optimizations. Installed editions receive updates for their own edition.
 
-| Game | Tested environment | Current scope |
-| --- | --- | --- |
-| Donkey Kong Bananza | Windows, NVIDIA GPU, Vulkan | Rendering and performance changes tested in gameplay. The owner also verified loading a `.nup` dump. |
-| Pokémon Pokopia | Windows, GeForce RTX 5090, Vulkan | Introductory cinematic, tutorial and movement verified. The project owner reported a stable 60 FPS at 2× in the tested gameplay. |
-| The Legend of Zelda: Ocarina of Time (tested NS2 build) | Windows, GeForce RTX 5090, Vulkan | Reaches gameplay. Shader translation and rendering fixes include the excessively bright doorway. Use **1× resolution for the best current experience**; remaining graphics issues and shader-compilation stutter are under investigation. |
-| All other games | No Jinra gameplay results | Compatibility and performance unknown |
+For a portable install, extract the entire archive and run Jinra. It stores
+saves and settings in the user directory beside the application. Installer
+upgrades preserve that directory. Use your own game dumps and system files.
 
-The 60 FPS result applies to the tested hardware, settings and gameplay.
+## 1.0.0
 
-## Screenshots
+Jinra can prepare Vulkan shaders for the matching Ocarina of Time revision
+before gameplay. The loading screen reports progress and offers **Play now**
+to continue shader preparation in the background. Prepared shaders remain
+available across compatible updates. A change to the shader translator, driver
+or relevant graphics settings can require preparation again.
 
-These are real captures of the Jinra desktop interface. Games appearing in the
-library are examples of detection, not additional compatibility test results.
+Right-click a game and select **Sync Shaders** to look up a compatible shared
+cache in the Jinra catalog. If the game already runs well with its locally
+prepared cache, you can keep using it.
 
-### Library
+The Ocarina of Time startup and prepared cache reuse were verified on Windows
+with a GeForce RTX 5090. The AMD Vulkan interpolation adjustment still needs
+gameplay verification on affected Radeon hardware.
+
+## Windows defaults and compatibility
+
+Jinra includes the Vulkan safeguard for
+pre-RDNA3 AMD Windows drivers. Those drivers can advertise cooperative matrices
+through emulation. Jinra uses the shader fallback on affected GPUs to address
+the Ocarina of Time crash during shader compilation. The same fix was verified
+on an RX 6800 XT upstream. Jinra-specific gameplay verification on Radeon is pending.
+
+Switch 2 titles select the 12 GiB memory layout at startup. Game compatibility,
+rendering, and performance vary with the title, hardware, and driver.
+
+On Windows, the first-run profile uses Vulkan at 1× in Docked mode with ScaleForce,
+FXAA, 16× anisotropic filtering, Fast GPU accuracy, aggressive VRAM usage, GPU
+ASTC decoding without recompression, and asynchronous shader compilation and
+presentation. FSR 3 frame generation and supported in-game DLSS paths start
+enabled. Existing configurations keep their saved settings.
+
+New profiles use the Jinra name and logo. The initial Web username is jinra.
+Existing profiles keep their names, preferences, and save associations.
+
+## Interface
+
+The following screenshots show the Jinra interface from an earlier preview.
 
 ![Jinra library with Donkey Kong Bananza selected](docs/jinra/screenshots/library.jpg)
 
-### Controls
+![Jinra controls with a DualSense controller](docs/jinra/screenshots/controls-dualsense.jpg)
 
-The Windows session below automatically detected a DualSense controller.
+## Build and license
 
-![Jinra controls with an automatically detected DualSense](docs/jinra/screenshots/controls-dualsense.jpg)
-
-## What is included
-
-- Rendering, synchronization and buffer-handling work developed while testing
-  Donkey Kong Bananza on NVIDIA hardware.
-- A targeted NVIDIA Vulkan workaround for the Pokémon Pokopia introductory
-  cinematic crash. See [the technical notes](docs/upstream-pokopia-fixes.md).
-- Zelda shader translation and rendering fixes, including preservation of mesh
-  shader register values that previously caused incorrect depth and bright surfaces.
-- Jinra branding, the samurai icon and a redesigned desktop library.
-- Library search, Recent and Favorites views, and a selected-game panel.
-- Xbox and DualSense layout previews, SDL device detection and physical button
-  labels. Virtual-controller checks passed; physical-device behavior still needs
-  broader verification.
-- The existing interface-language catalog and advanced settings.
-- Detection of `.nup` games in the library and file picker, with experimental
-  NUP v1 loading for raw and Zstandard-compressed members, including
-  a base program and its newest bundled update.
-
-NUP support passed container-fixture tests. **Donkey Kong Bananza was also
-successfully tested from a `.nup` dump by the project owner.** This does not
-establish compatibility with other games or every NUP layout. Bundled DLC records
-are recognized but are not mounted. See [NUP support](docs/nup-jinra.md) for details
-and attribution.
-
-## Defaults and performance
-
-New configurations start with English and the Jinra theme, plus:
-
-| Setting | Default |
-| --- | --- |
-| Graphics backend | Vulkan |
-| Emulated memory | 12 GB |
-| Console mode | Handheld |
-| Resolution scale | 2x |
-| Scaling filter | ScaleForce |
-| Anti-aliasing | SMAA |
-| GPU accuracy | High / Accurate |
-| Asynchronous shader building | Enabled |
-| Video decoding | GPU |
-| VRAM usage mode | Aggressive |
-
-These are the settings used during development, not universal recommendations
-for every PC. Existing saved preferences and per-game overrides take precedence.
-If 2x is too demanding for your system, try 1x. Resolution scaling multiplies the
-game's internal render size, which can vary by game, scene and console mode.
-
-### Zelda: recommended settings and remaining limitations
-
-**Play the tested Ocarina of Time build at 1× resolution for the best current
-experience.** Use Vulkan, High / Accurate GPU accuracy and 12 GB of emulated RAM.
-At 1×, the tested exterior scene renders the vases correctly and avoids the
-overly dark materials seen with higher resolution scales. This is a recommendation
-for this game, not a claim that every scene is graphically correct.
-
-In the tested build, both Handheld and Docked present a 2560×1440 base image.
-The measured final image is 3840×2160 (4K) at 1.5× and 5120×2880 (5K) at 2×.
-Individual rendering passes may use different or dynamic resolutions. These
-numbers do not apply universally to other games.
-
-Stable 60 FPS has **not** been achieved for this Zelda build. The tested exterior
-scene runs around 40–45 FPS when stationary on the development PC, with lower
-rates during movement and shader preparation. Compilation can still cause
-substantial pauses. Higher resolution scales can also make some materials too
-dark. Further graphics and performance fixes are in progress.
-
-See [the desktop interface notes](docs/jinra-ui.md) for controller, artwork,
-language and profile behavior. New initial profiles use the Jinra name and logo;
-existing profile identifiers and save associations are preserved.
-
-## Running
-
-### Windows installer and updates
-
-Download the Windows x64 installer from [Releases](https://github.com/JinWooPT/Jinra/releases).
-It installs for the current user and provides a Start menu entry, an optional
-desktop shortcut and an uninstaller. Existing data in the installation's `user`
-folder is retained during upgrades and uninstallation.
-
-Use **Help > Check for updates...** to check GitHub Releases. Startup checks follow
-the existing **Check for updates** preference. The updater recognizes newer Jinra
-preview and stable versions, verifies the downloaded installer's size and SHA-256
-digest, and asks before closing the app and starting the installer. Installation
-is blocked while a game is running. No game files or user data are uploaded.
-
-This version retains the Windows installer-handoff fix from preview.3. If you
-are upgrading from preview.1 or preview.2 and Jinra closes without opening Setup,
-download the current installer from Releases and install it over your existing
-installation.
-
-The installer and update support are for Windows x64. Other platforms remain
-unverified. Source builders can run the focused update tests by configuring
-`-DJINRA_UPDATE_TESTS=ON` and building the `jinra_update_tests` target.
-
-### Game setup
-
-Use your own game dumps and any required keys and firmware. No games, keys,
-firmware, user profiles, saves or shader caches are distributed with Jinra.
-
-**Use Switch 2 firmware 23.0.0 for the tested builds of Donkey Kong Bananza and
-Pokémon Pokopia.** The tested Bananza build stalled at launch with firmware
-22.5.0. The installer preserves existing firmware, so install your own 23.0.0
-dump under **Tools > Install Firmware** and check the reported version in the
-status bar.
-
-Add your game folder in the Library or use **File > Load File**. Extracted dumps
-are supported; for that layout, keep `romfs` alongside `exefs`.
-
-The desktop executable is `jinra.exe` on Windows. Internal storage and some
-configuration keys retain their upstream names for compatibility.
-
-## Building from source
-
-The existing CMake desktop target is still named `yuzu`; its output has been
-renamed to `jinra`. General dependency instructions are in [docs/Deps.md](docs/Deps.md).
-
-For Windows, the inherited [MSVC build helper](build-eden-msvc.bat) is available.
-It requires Visual Studio or Build Tools with Desktop development with C++,
-CMake, Ninja, Git for Windows and the dependencies described in the build docs.
-The helper retains its upstream filename and some legacy output messages;
-look for `jinra.exe` in the build output directory.
-
-The local development build was validated with MSVC, Release, LTO and a locally
-trained optimization profile. That private build directory and profile are not
-part of the repository. Rebuilding with another toolchain or without that
-profile may change performance; the published source is not a claim of identical
-binaries across build environments.
-
-Existing upstream Linux and other-platform build instructions remain in the
-documentation. These platforms have not been tested with Jinra.
-
-## Reporting results
-
-Include the Jinra commit or version, game version, GPU model, driver version,
-operating system and relevant settings. AMD reports are especially useful because
-this project's AMD behavior is currently unknown. Do not attach game data, keys,
-firmware or private user files.
-
-## Credits, license and development disclosure
-
-Jinra is derived from [0x2593/Eden-NS2](https://github.com/0x2593/Eden-NS2),
-[Eden](https://git.eden-emu.dev/eden-emu/eden) and yuzu. Original copyright,
-license and contributor notices are retained. The tested Jinra source was based
-on Eden-NS2 commit `c3dd05fb279b0e5b330964bf9983e4a88edc326e`.
-
-NUP loading is adapted from a55uka's format and Eglantine's GPL-licensed reader;
-the pinned source and limitations are documented in [docs/nup-jinra.md](docs/nup-jinra.md).
-
-This fork was developed with substantial AI assistance, including code changes,
-tests, interface artwork and documentation. It remains experimental and needs
-further human review and testing.
-
-Jinra is not affiliated with or endorsed by Nintendo, Eden or the yuzu project.
-The project is distributed under **GPL-3.0-or-later**; see [LICENSE.txt](LICENSE.txt)
-and [LICENSES](LICENSES) for the retained license texts and notices.
+See the [build guide](docs/Build.md) and [Windows packaging notes](dist/windows/README.md).
+See [LICENSE.txt](LICENSE.txt) and [LICENSES](LICENSES) for applicable terms.

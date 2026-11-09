@@ -21,6 +21,7 @@ struct UpdateRelease {
     VersionNumber version;
 };
 
-std::optional<UpdateRelease> FindUpdate(const QJsonArray& releases, const VersionNumber& current);
+std::optional<UpdateRelease> FindUpdate(const QJsonArray& releases, const VersionNumber& current,
+                                       bool pgo_build = false);
 
 } // namespace Jinra

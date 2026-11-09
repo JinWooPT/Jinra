@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdlib>
 #include <mutex>
 #include <ranges>
 
@@ -41,7 +40,7 @@ void GlobalSchedulerContext::RemoveThread(KThread* thread) noexcept {
 /// @note This operation happens every 10ms.
 void GlobalSchedulerContext::PreemptThreads(KernelCore& kernel) noexcept {
     // The priority levels at which the global scheduler preempts threads every 10 ms. They are
-    // ordered from Core 0 to Core 5. Core 3 is the system core (63); cores 4 and 5 are application
+    // ordered from Core 0 to Core 5; core 3 is shared with the system, 4 and 5 are application
     // cores like 0..2.
     static constexpr std::array<u32, Core::Hardware::NUM_CPU_CORES> per_core{
         59,
@@ -52,23 +51,8 @@ void GlobalSchedulerContext::PreemptThreads(KernelCore& kernel) noexcept {
         59,
     };
     ASSERT(KScheduler::IsSchedulerLockedByCurrentThread(kernel));
-    // Experiment (EDEN_PREEMPT_ALL=1, read once): the console gives applications more cores than the four
-    // emulated ones, so pinned workers that spin on each other (a barrier) end up sharing a core and the
-    // spinners starve the thread they wait for. Rotate the application priority levels too.
-    static const bool preempt_all = [] {
-        const char* value = std::getenv("EDEN_PREEMPT_ALL");
-        return value != nullptr && *value == '1';
-    }();
-    for (u32 core_id = 0; core_id < per_core.size(); core_id++) {
+    for (u32 core_id = 0; core_id < per_core.size(); core_id++)
         KScheduler::RotateScheduledQueue(kernel, core_id, per_core[core_id]);
-        if (preempt_all) {
-            for (s32 priority = 28; priority <= 62; priority++) {
-                if (static_cast<u32>(priority) != per_core[core_id]) {
-                    KScheduler::RotateScheduledQueue(kernel, core_id, priority);
-                }
-            }
-        }
-    }
 }
 
 /// @brief Returns true if the global scheduler lock is acquired

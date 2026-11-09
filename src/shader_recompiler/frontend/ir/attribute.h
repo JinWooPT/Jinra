@@ -15,7 +15,6 @@ namespace Shader::IR {
 
 enum class Attribute : u64 {
 #define SRIR_ATTRIBUTE_LIST \
-    SRIR_ATTRIBUTE_ELEM(VprsTableIndex, 23) \
     SRIR_ATTRIBUTE_ELEM(PrimitiveId, 24) \
     SRIR_ATTRIBUTE_ELEM(Layer, 25) \
     SRIR_ATTRIBUTE_ELEM(ViewportIndex, 26) \

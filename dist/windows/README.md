@@ -1,27 +1,21 @@
-# Jinra Windows installer
+# Jinra for Windows
 
-`jinra.iss` builds a per-user x64 installer with Inno Setup 6. It creates a portable
-`user` directory beside the program, a Start menu entry, an optional desktop
-shortcut and an uninstaller. Installation and upgrades replace only program and
-license files. The user directory is preserved during uninstallation.
+The Windows packages use Clang 22.1.8, the Microsoft x64 toolchain and Windows SDK,
+CMake and Ninja. Configure a Release build with Qt and SDL3 enabled, then build
+the yuzu and yuzu-cmd targets. Their outputs are jinra.exe and jinra-cli.exe.
+The original build guide covers toolchain and dependency setup.
 
-Pass a clean package folder containing `jinra.exe`, `LICENSE.txt`, `LICENSES` and
-`GETTING_STARTED.txt`. Any required DLLs and `plugins` can also be included. Do not
-distribute a development profile, keys, firmware, saves or shader caches.
+The release builds use ThinLTO. Set JINRA_BUILD_TAG to build-116 and set
+JINRA_BUILD_PLATFORM to windows-x86_64 for Standard or windows-x86_64-pgo for PGO.
+For PGO, add -fprofile-use with the absolute path to jinra-windows.profdata to
+the compiler flags. The profile is in the source tree. Disable the inherited
+update checker with ENABLE_UPDATE_CHECKER=OFF. The Jinra update checker is
+included independently.
 
-The `AppVersion` preprocessor define must match the root `VERSION` file. The update
-checker expects the release tag `v<VERSION>` and installer asset
-`Jinra-Setup-<VERSION>-x64.exe`, uploaded as a GitHub Release asset so its SHA-256
-digest is available from GitHub's release API.
-
-Example:
-
-```powershell
-./dist/windows/build-installer.ps1 -PayloadDir ./clean-package -OutputDir ./build-installer
-```
-
-Use `-DTestMode=1` when invoking ISCC directly to disable shortcuts and the uninstall
-registry entry for isolated install/upgrade/uninstall validation. Do not publish
-that test-only installer. The first preview installer is unsigned.
-
-This packaging and update integration was developed with AI assistance.
+Package the outputs using build-installer.ps1 and Inno Setup 6. Supply a clean
+payload with both executables, nx2_switches.txt, LICENSE.txt, LICENSES,
+GETTING_STARTED.txt, and the required app-local runtime libraries. Copy the
+contents of dist/recipes into the payload's recipes directory when present.
+Use -Pgo for the PGO installer. The release tag must match VERSION and each
+installer must have its corresponding edition suffix for the updater to
+recognize it.

@@ -141,6 +141,7 @@ void EmitFPExp2(EmitContext& ctx, IR::Inst& inst, ScalarF32 value) {
 }
 
 void EmitFPTanh(EmitContext& ctx, IR::Inst& inst, ScalarF32 value) {
+    // Same as the SPIR-V version: a series below 2^-4, (1 - e^-2x) / (1 + e^-2x) above.
     ctx.Add("AND.U RC.x,{1},0x7fffffff;"
             "MUL.F RC.y,RC.x,RC.x;"
             "MUL.F RC.z,RC.y,-0.05396825397;"
@@ -159,7 +160,8 @@ void EmitFPTanh(EmitContext& ctx, IR::Inst& inst, ScalarF32 value) {
             "SLT.U RC.w,RC.x,0x39800000;"
             "CMP.S RC.y,RC.w,RC.x,RC.y;"
             "AND.U RC.x,{1},0x80000000;"
-            "OR.U {0}.x,RC.y,RC.x;", inst, value);
+            "OR.U {0}.x,RC.y,RC.x;",
+            inst, value);
 }
 
 void EmitFPLog2(EmitContext& ctx, IR::Inst& inst, ScalarF32 value) {

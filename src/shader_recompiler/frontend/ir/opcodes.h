@@ -22,8 +22,8 @@ enum class Opcode {
 #undef OPCODE
 };
 
-constexpr size_t NUM_OPCODES = 0
-#define OPCODE(...) + 1
+inline constexpr size_t NUM_OPCODES = 0
+#define OPCODE(...) +1
 #include "opcodes.inc"
 #undef OPCODE
     ;

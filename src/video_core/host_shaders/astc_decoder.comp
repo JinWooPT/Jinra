@@ -1095,10 +1095,19 @@ int FindLayout(uint mode) {
 }
 
 
+ivec2 output_extent;
+bool partial_block;
+
+void StoreTexel(ivec3 coord, vec4 value) {
+    if (!partial_block || all(lessThan(coord.xy, output_extent))) {
+        imageStore(dest_image, coord, value);
+    }
+}
+
 void FillError(ivec3 coord) {
     for (uint j = 0; j < block_dims.y; j++) {
         for (uint i = 0; i < block_dims.x; i++) {
-            imageStore(dest_image, coord + ivec3(i, j, 0), vec4(0.0, 0.0, 0.0, 0.0));
+            StoreTexel(coord + ivec3(i, j, 0), vec4(0.0));
         }
     }
 }
@@ -1115,7 +1124,7 @@ void FillVoidExtentLDR(ivec3 coord) {
     const float b = float(b_u) / 65535.0f;
     for (uint j = 0; j < block_dims.y; j++) {
         for (uint i = 0; i < block_dims.x; i++) {
-            imageStore(dest_image, coord + ivec3(i, j, 0), vec4(r, g, b, a));
+            StoreTexel(coord + ivec3(i, j, 0), vec4(r, g, b, a));
         }
     }
 }
@@ -1389,28 +1398,28 @@ void DecompressBlock(ivec3 coord) {
                 p = Cf / 65535.0f;
             }
 
-            imageStore(dest_image, coord + ivec3(i, j, 0), clamp(p, 0.0f, 1.0f).gbar);
+            StoreTexel(coord + ivec3(i, j, 0), clamp(p, 0.0f, 1.0f).gbar);
         }
     }
 }
 
 uint SwizzleOffset(uvec2 pos) {
-    uint offset = ((pos.x & 32u) << 3u) |
+    return ((pos.x & 32u) << 3u) |
            ((pos.y & 6u)  << 5u) |
            ((pos.x & 16u) << 1u) |
            ((pos.y & 1u)  << 4u) |
            (pos.x & 15u);
-    if (native_tiling != 0) {
-        const uint difference = ((offset >> 5u) ^ (offset >> 6u)) & 1u;
-        offset ^= (difference << 5u) | (difference << 6u);
-    }
-    return offset;
 }
 
 void main() {
     uvec3 pos = gl_GlobalInvocationID;
     pos.x <<= BYTES_PER_BLOCK_LOG2;
-    const uint swizzle = SwizzleOffset(pos.xy);
+    uint swizzle = SwizzleOffset(pos.xy);
+    if (native_tiling != 0u) {
+        // Switch 2 GOBs swap offset bits 5 and 6 (see block_linear_unswizzle_2d.comp).
+        const uint difference = ((swizzle >> 5u) ^ (swizzle >> 6u)) & 1u;
+        swizzle ^= (difference << 5u) | (difference << 6u);
+    }
     const uint block_y = pos.y >> GOB_SIZE_Y_SHIFT;
 
     uint offset = 0;
@@ -1421,9 +1430,12 @@ void main() {
     offset += swizzle;
 
     const ivec3 coord = ivec3(gl_GlobalInvocationID * uvec3(block_dims, 1));
-    if (any(greaterThanEqual(coord, imageSize(dest_image)))) {
+    const ivec3 extent = imageSize(dest_image);
+    if (any(greaterThanEqual(coord, extent))) {
         return;
     }
+    output_extent = extent.xy;
+    partial_block = any(greaterThan(coord.xy + ivec2(block_dims), output_extent));
     local_buff = astc_data[offset / 16];
     DecompressBlock(coord);
 }

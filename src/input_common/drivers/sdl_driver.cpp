@@ -3,6 +3,7 @@
 // SPDX-FileCopyrightText: 2018 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <numbers>
 #include "common/logging.h"
@@ -86,9 +87,10 @@ static bool SDLEventWatcher(void* user_data, SDL_Event* event) {
 
 class SDLJoystick {
 public:
-    SDLJoystick(Common::UUID guid_, int port_, SDL_Joystick* joystick, SDL_Gamepad* game_controller)
-        : guid{guid_}, port{port_}, sdl_joystick{joystick, &SDL_CloseJoystick},
-          sdl_controller{game_controller, &SDL_CloseGamepad} {
+    SDLJoystick(Common::UUID guid_, int port_, SDL_Joystick* joystick,
+                                SDL_Gamepad* game_controller)
+                : guid{guid_}, port{port_}, sdl_joystick{joystick, &SDL_CloseJoystick},
+                    sdl_controller{game_controller, &SDL_CloseGamepad} {
         EnableMotion();
     }
 
@@ -114,7 +116,15 @@ public:
             }
         }
 
-        LOG_INFO(Input, "Controller motion capabilities: accel={} gyro={}", has_accel, has_gyro);
+        // EnableMotion is also called to recover a stalled sensor, so only log when the reported
+        // capabilities actually change instead of on every restart.
+        if (!motion_capabilities_logged || logged_accel != has_accel || logged_gyro != has_gyro) {
+            LOG_INFO(Input, "Controller motion capabilities: accel={} gyro={}", has_accel,
+                     has_gyro);
+            motion_capabilities_logged = true;
+            logged_accel = has_accel;
+            logged_gyro = has_gyro;
+        }
     }
 
     bool HasMotion() const {
@@ -124,8 +134,8 @@ public:
     bool UpdateMotion(SDL_GamepadSensorEvent event) {
         constexpr float gravity_constant = 9.80665f;
         std::scoped_lock lock{mutex};
-        const u64 sensor_timestamp =
-            event.sensor_timestamp != 0 ? event.sensor_timestamp : event.timestamp;
+        const u64 sensor_timestamp = event.sensor_timestamp != 0 ? event.sensor_timestamp
+                                                                 : event.timestamp;
 
         if (last_motion_update == 0) {
             last_motion_update = sensor_timestamp;
@@ -162,16 +172,21 @@ public:
         // Motion data is invalid
         if (motion.accel_x == 0 && motion.gyro_x == 0 && motion.accel_y == 0 &&
             motion.gyro_y == 0 && motion.accel_z == 0 && motion.gyro_z == 0) {
-            if (motion_error_count++ < 200) {
+            if (motion_error_count++ < motion_restart_threshold) {
                 return false;
             }
-            // Try restarting the sensor
+            // Try restarting the sensor. Back off exponentially so a sensor that keeps reporting
+            // zeros (observed on the Steam Deck) isn't toggled several times a
+            // second for the whole session.
             motion_error_count = 0;
+            motion_restart_threshold =
+                std::min(motion_restart_threshold * 2, MaxMotionRestartThreshold);
             EnableMotion();
             return false;
         }
 
         motion_error_count = 0;
+        motion_restart_threshold = InitialMotionRestartThreshold;
         motion.delta_timestamp = time_difference;
         return true;
     }
@@ -191,8 +206,8 @@ public:
         if (vibration.low_frequency > low_start_sensitivity_limit) {
             low_frequency_scale =
                 (std::max)(1.0f - (vibration.low_frequency - low_start_sensitivity_limit) /
-                                      low_width_sensitivity_limit,
-                           0.3f);
+                                    low_width_sensitivity_limit,
+                         0.3f);
         }
         f32 low_amplitude = vibration.low_amplitude * low_frequency_scale;
 
@@ -200,8 +215,8 @@ public:
         if (vibration.high_frequency > high_start_sensitivity_limit) {
             high_frequency_scale =
                 (std::max)(1.0f - (vibration.high_frequency - high_start_sensitivity_limit) /
-                                      high_width_sensitivity_limit,
-                           0.3f);
+                                    high_width_sensitivity_limit,
+                         0.3f);
         }
         f32 high_amplitude = vibration.high_amplitude * high_frequency_scale;
 
@@ -210,7 +225,8 @@ public:
                                      static_cast<u16>(high_amplitude), rumble_max_duration_ms);
         } else if (sdl_joystick) {
             return SDL_RumbleJoystick(sdl_joystick.get(), static_cast<u16>(low_amplitude),
-                                      static_cast<u16>(high_amplitude), rumble_max_duration_ms);
+                                      static_cast<u16>(high_amplitude),
+                                      rumble_max_duration_ms);
         }
 
         return false;
@@ -226,8 +242,7 @@ public:
         };
 
         // Valve hardware doesn't have any enums in SDL, so we have to support it manually.
-        // Since they have HD rumble, we can assume that all their hardware supports it, even if we
-        // can't detect the exact type.
+        // Since they have HD rumble, we can assume that all their hardware supports it, even if we can't detect the exact type.
         if (sdl_controller) {
             if (is_known_hd_type(SDL_GetGamepadType(sdl_controller.get())) ||
                 SDL_GetGamepadVendor(sdl_controller.get()) == valve_vendor_id) {
@@ -355,12 +370,15 @@ public:
     void MarkActive(u64 timestamp) {
         last_input_activity.store(timestamp, std::memory_order_relaxed);
     }
+
     u64 GetLastActivity() const {
         return last_input_activity.load(std::memory_order_relaxed);
     }
+
     void RecordAxis(int axis, s16 value, u64 timestamp) {
-        if (axis < 0 || axis >= static_cast<int>(previous_axes.size()))
+        if (axis < 0 || axis >= static_cast<int>(previous_axes.size())) {
             return;
+        }
         std::scoped_lock lock{mutex};
         if (!known_axes[axis]) {
             previous_axes[axis] = value;
@@ -414,7 +432,13 @@ private:
     std::array<s16, 32> previous_axes{};
     std::array<bool, 32> known_axes{};
     u64 last_motion_update{};
+    static constexpr std::size_t InitialMotionRestartThreshold = 200;
+    static constexpr std::size_t MaxMotionRestartThreshold = 200 * 64;
     std::size_t motion_error_count{};
+    std::size_t motion_restart_threshold{InitialMotionRestartThreshold};
+    bool motion_capabilities_logged{false};
+    bool logged_accel{false};
+    bool logged_gyro{false};
     bool has_gyro{false};
     bool has_accel{false};
     bool has_vibration{false};
@@ -614,8 +638,9 @@ void SDLDriver::HandleGameControllerEvent(const SDL_Event& event) {
     case SDL_EVENT_JOYSTICK_HAT_MOTION: {
         if (const auto joystick = GetSDLJoystickBySDLID(event.jhat.which)) {
             const PadIdentifier identifier = joystick->GetPadIdentifier();
-            if (event.jhat.value != 0)
+            if (event.jhat.value != 0) {
                 joystick->MarkActive(event.jhat.timestamp);
+            }
             SetHatButton(identifier, event.jhat.hat, event.jhat.value);
         }
         break;
@@ -675,8 +700,7 @@ SDLDriver::SDLDriver(std::string input_engine_) : InputEngine(std::move(input_en
 
 #ifdef _WIN32
     if (Settings::values.disable_wgi_xinput) {
-        SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_RAWINPUT_CORRELATE_XINPUT, "0",
-                                SDL_HINT_OVERRIDE);
+        SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_RAWINPUT_CORRELATE_XINPUT, "0", SDL_HINT_OVERRIDE);
         SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_WGI, "0", SDL_HINT_OVERRIDE);
     }
 #endif
@@ -957,11 +981,9 @@ ButtonMapping SDLDriver::GetButtonMappingForDevice(const Common::ParamPackage& p
     if (auto* controller = joystick->GetSDLGameController(); controller) {
         // Parameters contain two joysticks return dual
         if (params.Has("guid2")) {
-            const auto joystick2 =
-                GetSDLJoystickByGUID(params.Get("guid2", ""), params.Get("port", 0));
+            const auto joystick2 = GetSDLJoystickByGUID(params.Get("guid2", ""), params.Get("port", 0));
             if (joystick2->GetSDLGameController())
-                return GetDualControllerMapping(joystick, joystick2, switch_to_sdl_button,
-                                                switch_to_sdl_axis);
+                return GetDualControllerMapping(joystick, joystick2, switch_to_sdl_button, switch_to_sdl_axis);
         }
         return GetSingleControllerMapping(joystick, switch_to_sdl_button, switch_to_sdl_axis);
     }
@@ -972,17 +994,13 @@ ButtonMapping SDLDriver::GetButtonMappingForDevice(const Common::ParamPackage& p
         SDL_GamepadBinding binding{};
         binding.input_type = SDL_GAMEPAD_BINDTYPE_BUTTON;
         binding.input.button = pair.second;
-        mapping.insert_or_assign(
-            pair.first,
-            BuildParamPackageForBinding(joystick->GetPort(), joystick->GetGUID(), binding));
+        mapping.insert_or_assign(pair.first, BuildParamPackageForBinding(joystick->GetPort(), joystick->GetGUID(), binding));
     }
     for (const auto& pair : switch_to_sdl_axis) {
         SDL_GamepadBinding binding{};
         binding.input_type = SDL_GAMEPAD_BINDTYPE_AXIS;
         binding.input.axis.axis = pair.second;
-        mapping.insert_or_assign(
-            pair.first,
-            BuildParamPackageForBinding(joystick->GetPort(), joystick->GetGUID(), binding));
+        mapping.insert_or_assign(pair.first, BuildParamPackageForBinding(joystick->GetPort(), joystick->GetGUID(), binding));
     }
     return mapping;
 }
@@ -1133,9 +1151,9 @@ AnalogMapping SDLDriver::GetAnalogMappingForDevice(const Common::ParamPackage& p
         const auto left_offset_x = -GetAxis(identifier, binding_left_x.input.axis.axis);
         const auto left_offset_y = GetAxis(identifier, binding_left_y.input.axis.axis);
         mapping.insert_or_assign(Settings::NativeAnalog::LStick,
-                                 BuildParamPackageForAnalog(
-                                     identifier, binding_left_x.input.axis.axis,
-                                     binding_left_y.input.axis.axis, left_offset_x, left_offset_y));
+                     BuildParamPackageForAnalog(identifier, binding_left_x.input.axis.axis,
+                                    binding_left_y.input.axis.axis,
+                                                            left_offset_x, left_offset_y));
     } else {
         const auto identifier = joystick->GetPadIdentifier();
         PreSetController(identifier);
@@ -1144,9 +1162,9 @@ AnalogMapping SDLDriver::GetAnalogMappingForDevice(const Common::ParamPackage& p
         const auto left_offset_x = -GetAxis(identifier, binding_left_x.input.axis.axis);
         const auto left_offset_y = GetAxis(identifier, binding_left_y.input.axis.axis);
         mapping.insert_or_assign(Settings::NativeAnalog::LStick,
-                                 BuildParamPackageForAnalog(
-                                     identifier, binding_left_x.input.axis.axis,
-                                     binding_left_y.input.axis.axis, left_offset_x, left_offset_y));
+                     BuildParamPackageForAnalog(identifier, binding_left_x.input.axis.axis,
+                                    binding_left_y.input.axis.axis,
+                                                            left_offset_x, left_offset_y));
     }
     const auto binding_right_x = GetBindingForAxis(bindings, SDL_GAMEPAD_AXIS_RIGHTX);
     const auto binding_right_y = GetBindingForAxis(bindings, SDL_GAMEPAD_AXIS_RIGHTY);
@@ -1158,8 +1176,8 @@ AnalogMapping SDLDriver::GetAnalogMappingForDevice(const Common::ParamPackage& p
     const auto right_offset_y = GetAxis(identifier, binding_right_y.input.axis.axis);
     mapping.insert_or_assign(Settings::NativeAnalog::RStick,
                              BuildParamPackageForAnalog(identifier, binding_right_x.input.axis.axis,
-                                                        binding_right_y.input.axis.axis,
-                                                        right_offset_x, right_offset_y));
+                                                        binding_right_y.input.axis.axis, right_offset_x,
+                                                        right_offset_y));
     return mapping;
 }
 

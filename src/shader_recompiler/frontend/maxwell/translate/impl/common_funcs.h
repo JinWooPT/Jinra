@@ -6,8 +6,6 @@
 #include "shader_recompiler/frontend/maxwell/translate/impl/impl.h"
 
 namespace Shader::Maxwell {
-[[nodiscard]] IR::U32 ConvertF32ToS32Saturated(IR::IREmitter& ir, const IR::F32& rounded);
-
 [[nodiscard]] IR::U1 IntegerCompare(IR::IREmitter& ir, const IR::U32& operand_1,
                                     const IR::U32& operand_2, CompareOp compare_op, bool is_signed);
 
@@ -25,8 +23,4 @@ namespace Shader::Maxwell {
 [[nodiscard]] IR::U1 FloatingPointCompare(IR::IREmitter& ir, const IR::F16F32F64& operand_1,
                                           const IR::F16F32F64& operand_2, FPCompareOp compare_op,
                                           IR::FpControl control = {});
-
-/// Evaluates a LOP3.LUT three-input logic operation (truth table with A=0xf0, B=0xcc, C=0xaa).
-[[nodiscard]] IR::U32 ApplyLUT(IR::IREmitter& ir, const IR::U32& a, const IR::U32& b,
-                               const IR::U32& c, u64 ttbl);
 } // namespace Shader::Maxwell

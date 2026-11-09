@@ -94,21 +94,8 @@ enum class AppletId : u32 {
     LoginShare = 0x18,
     WebAuth = 0x19,
     MyPage = 0x1A,
-    Lhub = 0x35,
-    SoftwareKeyboardNative = 0x01020011,
-    ControllerNative = 0x0100000C,
+    Lhub = 0x35
 };
-
-constexpr AppletId GetFrontendAppletId(AppletId id) {
-    switch (id) {
-    case AppletId::SoftwareKeyboardNative:
-        return AppletId::SoftwareKeyboard;
-    case AppletId::ControllerNative:
-        return AppletId::Controller;
-    default:
-        return id;
-    }
-}
 
 enum class AppletProgramId : u64 {
     QLaunch = 0x0100000000001000ull,

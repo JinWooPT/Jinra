@@ -26,8 +26,10 @@
 #include "video_core/host_shaders/resolve_conditional_render_comp_spv.h"
 #include "video_core/host_shaders/vulkan_quad_indexed_comp_spv.h"
 #include "video_core/host_shaders/vulkan_uint8_comp_spv.h"
+#include "video_core/host_shaders/vulkan_vertex_repack_comp_spv.h"
 #include "video_core/host_shaders/block_linear_unswizzle_3d_bcn_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/surface.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -323,6 +325,63 @@ ComputePass::ComputePass(const Device& device_, Scheduler& scheduler, Descriptor
 }
 
 ComputePass::~ComputePass() = default;
+
+VertexRepackPass::VertexRepackPass(const Device& device_, Scheduler& scheduler_,
+                                 DescriptorPool& descriptor_pool, StagingBufferPool& staging_pool_,
+                                 ComputePassDescriptorQueue& descriptor_queue_)
+    : ComputePass(device_, scheduler_, descriptor_pool, INPUT_OUTPUT_DESCRIPTOR_SET_BINDINGS,
+                  INPUT_OUTPUT_DESCRIPTOR_UPDATE_TEMPLATE, INPUT_OUTPUT_BANK_INFO,
+                  COMPUTE_PUSH_CONSTANT_RANGE<12>, VULKAN_VERTEX_REPACK_COMP_SPV),
+      scheduler{scheduler_}, staging_pool{staging_pool_}, descriptor_queue{descriptor_queue_} {}
+
+std::optional<std::pair<VkBuffer, VkDeviceSize>> VertexRepackPass::Assemble(VkBuffer source,
+                                                                            u32 offset, u32 size,
+                                                                            u64 buffer_size) {
+    const auto parameters = MakeVertexRepackParameters(
+        offset, size, device.GetStorageBufferAlignment(), device.GetMaxStorageBufferRange(),
+        device.GetMaxComputeWorkGroupCount()[0], buffer_size);
+    if (!parameters) {
+        LOG_ERROR(Render_Vulkan, "Vertex repack exceeds device limits: offset={}, size={}", offset, size);
+        return std::nullopt;
+    }
+    const u32 num_vertices = parameters->vertices;
+    const u32 output_size = parameters->output_size;
+    const auto dest = staging_pool.Request(output_size, MemoryUsage::DeviceLocal);
+    const u32 base_offset = parameters->source_base;
+    const u32 bias = parameters->source_bias;
+    descriptor_queue.Acquire(scheduler, 2);
+    descriptor_queue.AddBuffer(source, base_offset, parameters->source_range);
+    descriptor_queue.AddBuffer(dest.buffer, dest.offset, output_size);
+    const void* data = descriptor_queue.UpdateData();
+    scheduler.RequestOutsideRenderPassOperationContext();
+    LOG_DEBUG(Render_Vulkan, "Vertex repack queued: source_size={}, output_size={}, groups={}",
+              size, output_size, parameters->dispatch_groups);
+    scheduler.Record([this, data, bias, size, num_vertices,
+                      groups = parameters->dispatch_groups](vk::CommandBuffer cmdbuf) {
+        const VkMemoryBarrier read_barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, read_barrier);
+        const auto set = descriptor_allocator.Commit();
+        device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, data);
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+        const std::array<u32, 3> constants{bias, size, num_vertices * 18};
+        cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants.data());
+        cmdbuf.Dispatch(groups, 1, 1);
+        const VkMemoryBarrier write_barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, write_barrier);
+    });
+    return std::pair<VkBuffer, VkDeviceSize>{dest.buffer, dest.offset};
+}
 
 Uint8Pass::Uint8Pass(const Device& device_, Scheduler& scheduler_, DescriptorPool& descriptor_pool,
                      StagingBufferPool& staging_buffer_pool_,
@@ -649,36 +708,23 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                   : info.layer_stride;
     const size_t input_size = skip != 0 ? size_t{input_layer_stride} * info.resources.layers
                                         : guest_size_bytes;
-    for (const VideoCommon::SwizzleParameters& swizzle : swizzles) {
-        const u32 num_dispatches_x = Common::DivCeil(swizzle.num_tiles.width, 8U);
-        const u32 num_dispatches_y = Common::DivCeil(swizzle.num_tiles.height, 8U);
-        const s32 host_level = swizzle.level - static_cast<s32>(skip);
-
-        // To unswizzle the ASTC data
-        auto params = MakeBlockLinearSwizzle2DParams(swizzle, info);
-        params.layer_stride = input_layer_stride;
-        ASSERT(params.origin == (std::array<u32, 3>{0, 0, 0}));
-        ASSERT(params.destination == (std::array<s32, 3>{0, 0, 0}));
-        ASSERT(params.bytes_per_block_log2 == 4);
-
-        // Only some layers: the input holds them one after another, each decoded by its own
-        // dispatch into a view of its layer. Otherwise one dispatch covers every layer.
-        const size_t num_inputs = target.layers.empty() ? 1 : target.layers.size();
-        for (size_t i = 0; i < num_inputs; ++i) {
-            const bool all_layers = target.layers.empty();
-            const size_t input_offset = map.offset + i * input_layer_stride + swizzle.buffer_offset;
-            const size_t input_range = (all_layers ? input_size : input_layer_stride) - swizzle.buffer_offset;
-            const u32 num_dispatches_z = all_layers ? static_cast<u32>(info.resources.layers) : 1U;
-
+    // Only some layers: one dispatch per layer and level, into that layer's own view.
+    for (size_t i = 0; i < target.layers.size(); ++i) {
+        for (const VideoCommon::SwizzleParameters& swizzle : swizzles) {
+            const size_t layer_offset = i * input_layer_stride;
             compute_pass_descriptor_queue.Acquire(scheduler, 2);
-            compute_pass_descriptor_queue.AddBuffer(map.buffer, input_offset, input_range);
-            compute_pass_descriptor_queue.AddImage(all_layers
-                                                       ? target.level_view(host_level)
-                                                       : target.layer_view(host_level, target.layers[i]));
+            compute_pass_descriptor_queue.AddBuffer(map.buffer,
+                                                    map.offset + layer_offset + swizzle.buffer_offset,
+                                                    input_layer_stride - swizzle.buffer_offset);
+            compute_pass_descriptor_queue.AddImage(
+                target.layer_view(swizzle.level - static_cast<s32>(skip), target.layers[i]));
             const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
-
-            scheduler.Record([this, num_dispatches_x, num_dispatches_y, num_dispatches_z, block_dims,
-                              params, descriptor_data](vk::CommandBuffer cmdbuf) {
+            auto params = MakeBlockLinearSwizzle2DParams(swizzle, info);
+            params.layer_stride = input_layer_stride;
+            const u32 num_dispatches_x = Common::DivCeil(swizzle.num_tiles.width, 8U);
+            const u32 num_dispatches_y = Common::DivCeil(swizzle.num_tiles.height, 8U);
+            scheduler.Record([this, num_dispatches_x, num_dispatches_y, block_dims, params,
+                              descriptor_data](vk::CommandBuffer cmdbuf) {
                 const AstcPushConstants uniforms{
                     .blocks_dims = block_dims,
                     .layer_stride = params.layer_stride,
@@ -692,9 +738,47 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                 device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
                 cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
                 cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
-                cmdbuf.Dispatch(num_dispatches_x, num_dispatches_y, num_dispatches_z);
+                cmdbuf.Dispatch(num_dispatches_x, num_dispatches_y, 1);
             });
         }
+    }
+    for (const VideoCommon::SwizzleParameters& swizzle : target.layers.empty() ? swizzles
+                                                        : std::span<const VideoCommon::SwizzleParameters>{}) {
+        const size_t input_offset = swizzle.buffer_offset + map.offset;
+        const u32 num_dispatches_x = Common::DivCeil(swizzle.num_tiles.width, 8U);
+        const u32 num_dispatches_y = Common::DivCeil(swizzle.num_tiles.height, 8U);
+        const u32 num_dispatches_z = info.resources.layers;
+
+        compute_pass_descriptor_queue.Acquire(scheduler, 2);
+        compute_pass_descriptor_queue.AddBuffer(map.buffer, input_offset,
+                                                input_size - swizzle.buffer_offset);
+        compute_pass_descriptor_queue.AddImage(
+            target.level_view(swizzle.level - static_cast<s32>(skip)));
+        const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
+
+        // To unswizzle the ASTC data
+        auto params = MakeBlockLinearSwizzle2DParams(swizzle, info);
+        params.layer_stride = input_layer_stride;
+        ASSERT(params.origin == (std::array<u32, 3>{0, 0, 0}));
+        ASSERT(params.destination == (std::array<s32, 3>{0, 0, 0}));
+        ASSERT(params.bytes_per_block_log2 == 4);
+        scheduler.Record([this, num_dispatches_x, num_dispatches_y, num_dispatches_z, block_dims,
+                          params, descriptor_data](vk::CommandBuffer cmdbuf) {
+            const AstcPushConstants uniforms{
+                .blocks_dims = block_dims,
+                .layer_stride = params.layer_stride,
+                .block_size = params.block_size,
+                .x_shift = params.x_shift,
+                .block_height = params.block_height,
+                .block_height_mask = params.block_height_mask,
+                .native_tiling = params.native_tiling,
+            };
+            const VkDescriptorSet set = descriptor_allocator.Commit();
+            device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+            cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
+            cmdbuf.Dispatch(num_dispatches_x, num_dispatches_y, num_dispatches_z);
+        });
     }
     scheduler.Record([vk_image, aspect_mask](vk::CommandBuffer cmdbuf) {
         const VkImageMemoryBarrier image_barrier{
@@ -718,13 +802,12 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                        vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, image_barrier);
     });
-    // Each decode ends with the GPU thread waiting for the host GPU to go idle. Measured here
-    // (count and time per 5 s); EDEN_NX2_ASTC_FLUSH=1 submits without waiting instead, =0 always
-    // waits. Switch 2 textures only submit by default: Mario Kart World streams them while it
-    // draws, and each wait (20-50 ms) stalled the frame. The decoded image is used after the
-    // barrier above on the same queue either way, as the BCn transcode path does without waiting.
-    static const char* const flush_setting = std::getenv("EDEN_NX2_ASTC_FLUSH");
-    const bool flush_only = flush_setting != nullptr ? flush_setting[0] == '1' : info.native_tiling;
+    // Each decode ends with a submit to the host GPU. Measured here
+    // (count and time per 5 s); EDEN_NX2_ASTC_FLUSH=0 waits for the host GPU to go idle instead.
+    static const bool flush_only = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_FLUSH");
+        return value == nullptr || value[0] != '0';
+    }();
     if (!target.wait) {
         return;
     }
@@ -806,7 +889,7 @@ struct alignas(16) BlockLinearUnswizzle3DPushConstants {
 
     u32 block_depth;             // Offset 48
     u32 block_depth_mask;        // Offset 52
-    u32 native_tiling;           // Offset 56
+    s32 _pad;                    // Offset 56
 
     s32 destination[3];          // Offset 60
     s32 _pad_end;                // Offset 72
@@ -926,7 +1009,6 @@ void BlockLinearUnswizzle3DPass::UnswizzleChunk(
     pc.block_height_mask    = params.block_height_mask;
     pc.block_depth          = params.block_depth;
     pc.block_depth_mask     = params.block_depth_mask;
-    pc.native_tiling        = params.native_tiling;
 
     pc.blocks_dim[0] = blocks_x;
     pc.blocks_dim[1] = blocks_y;

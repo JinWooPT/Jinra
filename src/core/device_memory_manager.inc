@@ -5,8 +5,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <memory>
+#include <source_location>
+#include <string_view>
 #include <type_traits>
 #include <algorithm>
 #include <vector>
@@ -18,13 +21,13 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "common/paged_scalar.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/device_memory.h"
-#include "core/hle/kernel/board/nintendo/nx/k_system_control.h"
 #include "core/device_memory_manager.h"
-#include "core/hle/dlss_trace.h"
 #include "core/memory.h"
+#include "video_core/nx2_perf.h"
 
 namespace Core {
 
@@ -140,6 +143,29 @@ struct EmptyAllocator {
 
 } // namespace
 
+// An unmapped read returns zeros. The first 16 are logged with their caller, every one with
+// EDEN_NX2_READBLOCK_TRACE=1.
+inline void ReportUnmappedRead(DAddr first_unmapped, DAddr address, size_t size,
+                               size_t unmapped_bytes, const std::source_location& caller) {
+    static const bool trace = [] {
+        const char* value = std::getenv("EDEN_NX2_READBLOCK_TRACE");
+        return value != nullptr && value[0] == '1';
+    }();
+    static std::atomic<u32> reported{};
+    if (!trace && reported.fetch_add(1, std::memory_order_relaxed) >= 16) {
+        return;
+    }
+    std::string_view file{caller.file_name()};
+    if (const size_t slash = file.find_last_of("/\\"); slash != std::string_view::npos && slash > 0) {
+        const size_t parent = file.find_last_of("/\\", slash - 1);
+        file.remove_prefix(parent == std::string_view::npos ? 0 : parent + 1);
+    }
+    LOG_ERROR(HW_Memory,
+              "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {}, {} "
+              "bytes unmapped) from {}:{}",
+              first_unmapped, address, size, unmapped_bytes, file, caller.line());
+}
+
 template <typename DTraits>
 struct DeviceMemoryManagerAllocator {
     static constexpr size_t device_virtual_bits = DTraits::device_virtual_bits;
@@ -173,8 +199,9 @@ struct DeviceMemoryManagerAllocator {
 template <typename Traits>
 DeviceMemoryManager<Traits>::DeviceMemoryManager(const DeviceMemory& device_memory_)
     : physical_base{uintptr_t(device_memory_.buffer.BackingBasePointer())}
+    , device_memory_ptr{&device_memory_}
     , device_inter{nullptr}
-    , compressed_device_addr(Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize() >> Memory::YUZU_PAGEBITS)
+    , compressed_device_addr(1ULL << ((Settings::values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_4Gb ? physical_min_bits : physical_max_bits) - Memory::YUZU_PAGEBITS))
     , tracked_entries(device_as_size >> Memory::YUZU_PAGEBITS)
 {
     impl = std::make_unique<DeviceMemoryManagerAllocator<Traits>>();
@@ -183,6 +210,49 @@ DeviceMemoryManager<Traits>::DeviceMemoryManager(const DeviceMemory& device_memo
 
 template <typename Traits>
 DeviceMemoryManager<Traits>::~DeviceMemoryManager() = default;
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::HintCold(DAddr address, size_t size) {
+    struct Run {
+        u64 physical_offset;
+        VAddr virtual_address; ///< 0: no CPU mapping known
+        u64 size;
+    };
+    std::vector<Run> runs;
+    const size_t page_end = Common::DivCeil(address + size, Memory::YUZU_PAGESIZE);
+    for (size_t page = address >> Memory::YUZU_PAGEBITS; page < page_end; ++page) {
+        const u32 compressed = tracked_entries[page].compressed_physical_ptr;
+        if (compressed == 0) {
+            continue;
+        }
+        const u64 physical = u64{compressed - 1} << Memory::YUZU_PAGEBITS;
+        const VAddr vaddr = ExtractCPUBacking(page).second;
+        if (!runs.empty()) {
+            Run& last = runs.back();
+            const bool contiguous_view =
+                last.virtual_address == 0 ? vaddr == 0 : last.virtual_address + last.size == vaddr;
+            if (last.physical_offset + last.size == physical && contiguous_view) {
+                last.size += Memory::YUZU_PAGESIZE;
+                continue;
+            }
+        }
+        runs.push_back({physical, vaddr, Memory::YUZU_PAGESIZE});
+    }
+    if (runs.empty()) {
+        return;
+    }
+    if (!cold_hint_worker) {
+        cold_hint_worker = std::make_unique<Common::ThreadWorker>(1, "DeviceMemory:ColdHint");
+    }
+    cold_hint_worker->QueueWork([this, runs = std::move(runs)] {
+        for (const Run& run : runs) {
+            device_memory_ptr->buffer.HintCold(
+                run.physical_offset, run.size,
+                run.virtual_address != 0 ? std::optional<size_t>{run.virtual_address}
+                                         : std::nullopt);
+        }
+    });
+}
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::BindInterface(DeviceInterface* device_inter_) {
@@ -217,11 +287,11 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
     for (size_t i = 0; i < num_pages; i++) {
         const VAddr new_vaddress = virtual_address + i * Memory::YUZU_PAGESIZE;
         auto* ptr = process_memory->GetPointerSilent(Common::ProcessAddress(new_vaddress));
-        // Runs from an earlier mapping must not extend into different physical pages.
+        // One page per run unless tracked below: a run left from an earlier mapping of these
+        // device pages would make WalkBlock copy the host memory that followed that mapping.
         tracked_entries.GetUnchecked(start_page_d + i).continuity_tracker = 0;
         if (ptr == nullptr) [[unlikely]] {
             tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = 0;
-            InsertCPUBacking(start_page_d + i, new_vaddress, asid);
             continue;
         }
         auto phys_addr = static_cast<u32>(GetRawPhysicalAddr(ptr) >> Memory::YUZU_PAGEBITS) + 1U;
@@ -244,18 +314,6 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
     if (track) {
         TrackContinuityImpl(address, virtual_address, size, asid);
     }
-}
-
-template <typename Traits>
-u32 DeviceMemoryManager<Traits>::ProbeBacking(DAddr address) {
-    const size_t page_index = address >> Memory::YUZU_PAGEBITS;
-    const auto [asid, vaddress] = ExtractCPUBacking(page_index);
-    if (asid.id >= registered_processes.size() || !registered_processes[asid.id]) return 1;
-    auto* ptr = registered_processes[asid.id]->GetPointerSilent(Common::ProcessAddress(vaddress));
-    const u32 stored = tracked_entries[page_index].compressed_physical_ptr;
-    const u32 current = ptr ? static_cast<u32>(GetRawPhysicalAddr(ptr) >> Memory::YUZU_PAGEBITS) + 1U : 0U;
-    if (stored == current) return stored ? 0 : 1;
-    return stored == 0 ? 2 : 3;
 }
 
 template <typename Traits>
@@ -293,8 +351,9 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::CutContinuityAt(size_t page) {
-    // Eglantine ddd367a8152f1c37bfc972475b40afece2da31ac; see docs/upstream-pokopia-fixes.md.
-    // A run counts down on successive pages. Stop once a run already ends before this boundary.
+    // Runs counted from the pages before `page` end there: the pages from `page` on are being
+    // mapped again or unmapped. A run is counted down page by page (TrackContinuityImpl), so the
+    // first page whose run already ends before `page` ends the walk.
     for (size_t index = page; index-- > 0;) {
         const size_t last_count = page - 1 - index;
         if (tracked_entries[index].continuity_tracker <= last_count) {
@@ -387,24 +446,17 @@ const T* DeviceMemoryManager<Traits>::GetPointer(DAddr address) const {
 template <typename Traits>
 template <typename T>
 void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
-    T* ptr = GetPointer<T>(address);
-    if (!ptr) [[unlikely]] {
-        return;
-    }
-    Core::HLE::DlssTrace::WriteWatch("DeviceMemoryManager::Write<T>", ptr, sizeof(T));
-    std::memcpy(ptr, &value, sizeof(T));
+    Common::WritePagedScalar(address, value, [&](DAddr page_address) {
+        return page_address < device_as_size ? GetPointer<u8>(page_address) : nullptr;
+    });
 }
 
 template <typename Traits>
 template <typename T>
 T DeviceMemoryManager<Traits>::Read(DAddr address) const {
-    const T* ptr = GetPointer<T>(address);
-    T result{};
-    if (!ptr) [[unlikely]] {
-        return result;
-    }
-    std::memcpy(&result, ptr, sizeof(T));
-    return result;
+    return Common::ReadPagedScalar<T>(address, [&](DAddr page_address) {
+        return page_address < device_as_size ? GetPointer<u8>(page_address) : nullptr;
+    });
 }
 
 template <typename Traits>
@@ -413,7 +465,11 @@ void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto o
     std::size_t page_index = addr >> Memory::YUZU_PAGEBITS;
     std::size_t page_offset = addr & Memory::YUZU_PAGEMASK;
     while (remaining_size) {
-        const size_t next_pages = std::size_t(tracked_entries[page_index].continuity_tracker+1);
+        const auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
+        // An unmapped page says nothing about the pages after it: its run cannot be trusted, so
+        // only this page is handed to on_unmapped before the walk moves on.
+        const size_t next_pages =
+            phys_addr == 0 ? 1 : std::size_t(tracked_entries[page_index].continuity_tracker + 1);
         const std::size_t copy_amount = (std::min)((next_pages << Memory::YUZU_PAGEBITS) - page_offset, remaining_size);
         const auto current_vaddr = u64((page_index << Memory::YUZU_PAGEBITS) + page_offset);
         SCOPE_EXIT{
@@ -423,7 +479,6 @@ void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto o
             remaining_size -= copy_amount;
         };
 
-        auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
         if (phys_addr == 0) {
             on_unmapped(copy_amount, current_vaddr);
             continue;
@@ -434,7 +489,8 @@ void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto o
 }
 
 template <typename Traits>
-void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, size_t size) {
+void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, size_t size,
+                                            std::source_location caller) {
     device_inter->FlushRegion(address, size);
     const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
     if (size <= Memory::YUZU_PAGESIZE - page_offset) {
@@ -457,16 +513,15 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
             return;
         }
     }
+    DAddr first_unmapped = 0;
+    size_t unmapped_bytes = 0;
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
-            static std::atomic<u32> reported{};
-            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_ERROR(
-                    HW_Memory,
-                    "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {})",
-                    current_vaddr, address, size);
+            if (unmapped_bytes == 0) {
+                first_unmapped = current_vaddr;
             }
+            unmapped_bytes += copy_amount;
             std::memset(dest_pointer, 0, copy_amount);
         },
         [&](size_t copy_amount, const u8* const src_ptr) {
@@ -475,6 +530,9 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
         [&](const std::size_t copy_amount) {
             dest_pointer = static_cast<u8*>(dest_pointer) + copy_amount;
         });
+    if (unmapped_bytes != 0) {
+        ReportUnmappedRead(first_unmapped, address, size, unmapped_bytes, caller);
+    }
 }
 
 template <typename Traits>
@@ -491,7 +549,6 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
             }
         },
         [&](size_t copy_amount, u8* const dst_ptr) {
-            Core::HLE::DlssTrace::WriteWatch("DeviceMemoryManager::WriteBlock", dst_ptr, copy_amount);
             std::memcpy(dst_ptr, src_pointer, copy_amount);
         },
         [&](const std::size_t copy_amount) {
@@ -501,7 +558,8 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
 }
 
 template <typename Traits>
-void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size) {
+void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size,
+                                                  std::source_location caller) {
     const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
     if (size <= Memory::YUZU_PAGESIZE - page_offset) {
         const DAddr guest_page = address & ~static_cast<DAddr>(Memory::YUZU_PAGEMASK);
@@ -523,16 +581,15 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
             return;
         }
     }
+    DAddr first_unmapped = 0;
+    size_t unmapped_bytes = 0;
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
-            static std::atomic<u32> reported{};
-            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_ERROR(
-                    HW_Memory,
-                    "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {})",
-                    current_vaddr, address, size);
+            if (unmapped_bytes == 0) {
+                first_unmapped = current_vaddr;
             }
+            unmapped_bytes += copy_amount;
             std::memset(dest_pointer, 0, copy_amount);
         },
         [&](size_t copy_amount, const u8* const src_ptr) {
@@ -541,6 +598,9 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
         [&](const std::size_t copy_amount) {
             dest_pointer = static_cast<u8*>(dest_pointer) + copy_amount;
         });
+    if (unmapped_bytes != 0) {
+        ReportUnmappedRead(first_unmapped, address, size, unmapped_bytes, caller);
+    }
 }
 
 template <typename Traits>
@@ -558,7 +618,6 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
             }
         },
         [&](size_t copy_amount, u8* const dst_ptr) {
-            Core::HLE::DlssTrace::WriteWatch("DeviceMemoryManager::WriteBlock", dst_ptr, copy_amount);
             std::memcpy(dst_ptr, src_pointer, copy_amount);
         },
         [&](const std::size_t copy_amount) {
@@ -598,7 +657,8 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
     const size_t page_end = Common::DivCeil(addr + size, Memory::YUZU_PAGESIZE);
     size_t page = addr >> Memory::YUZU_PAGEBITS;
     auto [asid, base_vaddress] = ExtractCPUBacking(page);
-    auto* memory_device_inter = registered_processes[asid.id];
+    auto* memory_device_inter =
+        asid.id < registered_processes.size() ? registered_processes[asid.id] : nullptr;
     const auto release_pending = [&] {
         if (uncache_bytes > 0) {
             if (memory_device_inter != nullptr) {
@@ -628,7 +688,9 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
 
         if (asid.id != asid_2.id) [[unlikely]] {
             release_pending();
-            memory_device_inter = registered_processes[asid_2.id];
+            asid = asid_2;
+            memory_device_inter =
+                asid_2.id < registered_processes.size() ? registered_processes[asid_2.id] : nullptr;
         }
 
         if (vpage != old_vpage + 1) [[unlikely]] {
@@ -647,8 +709,10 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
             }
             uncache_bytes += Memory::YUZU_PAGESIZE;
         } else if (uncache_bytes > 0) {
-            MarkRegionCaching(memory_device_inter, uncache_begin << Memory::YUZU_PAGEBITS,
-                              uncache_bytes, false);
+            if (memory_device_inter != nullptr) {
+                MarkRegionCaching(memory_device_inter, uncache_begin << Memory::YUZU_PAGEBITS,
+                                  uncache_bytes, false);
+            }
             uncache_bytes = 0;
         }
         if (count.load(std::memory_order::relaxed) == 1 && delta > 0) {
@@ -657,8 +721,10 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
             }
             cache_bytes += Memory::YUZU_PAGESIZE;
         } else if (cache_bytes > 0) {
-            MarkRegionCaching(memory_device_inter, cache_begin << Memory::YUZU_PAGEBITS,
-                              cache_bytes, true);
+            if (memory_device_inter != nullptr) {
+                MarkRegionCaching(memory_device_inter, cache_begin << Memory::YUZU_PAGEBITS,
+                                  cache_bytes, true);
+            }
             cache_bytes = 0;
         }
     }
@@ -674,6 +740,22 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size
 template <typename Traits>
 void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta) {
     if (ranges.empty()) {
+        return;
+    }
+    // Runs already sorted with gaps between them (the buffer tracker's) are what the sort and
+    // merge below would produce: use them as they are instead of two heap copies.
+    const bool separated =
+        std::ranges::adjacent_find(ranges, [](const auto& a, const auto& b) {
+            return a.first > b.first || a.first + a.second >= b.first;
+        }) == ranges.end();
+    if (separated && !VideoCommon::Nx2Perf::Verify()) {
+        const DAddr lock_begin = ranges.front().first;
+        const DAddr lock_end = ranges.back().first + ranges.back().second;
+        Common::ScopedRangeLock lk(counter_guard, lock_begin,
+                                   static_cast<size_t>(lock_end - lock_begin));
+        for (const auto& [addr, size] : ranges) {
+            UpdatePagesCachedCountNoLock(addr, size, delta);
+        }
         return;
     }
     // Make a local copy and sort by address
@@ -698,6 +780,14 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
         }
     }
     coalesced.emplace_back(cur_addr, cur_size);
+    if (separated) {
+        static std::atomic<u32> logged{};
+        if (!std::ranges::equal(ranges, coalesced) &&
+            logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+            LOG_ERROR(HW_GPU, "Nx2Perf texture-writes: cached page runs from {:#x} merged differently",
+                      coalesced.front().first);
+        }
+    }
 
     const DAddr lock_begin = coalesced.front().first;
     const DAddr lock_end = coalesced.back().first + coalesced.back().second;
@@ -706,6 +796,38 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
     for (const auto& [addr, size] : coalesced) {
         UpdatePagesCachedCountNoLock(addr, size, delta);
     }
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
+    const auto MarkRegionReadTrap = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionReadTrap;
+    Memory::Memory* run_inter = nullptr;
+    u64 run_begin = 0;
+    u64 run_pages = 0;
+    const auto release_run = [&] {
+        if (run_pages > 0 && run_inter != nullptr) {
+            MarkRegionReadTrap(run_inter, run_begin << Memory::YUZU_PAGEBITS,
+                               run_pages << Memory::YUZU_PAGEBITS);
+        }
+        run_pages = 0;
+    };
+    const size_t page_end = Common::DivCeil(addr + size, Memory::YUZU_PAGESIZE);
+    for (size_t page = addr >> Memory::YUZU_PAGEBITS; page != page_end; ++page) {
+        auto [asid, vaddr] = ExtractCPUBacking(page);
+        const u64 vpage = vaddr >> Memory::YUZU_PAGEBITS;
+        if (vpage == 0) {
+            release_run();
+            continue;
+        }
+        auto* const inter = registered_processes[asid.id];
+        if (inter != run_inter || vpage != run_begin + run_pages) {
+            release_run();
+            run_inter = inter;
+            run_begin = vpage;
+        }
+        ++run_pages;
+    }
+    release_run();
 }
 
 } // namespace Core

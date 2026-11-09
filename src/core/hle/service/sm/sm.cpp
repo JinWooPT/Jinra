@@ -23,10 +23,11 @@
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
+#include "core/hle/service/nx2_streamplay.h"
+#include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/sm/sm_controller.h"
-#include "core/hle/service/switch2_stub_interface.h"
 
 namespace Service::SM {
 
@@ -180,8 +181,8 @@ static std::string PopServiceName(IPC::RequestParser& rp) {
 
 namespace {
 
-// A session served by a placeholder interface named after the missing service, set up like a
-// session handed out by a service.
+// A session served by a Switch 2 stub interface named after the missing service (see
+// nx2_stub_interface.h), set up like a session handed out by a service.
 Kernel::KClientSession* CreateStubSession(Core::System& system, HLERequestContext& ctx,
                                           const std::string& name) {
     auto& kernel = system.Kernel();
@@ -194,8 +195,12 @@ Kernel::KClientSession* CreateStubSession(Core::System& system, HLERequestContex
 
     auto manager =
         std::make_shared<SessionRequestManager>(kernel, ctx.GetManager()->GetServerManager());
-    manager->SetSessionHandler(std::make_shared<ISwitch2StubInterface>(
-        system, ISwitch2StubInterface::InternName(fmt::format("{}{}", Switch2StubPrefix, name))));
+    if (name == "stpl:u") {
+        manager->SetSessionHandler(std::make_shared<INx2StreamPlayService>(system));
+    } else {
+        manager->SetSessionHandler(std::make_shared<INx2StubInterface>(
+            system, INx2StubInterface::InternName(fmt::format("{}{}", Nx2StubPrefix, name))));
+    }
     ctx.GetManager()->GetServerManager().RegisterSession(&session->GetServerSession(), manager);
     return &session->GetClientSession();
 }
@@ -219,9 +224,10 @@ Result SM::GetServiceImpl(Kernel::KClientSession** out_client_session, HLEReques
     }
 
     if (port_result != ResultSuccess) {
-        // Switch 2 programs also ask for services Eden does not have at all. Nothing ever
-        // registers those, so waiting would hang them for good: hand out a placeholder whose
-        // commands all succeed. (Eden's own services register before a game starts.)
+        // Switch 2 programs also ask for services Eden does not have at all (newer Mario Kart
+        // World updates open chat:u, GameChat, while booting). Nothing ever registers those, so
+        // waiting would hang them for good: hand out a placeholder whose commands are all
+        // auto-stubbed, like their unknown commands on existing services.
         const auto* const caller = ctx.GetThread().GetOwnerProcess();
         if (caller != nullptr && caller->IsSwitch2()) {
             LOG_WARNING(Service_SM, "(STUBBED) Switch 2 service {} does not exist, returning a stub",

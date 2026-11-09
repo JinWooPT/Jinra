@@ -153,12 +153,20 @@ public:
      *                 Default false.
      */
     void Start(bool resume = false) override {
-        if (stream == nullptr || !paused) {
+        if (!IsReady() || !paused) {
             return;
         }
 
+        if (!SDL_ResumeAudioStreamDevice(stream)) {
+            failed = true;
+            LOG_CRITICAL(Audio_Sink, "Error starting SDL audio stream: {}", SDL_GetError());
+            return;
+        }
         paused = false;
-        static_cast<void>(SDL_ResumeAudioStreamDevice(stream));
+    }
+
+    bool IsReady() const override {
+        return stream != nullptr && !failed;
     }
 
     /**
@@ -169,7 +177,10 @@ public:
             return;
         }
         SignalPause();
-        static_cast<void>(SDL_PauseAudioStreamDevice(stream));
+        if (!SDL_PauseAudioStreamDevice(stream)) {
+            failed = true;
+            LOG_CRITICAL(Audio_Sink, "Error stopping SDL audio stream: {}", SDL_GetError());
+        }
     }
 
 private:
@@ -228,10 +239,12 @@ private:
     SDL_AudioStream* stream{};
 };
 
+/// Configure the selected device name for both playback and capture streams.
 SDLSink::SDLSink(std::string_view target_device_name) {
     if (InitializeAudio()) {
         if (target_device_name != auto_device_name && !target_device_name.empty()) {
             output_device = target_device_name;
+            input_device = target_device_name;
         } else {
             output_device.clear();
         }

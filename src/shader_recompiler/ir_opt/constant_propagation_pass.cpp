@@ -16,6 +16,7 @@
 #include "shader_recompiler/frontend/ir/modifiers.h"
 #include "shader_recompiler/frontend/ir/value.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "shader_recompiler/ir_opt/predicate_mask.h"
 
 namespace Shader::Optimization {
 namespace {
@@ -337,6 +338,29 @@ bool FoldXmadMultiply(IR::Block& block, IR::Inst& inst) {
     return true;
 }
 
+/// Replaces (BitFieldUExtract(a, 16, 16) << 16) + BitFieldUExtract(a, 0, 16) with a: what an XMAD
+/// multiplication by 1 leaves once its products by 0 and 1 are folded
+bool FoldHalvesRecombine(IR::Inst& inst) {
+    for (size_t arg = 0; arg < 2; ++arg) {
+        IR::Inst* const shl{inst.Arg(arg).TryInstRecursive()};
+        IR::Inst* const low{inst.Arg(1 - arg).TryInstRecursive()};
+        if (!shl || !low || shl->GetOpcode() != IR::Opcode::ShiftLeftLogical32 ||
+            shl->Arg(1) != IR::Value{16U} || low->GetOpcode() != IR::Opcode::BitFieldUExtract ||
+            low->Arg(1) != IR::Value{0U} || low->Arg(2) != IR::Value{16U}) {
+            continue;
+        }
+        IR::Inst* const high{shl->Arg(0).TryInstRecursive()};
+        if (!high || high->GetOpcode() != IR::Opcode::BitFieldUExtract ||
+            high->Arg(1) != IR::Value{16U} || high->Arg(2) != IR::Value{16U} ||
+            high->Arg(0).Resolve() != low->Arg(0).Resolve()) {
+            continue;
+        }
+        inst.ReplaceUsesWith(low->Arg(0));
+        return true;
+    }
+    return false;
+}
+
 template <typename T>
 void FoldAdd(IR::Block& block, IR::Inst& inst) {
     if (inst.HasAssociatedPseudoOperation()) {
@@ -351,10 +375,37 @@ void FoldAdd(IR::Block& block, IR::Inst& inst) {
         return;
     }
     if constexpr (std::is_same_v<T, u32>) {
+        if (FoldHalvesRecombine(inst)) {
+            return;
+        }
         if (FoldXmadMultiply(block, inst)) {
             return;
         }
         if (FoldXmadMultiplyAdd(block, inst)) {
+            return;
+        }
+    }
+}
+
+/// Folds products by 0 and 1. An XMAD multiplication by a 16-bit immediate leaves them behind (the
+/// cross term of the high halves), and Ocarina's IMAD.WIDE pointer + offset then hid the pointer
+/// from storage buffer tracking, which bound the offset word as the buffer instead.
+void FoldIMul32(IR::Inst& inst) {
+    if (FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a * b; })) {
+        return;
+    }
+    for (size_t arg = 0; arg < 2; ++arg) {
+        const IR::Value factor{inst.Arg(arg)};
+        if (!factor.IsImmediate()) {
+            continue;
+        }
+        if (factor.U32() == 0) {
+            inst.ReplaceUsesWith(IR::Value{0U});
+            return;
+        }
+        if (factor.U32() == 1) {
+            const IR::Value other{inst.Arg(1 - arg)};
+            inst.ReplaceUsesWith(other);
             return;
         }
     }
@@ -953,90 +1004,9 @@ void FoldDriverConstBuffer(Environment& env, IR::Block& block, IR::Inst& inst, u
     }
 }
 
-// Adapted from Eglantine da775258, 38230873 and da17ced5; origins in
-// docs/upstream-pokopia-fixes.md. Zero means unknown, not a proven empty set.
-constexpr u32 MaskMinusOne = 1U;
-constexpr u32 MaskZero = 2U;
-constexpr u32 MaskOne = 4U;
-constexpr u32 MaxMaskDepth = 8;
-constexpr u32 MaxMaskVisits = 256;
-
-bool IsMaskConstant(const IR::Value& value) {
-    return value.IsImmediate() && value.Type() == IR::Type::U32 &&
-           (value.U32() == 0xffffffffU || value.U32() == 0 || value.U32() == 1);
-}
-
-u32 MaskValues(const IR::Value& value, u32 depth, u32& visits_left) {
-    if (visits_left == 0) {
-        return 0;
-    }
-    --visits_left;
-    const IR::Value resolved{value.Resolve()};
-    if (resolved.Type() != IR::Type::U32) {
-        return 0;
-    }
-    if (resolved.IsImmediate()) {
-        switch (resolved.U32()) {
-        case 0xffffffffU:
-            return MaskMinusOne;
-        case 0:
-            return MaskZero;
-        case 1:
-            return MaskOne;
-        default:
-            return 0;
-        }
-    }
-    if (depth >= MaxMaskDepth) {
-        return 0;
-    }
-    const IR::Inst* const inst{resolved.TryInstRecursive()};
-    if (!inst) {
-        return 0;
-    }
-    switch (inst->GetOpcode()) {
-    case IR::Opcode::SelectU32: {
-        const u32 true_values{MaskValues(inst->Arg(1), depth + 1, visits_left)};
-        const u32 false_values{MaskValues(inst->Arg(2), depth + 1, visits_left)};
-        return true_values != 0 && false_values != 0 ? true_values | false_values : 0;
-    }
-    case IR::Opcode::INeg32: {
-        const u32 values{MaskValues(inst->Arg(0), depth + 1, visits_left)};
-        return (values & MaskZero) | ((values & MaskMinusOne) << 2) | ((values & MaskOne) >> 2);
-    }
-    case IR::Opcode::IAdd32:
-        for (size_t index = 0; index < 2; ++index) {
-            const IR::Value step{inst->Arg(1 - index).Resolve()};
-            if (!step.IsImmediate() || step.Type() != IR::Type::U32) {
-                continue;
-            }
-            const u32 values{MaskValues(inst->Arg(index), depth + 1, visits_left)};
-            if (step.U32() == 1 && (values & MaskOne) == 0) {
-                return values << 1;
-            }
-            if (step.U32() == 0xffffffffU && (values & MaskMinusOne) == 0) {
-                return values >> 1;
-            }
-            return 0;
-        }
-        return 0;
-    case IR::Opcode::Phi: {
-        u32 values{};
-        for (size_t index = 0; index < inst->NumArgs(); ++index) {
-            const u32 incoming{MaskValues(inst->Arg(index), depth + 1, visits_left)};
-            if (incoming == 0) {
-                return 0;
-            }
-            values |= incoming;
-        }
-        return values;
-    }
-    default:
-        return 0;
-    }
-}
-
 void FoldSMax32(IR::Block& block, IR::Inst& inst) {
+    // guest shaders normalize predicate masks with max(x, -x): it is 1 for -1 and 1, and 0 for
+    // 0. NVIDIA's compiler miscompiles the max form which crashes with a vkDeviceLost
     for (size_t index = 0; index < 2; ++index) {
         const IR::Value value{inst.Arg(index).Resolve()};
         const IR::Inst* const negation{inst.Arg(1 - index).TryInstRecursive()};
@@ -1047,21 +1017,24 @@ void FoldSMax32(IR::Block& block, IR::Inst& inst) {
         IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
         const IR::Inst* const select{value.TryInstRecursive()};
         if (select && select->GetOpcode() == IR::Opcode::SelectU32 &&
-            IsMaskConstant(select->Arg(1).Resolve()) && IsMaskConstant(select->Arg(2).Resolve())) {
+            IsMaskConstant(select->Arg(1).Resolve()) &&
+            IsMaskConstant(select->Arg(2).Resolve())) {
+            // absolute value on both arms
+            const IR::Value true_value{select->Arg(1).Resolve()};
+            const IR::Value false_value{select->Arg(2).Resolve()};
             inst.ReplaceUsesWith(ir.Select(IR::U1{select->Arg(0)},
-                                           ir.Imm32(select->Arg(1).Resolve().U32() != 0 ? 1U : 0U),
-                                           ir.Imm32(select->Arg(2).Resolve().U32() != 0 ? 1U : 0U)));
+                                           ir.Imm32(true_value.U32() != 0 ? 1U : 0U),
+                                           ir.Imm32(false_value.U32() != 0 ? 1U : 0U)));
             return;
         }
-        u32 visits_left{MaxMaskVisits};
-        if (MaskValues(value, 0, visits_left) != 0) {
-            // Exact only for {-1,0,1}; leave all unproved integers in their original form.
+        // mask merged by predicated moves (phi of -s and 1 - s) is still -1, 0 or 1 when the
+        // it can be proven it, and max(x, -x) of such a mask is exactly x & 1.
+        if (MaskValues(value) != MaskUnknown) {
             inst.ReplaceUsesWith(ir.BitwiseAnd(IR::U32{value}, ir.Imm32(1)));
             return;
         }
     }
 }
-
 void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
     switch (inst.GetOpcode()) {
     case IR::Opcode::GetRegister:
@@ -1075,8 +1048,7 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
     case IR::Opcode::SMax32:
         return FoldSMax32(block, inst);
     case IR::Opcode::IMul32:
-        FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a * b; });
-        return;
+        return FoldIMul32(inst);
     case IR::Opcode::ShiftRightArithmetic32:
         FoldWhenAllImmediates(inst, [](s32 a, s32 b) { return static_cast<u32>(a >> b); });
         return;

@@ -3,6 +3,7 @@
 
 #include <cstring>
 
+#include "common/logging.h"
 #include "common/zbic_compression.h"
 
 #define ZSTD_ZBIC_SUPPORT 1
@@ -17,16 +18,9 @@
 #endif
 
 #include "zstd.h"
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4505)
-#endif
 #define g_ZSTD_threading_useless_symbol g_ZSTD_zbic_threading_useless_symbol
 #include "zstd.c"
 #undef g_ZSTD_threading_useless_symbol
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
 
 namespace Common::Compression {
 
@@ -45,6 +39,8 @@ int DecompressDataZBIC(std::span<u8> dst, std::span<const u8> src) {
     }
     const size_t res = ZSTD_decompress(dst.data(), dst.size(), src.data(), src.size());
     if (ZSTD_isError(res)) {
+        LOG_ERROR(Loader, "ZBIC decompression of {} bytes into {} bytes failed: {}", src.size(),
+                  dst.size(), ZSTD_getErrorName(res));
         return -1;
     }
     return static_cast<int>(res);

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <optional>
 #include <vector>
@@ -14,7 +15,6 @@
 #include "common/common_funcs.h"
 #include "common/common_types.h"
 #include "video_core/engines/engine_interface.h"
-#include "video_core/native_semaphore.h"
 
 namespace Core {
 class System;
@@ -25,9 +25,6 @@ class MemoryManager;
 class DmaPusher;
 
 enum class EngineID {
-    AMPERE_B = 0xc797,
-    AMPERE_COMPUTE_B = 0xc7c0,
-    AMPERE_DMA_COPY_B = 0xc7b5,
     NV01_TIMER = 0x0004,
     FERMI_TWOD_A = 0x902D, // 2D Engine
     MAXWELL_B = 0xB197,    // 3D Engine
@@ -75,9 +72,23 @@ public:
         BitField<8, 24, u32> syncpoint_id;
     };
 
-    [[nodiscard]] bool HasPendingNativeAcquire() const { return native_acquire.has_value(); }
-    [[nodiscard]] bool CanResumeNativeAcquire(DmaPusher& dma_pusher) const;
-    bool ResumeNativeAcquire(DmaPusher& dma_pusher);
+    /// Switch 2: a semaphore acquire this channel is suspended on.
+    struct PendingAcquire {
+        GPUVAddr address;
+        u32 value;
+        u32 operation;
+        std::chrono::steady_clock::time_point since;
+        bool reported;
+
+        [[nodiscard]] bool Matches(u32 current) const;
+    };
+
+    [[nodiscard]] bool HasPendingAcquire() const {
+        return pending_acquire.has_value();
+    }
+    [[nodiscard]] bool CanResumeAcquire(DmaPusher& dma_pusher);
+    /// Clears the pending acquire once it is met; false while the channel has to keep waiting.
+    bool ResumeAcquire(DmaPusher& dma_pusher);
 
     void CallMethod(DmaPusher& dma_pusher, const MethodCall& method_call);
     void CallMultiMethod(DmaPusher& dma_pusher, u32 method, u32 subchannel, const u32* base_start, u32 amount, u32 methods_pending);
@@ -134,9 +145,10 @@ private:
     void ProcessSemaphoreAcquire(DmaPusher& dma_pusher);
     void ProcessSemaphoreRelease(DmaPusher& dma_pusher);
     void ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher);
+    void ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument);
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
-    std::optional<NativeSemaphoreWait> native_acquire;
+    std::optional<PendingAcquire> pending_acquire;
 
     /// Mapping of command subchannels to their bound engine ids
     std::array<EngineID, 8> bound_engines{};

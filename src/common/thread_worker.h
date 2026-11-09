@@ -7,14 +7,15 @@
 #pragma once
 
 #include <atomic>
+#include <algorithm>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
-#include <queue>
 
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
@@ -70,8 +71,8 @@ public:
                         if (stop_token.stop_requested()) {
                             break;
                         }
-                        task = std::move(requests.front());
-                        requests.pop();
+                        task = std::move(requests.front().task);
+                        requests.pop_front();
                     }
                     if constexpr (with_state) {
                         task(&state);
@@ -81,7 +82,10 @@ public:
                     ++work_done;
                 }
             }
-            ++workers_stopped;
+            {
+                std::scoped_lock lock{queue_mutex};
+                ++workers_stopped;
+            }
             wait_condition.notify_all();
         };
         threads.reserve(num_workers);
@@ -96,13 +100,40 @@ public:
     StatefulThreadWorker& operator=(StatefulThreadWorker&&) = delete;
     StatefulThreadWorker(StatefulThreadWorker&&) = delete;
 
-    void QueueWork(Task work) {
+    size_t QueueWork(Task work) {
+        size_t ticket;
         {
             std::unique_lock lock{queue_mutex};
-            requests.emplace(std::move(work));
-            ++work_scheduled;
+            ticket = Enqueue(std::move(work));
         }
         condition.notify_one();
+        return ticket;
+    }
+
+    bool PrioritizeWork(size_t ticket) {
+        std::scoped_lock lock{queue_mutex};
+        const auto first_normal = std::find_if(requests.begin(), requests.end(),
+                                               [](const auto& entry) { return !entry.priority; });
+        const auto found = std::find_if(first_normal, requests.end(),
+                                        [ticket](const auto& entry) { return entry.ticket == ticket; });
+        if (found == requests.end()) {
+            return false;
+        }
+        found->priority = true;
+        std::rotate(first_normal, found, found + 1);
+        return found != first_normal;
+    }
+
+    bool TryQueueWork(Task work) {
+        {
+            std::unique_lock lock{queue_mutex};
+            if (work_scheduled - work_done >= workers_queued) {
+                return false;
+            }
+            Enqueue(std::move(work));
+        }
+        condition.notify_one();
+        return true;
     }
 
     void WaitForRequests(std::stop_token stop_token = {}) {
@@ -118,7 +149,19 @@ public:
     }
 
 private:
-    std::queue<Task> requests;
+    size_t Enqueue(Task work) {
+        const size_t ticket = work_scheduled.load(std::memory_order_relaxed) + 1;
+        requests.emplace_back(ticket, std::move(work));
+        work_scheduled.store(ticket, std::memory_order_relaxed);
+        return ticket;
+    }
+
+    struct QueuedTask {
+        size_t ticket;
+        Task task;
+        bool priority{};
+    };
+    std::deque<QueuedTask> requests;
     std::mutex queue_mutex;
     std::condition_variable_any condition;
     std::condition_variable wait_condition;

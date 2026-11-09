@@ -61,7 +61,7 @@ private:
     Result SignalAndIncrementIfEqual(uint64_t addr, s32 value, s32 count);
     Result SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 value, s32 count);
     Result WaitIfLessThan(uint64_t addr, s32 value, bool decrement, s64 timeout);
-    Result WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool compare_64_bits);
+    Result WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool is_64_bit);
 
 private:
     ThreadTree m_tree;

@@ -13,6 +13,7 @@
 #include <QProgressDialog>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QTimer>
 #include "yuzu/jinra_build_version.h"
 #include "yuzu/updater/jinra_updater.h"
 
@@ -35,6 +36,26 @@ struct DownloadState {
     qint64 bytes{};
     bool valid{true};
 };
+
+constexpr int download_attempts = 3;
+
+bool IsTransientDownloadError(const QNetworkReply& reply) {
+    const int status = reply.attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    if (status == 429 || (status >= 500 && status <= 599)) {
+        return true;
+    }
+    switch (reply.error()) {
+    case QNetworkReply::ConnectionRefusedError:
+    case QNetworkReply::RemoteHostClosedError:
+    case QNetworkReply::HostNotFoundError:
+    case QNetworkReply::TimeoutError:
+    case QNetworkReply::TemporaryNetworkFailureError:
+    case QNetworkReply::NetworkSessionFailedError:
+        return true;
+    default:
+        return false;
+    }
+}
 } // namespace
 
 JinraUpdater::JinraUpdater(QWidget* parent, QAction* action_, std::function<bool()> can_install_,
@@ -58,7 +79,7 @@ void JinraUpdater::Check(bool manual) {
                                  tr("Installer updates are currently available for Windows only."));
     return;
 #endif
-    if (active)
+    if (active || download_progress)
         return;
     action->setEnabled(false);
     auto* reply = network.get(Request(
@@ -88,7 +109,7 @@ void JinraUpdater::Check(bool manual) {
         const auto current = Jinra::VersionNumber::Parse(Jinra::CurrentVersion);
         if (!current)
             return;
-        const auto release = Jinra::FindUpdate(json.array(), *current);
+        const auto release = Jinra::FindUpdate(json.array(), *current, Jinra::PgoBuild);
         if (release) {
             action->setText(tr("Check for updates... (update available)"));
             if (manual || can_install())
@@ -119,7 +140,7 @@ void JinraUpdater::Offer(const Jinra::UpdateRelease& release) {
 }
 
 void JinraUpdater::Download(const Jinra::UpdateRelease& release) {
-    if (active || !can_install())
+    if (active || download_progress || !can_install())
         return;
     const QString directory = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) +
                               QStringLiteral("/jinra-updates");
@@ -128,9 +149,40 @@ void JinraUpdater::Download(const Jinra::UpdateRelease& release) {
                              tr("Could not create the download folder."));
         return;
     }
-    const QString filename = directory + QLatin1Char('/') + release.filename;
+    auto* progress =
+        new QProgressDialog(tr("Downloading Jinra update..."), tr("Cancel"), 0, 1000, window);
+    download_progress = progress;
+    progress->setWindowModality(Qt::WindowModal);
+    progress->setMinimumDuration(0);
+    progress->setAutoClose(false);
+    progress->setAutoReset(false);
+    connect(progress, &QProgressDialog::canceled, this, [this] {
+        if (active) {
+            active->abort();
+        }
+    });
+    action->setEnabled(false);
+    progress->show();
+    DownloadAttempt(release, directory + QLatin1Char('/') + release.filename, 1);
+}
+
+void JinraUpdater::FinishDownload() {
+    download_progress->close();
+    download_progress->deleteLater();
+    download_progress.clear();
+    action->setEnabled(true);
+}
+
+void JinraUpdater::DownloadAttempt(const Jinra::UpdateRelease& release, const QString& filename,
+                                   int attempt) {
+    auto* progress = download_progress.data();
+    if (progress->wasCanceled() || !can_install()) {
+        FinishDownload();
+        return;
+    }
     auto state = std::make_shared<DownloadState>(filename);
     if (!state->file.open(QIODevice::WriteOnly)) {
+        FinishDownload();
         QMessageBox::warning(window, tr("Jinra updates"), tr("Could not save the installer."));
         return;
     }
@@ -138,15 +190,6 @@ void JinraUpdater::Download(const Jinra::UpdateRelease& release) {
     request.setRawHeader("Accept", "application/octet-stream");
     auto* reply = network.get(request);
     active = reply;
-    action->setEnabled(false);
-    auto* progress =
-        new QProgressDialog(tr("Downloading Jinra update..."), tr("Cancel"), 0, 1000, window);
-    progress->setWindowModality(Qt::WindowModal);
-    progress->setMinimumDuration(0);
-    progress->setAutoClose(false);
-    progress->setAutoReset(false);
-    progress->show();
-    connect(progress, &QProgressDialog::canceled, reply, &QNetworkReply::abort);
     connect(reply, &QNetworkReply::downloadProgress, progress,
             [progress, release](qint64 received, qint64) {
                 progress->setValue(static_cast<int>(std::clamp<qint64>(received, 0, release.size) *
@@ -154,12 +197,15 @@ void JinraUpdater::Download(const Jinra::UpdateRelease& release) {
             });
     const auto consume = [reply, state, release] {
         const auto chunk = reply->readAll();
-        if (chunk.isEmpty())
+        if (chunk.isEmpty() ||
+            reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200)
             return;
         if (chunk.size() > release.size - state->bytes ||
             state->file.write(chunk) != chunk.size()) {
             state->valid = false;
-            reply->abort();
+            if (reply->isRunning()) {
+                reply->abort();
+            }
             return;
         }
         state->bytes += chunk.size();
@@ -168,17 +214,26 @@ void JinraUpdater::Download(const Jinra::UpdateRelease& release) {
     connect(reply, &QNetworkReply::readyRead, this, consume);
     connect(
         reply, &QNetworkReply::finished, this,
-        [this, reply, progress, state, release, filename, consume] {
+        [this, reply, progress, state, release, filename, consume, attempt] {
             consume();
-            const bool canceled = progress->wasCanceled();
-            disconnect(progress, &QProgressDialog::canceled, reply, &QNetworkReply::abort);
-            progress->close();
-            progress->deleteLater();
             active = nullptr;
-            action->setEnabled(true);
             reply->deleteLater();
-            if (canceled)
+            if (progress->wasCanceled()) {
+                FinishDownload();
                 return;
+            }
+            if (state->valid && attempt < download_attempts && IsTransientDownloadError(*reply)) {
+                state->file.cancelWriting();
+                progress->setLabelText(tr("Retrying download (%1 of %2)...")
+                                           .arg(attempt + 1)
+                                           .arg(download_attempts));
+                progress->setValue(0);
+                QTimer::singleShot(1000 * attempt, this, [this, release, filename, attempt] {
+                    DownloadAttempt(release, filename, attempt + 1);
+                });
+                return;
+            }
+            FinishDownload();
             if (!state->valid || reply->error() != QNetworkReply::NoError ||
                 reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200 ||
                 state->bytes != release.size || state->hash.result() != release.sha256 ||

@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "video_core/native_diagnostics.h"
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -26,16 +25,16 @@ inline State& GetState() {
 } // namespace NativeQueryDiagnostics
 
 // Events: 0=request, 1=written, 2=invalidated, 3=unsynchronized,
-// 4=channel suspended, 5=channel resumed (type=current, flags=operation | channel<<8),
-// 6=buffer readback,
+// 4=channel suspended, 5=channel resumed, 6=buffer readback,
 // 7/8=QMD release slots observed, 9=PCAS request,
 // 10=DMA destination (value=source, flags=line bytes), 11=inline write.
 // Keep this opt-in and bounded.
 inline void TraceNativeQuery(u32 event, u64 asid, u64 gpu, u64 cpu, u32 type, u64 value, u32 flags) {
-    if (!NativeDrawDiagnosticsEnabled()) return;
+    static const bool diagnostics = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
+    if (!diagnostics) return;
     auto& state = NativeQueryDiagnostics::GetState();
     const std::scoped_lock lock{state.mutex};
-    if (state.records++ < 10000000 || event == 4 || event == 5) {
+    if (state.records++ < 1000000 || event == 4 || event == 5) {
         state.file << event << ',' << asid << ',' << std::hex << gpu << ',' << cpu << ','
                    << type << ',' << value << ',' << flags << std::dec << '\n';
     }

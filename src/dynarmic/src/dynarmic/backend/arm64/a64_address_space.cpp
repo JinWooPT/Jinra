@@ -8,6 +8,10 @@
 
 #include "dynarmic/backend/arm64/a64_address_space.h"
 
+#include <bit>
+#include <cstdio>
+#include <cstdlib>
+
 #include "dynarmic/backend/arm64/a64_jitstate.h"
 #include "dynarmic/backend/arm64/abi.h"
 #include "dynarmic/backend/arm64/devirtualize.h"
@@ -367,11 +371,7 @@ A64AddressSpace::A64AddressSpace(const A64::UserConfig& conf)
 void A64AddressSpace::GenerateIR(IR::Block& ir_block, IR::LocationDescriptor descriptor) const {
     ir_block.Reset(descriptor);
     const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
-    A64::Translate(ir_block, A64::LocationDescriptor{descriptor}, get_code,
-                   {.define_unpredictable_behaviour = conf.define_unpredictable_behaviour,
-                    .wall_clock_cntpct = conf.wall_clock_cntpct,
-                    .enable_pauth_returns = conf.enable_pauth_returns,
-                    .address_space_bits = conf.page_table_address_space_bits});
+    A64::Translate(ir_block, A64::LocationDescriptor{descriptor}, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
     Optimization::Optimize(ir_block, conf, {});
 }
 
@@ -618,9 +618,23 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
     };
 }
 
-void A64AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo&) {
+void A64AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) {
     const A64::LocationDescriptor descriptor{block.Location()};
     const A64::LocationDescriptor end_location{block.EndLocation()};
+    static std::FILE* const block_map = [] {
+        const char* path = std::getenv("DYNARMIC_BLOCK_MAP");
+        std::FILE* file = path != nullptr ? std::fopen(path, "w") : nullptr;
+        if (file != nullptr) {
+            std::setvbuf(file, nullptr, _IOLBF, 0);
+        }
+        return file;
+    }();
+    if (block_map != nullptr) {
+        std::fprintf(block_map, "%llx %zx %llx %llx\n",
+                     static_cast<unsigned long long>(std::bit_cast<u64>(block_info.entry_point)),
+                     block_info.size, static_cast<unsigned long long>(descriptor.PC()),
+                     static_cast<unsigned long long>(end_location.PC()));
+    }
     const auto range = boost::icl::discrete_interval<u64>::closed(descriptor.PC(), end_location.PC() - 1);
     block_ranges.AddRange(range, descriptor);
 }

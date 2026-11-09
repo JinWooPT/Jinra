@@ -7,12 +7,15 @@
 
 #include <atomic>
 #include <algorithm>
-#include <cstdlib>
+#include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
+#include <set>
 #include <span>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "common/assert.h"
@@ -25,16 +28,13 @@
 #include "common/settings.h"
 #include "common/swap.h"
 #include "core/core.h"
-#include "core/arm/arm_interface.h"
 #include "core/device_memory.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hardware_properties.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
-#include "core/hle/dlss_trace.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
-#include "video_core/native_readback_epoch.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/rasterizer_download_area.h"
@@ -168,6 +168,24 @@ struct Memory::Impl {
             const u32 b{Read16(addr + sizeof(u16))};
             return (b << 16) | a;
         }
+    }
+
+    bool Read32Acquire(const Common::ProcessAddress addr, u32& value) {
+        value = 0;
+        if (!current_page_table || (addr & 3) != 0) {
+            return false;
+        }
+        auto* pointer = GetPointerImpl(GetInteger(addr), [] {}, [&] {
+            HandleRasterizerDownload(GetInteger(addr), sizeof(u32));
+        });
+        if (!pointer) {
+            return false;
+        }
+        u32_le actual{};
+        static_cast<void>(Common::AtomicCompareAndSwap(reinterpret_cast<u32_le*>(pointer),
+                                                     u32_le{0}, u32_le{0}, actual));
+        value = actual;
+        return true;
     }
 
     u64 Read64(const Common::ProcessAddress addr) {
@@ -309,10 +327,28 @@ struct Memory::Impl {
     }
 
     [[nodiscard]] inline const u8* GetSpan(const VAddr addr, const std::size_t size) const noexcept {
-        return (current_page_table->entries[addr >> YUZU_PAGEBITS].Block() == current_page_table->entries[(addr + size) >> YUZU_PAGEBITS].Block()) ? GetPointerSilent(addr) : nullptr;
+        const auto first = current_page_table->entries[addr >> YUZU_PAGEBITS].Block();
+        const auto last = current_page_table->entries[(addr + size) >> YUZU_PAGEBITS].Block();
+        if (Common::PageTable::PageEntryData::CanFastSpan(first, last)) {
+            return GetPointerSilent(addr);
+        }
+        if (first != Common::PageTable::PageEntryData::INVALID_BLOCK_ID &&
+            last != Common::PageTable::PageEntryData::INVALID_BLOCK_ID) {
+            return nullptr;
+        }
+        return GetContiguousSpan(addr, size);
     }
     [[nodiscard]] inline u8* GetSpan(const VAddr addr, const std::size_t size) noexcept {
-        return (current_page_table->entries[addr >> YUZU_PAGEBITS].Block() == current_page_table->entries[(addr + size) >> YUZU_PAGEBITS].Block()) ? GetPointerSilent(addr) : nullptr;
+        const auto first = current_page_table->entries[addr >> YUZU_PAGEBITS].Block();
+        const auto last = current_page_table->entries[(addr + size) >> YUZU_PAGEBITS].Block();
+        if (Common::PageTable::PageEntryData::CanFastSpan(first, last)) {
+            return GetPointerSilent(addr);
+        }
+        if (first != Common::PageTable::PageEntryData::INVALID_BLOCK_ID &&
+            last != Common::PageTable::PageEntryData::INVALID_BLOCK_ID) {
+            return nullptr;
+        }
+        return GetContiguousSpan(addr, size);
     }
 
     bool WriteBlockImpl(const Common::ProcessAddress addr, const void* buffer, const std::size_t size, bool unsafe) {
@@ -321,14 +357,12 @@ struct Memory::Impl {
             LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})", GetInteger(current_vaddr), GetInteger(addr), size);
         },
         [&](const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            Core::HLE::DlssTrace::WriteWatch("Memory::WriteBlock(plain)", ptr, copy_amount);
             std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
             if (!unsafe) {
                 HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
             }
-            Core::HLE::DlssTrace::WriteWatch(unsafe ? "Memory::WriteBlockUnsafe" : "Memory::WriteBlock", ptr, copy_amount);
             std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
         });
     }
@@ -339,12 +373,10 @@ struct Memory::Impl {
             LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})", GetInteger(current_vaddr), GetInteger(addr), size);
         },
         [=](const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            Core::HLE::DlssTrace::WriteWatch("Memory::ZeroBlock", ptr, copy_amount);
             std::memset(ptr, 0, copy_amount);
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
             HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
-            Core::HLE::DlssTrace::WriteWatch("Memory::ZeroBlock", ptr, copy_amount);
             std::memset(ptr, 0, copy_amount);
         });
     }
@@ -469,13 +501,25 @@ struct Memory::Impl {
 
         if (current_page_table->fastmem_arena) {
             Common::MemoryPermission perm{};
-            if (!Settings::values.use_reactive_flushing.GetValue() || !cached) {
+            // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
+            // them a CPU read of GPU-written memory can see stale data.
+            static const bool nx2_no_reactive = [] {
+                const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
+                return value != nullptr && value[0] == '1';
+            }();
+            const bool reactive_flushing =
+                Settings::values.use_reactive_flushing.GetValue() &&
+                !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
+            if (!reactive_flushing || !cached) {
                 perm |= Common::MemoryPermission::Read;
             }
             if (!cached) {
                 perm |= Common::MemoryPermission::Write;
             }
             host_buffer->Protect(vaddr, size, perm);
+            if (cached && perm != Common::MemoryPermission{}) {
+                ProtectArmedPages(vaddr, size);
+            }
         }
 
         // Iterate over a contiguous CPU address space, which corresponds to the specified GPU
@@ -536,6 +580,96 @@ struct Memory::Impl {
         }
     }
 
+    /// Read traps replace reactive flushing's blanket read protection of every cached page: only
+    /// pages the GPU writes are protected, and each one only until its first read
+    /// (EDEN_NX2_READ_TRAPS=0 turns them off). Under NCE every fault is taken as a write, so they
+    /// are not used there.
+    bool ReadTrapsEnabled() const {
+        static const bool disabled = [] {
+            const char* value = std::getenv("EDEN_NX2_READ_TRAPS");
+            return value != nullptr && value[0] == '0';
+        }();
+        return !disabled && current_page_table->fastmem_arena &&
+               !Settings::values.use_reactive_flushing.GetValue() &&
+               Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
+    }
+
+    void RasterizerArmReadTraps(u64 vaddr, u64 size) {
+        // Clean cached read areas also need invalidation when reactive flushing is enabled.
+        read_trap_generation.fetch_add(1, std::memory_order_release);
+        if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size) ||
+            !ReadTrapsEnabled()) {
+            return;
+        }
+        const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
+        std::scoped_lock lk{read_trap_mutex};
+        u64 run_begin = 0;
+        u64 run_pages = 0;
+        const auto protect_run = [&] {
+            if (run_pages > 0) {
+                // Reads that hit a cached read area must not skip the flush of a new trap.
+                read_trap_generation.fetch_add(1, std::memory_order_release);
+                host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+                                     Common::MemoryPermission{});
+                run_pages = 0;
+            }
+        };
+        for (u64 page = vaddr >> YUZU_PAGEBITS; page != page_end; ++page) {
+            const bool cached = std::as_const(current_page_table->entries)[page].Type() ==
+                                Common::PageType::RasterizerCachedMemory;
+            armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
+            if (!cached || !armed_read_traps.insert(page).second) {
+                armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
+                protect_run();
+                continue;
+            }
+            if (run_pages == 0) {
+                run_begin = page;
+            }
+            ++run_pages;
+        }
+        protect_run();
+    }
+
+    bool ReadTrapArmed(u64 vaddr, u64 size) {
+        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
+            return false;
+        }
+        std::scoped_lock lk{read_trap_mutex};
+        const auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
+        return it != armed_read_traps.end() && *it <= ((vaddr + size - 1) >> YUZU_PAGEBITS);
+    }
+
+    /// Takes read permission away again from armed pages that were just cached again.
+    void ProtectArmedPages(u64 vaddr, u64 size) {
+        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
+            return;
+        }
+        std::scoped_lock lk{read_trap_mutex};
+        const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
+        for (auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
+             it != armed_read_traps.end() && *it < page_end; ++it) {
+            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
+        }
+    }
+
+    /// A slow-path read of a cached page: its trap, if any, has done its job.
+    void DisarmReadTraps(u64 vaddr, size_t size) {
+        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
+            return;
+        }
+        std::scoped_lock lk{read_trap_mutex};
+        const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
+        auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
+        while (it != armed_read_traps.end() && *it < page_end) {
+            // Still cached (this read came through the rasterizer path): writes stay trapped.
+            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
+                                 Common::MemoryPermission::Read);
+            it = armed_read_traps.erase(it);
+            armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
     /**
      * Maps a region of pages as a specific type.
      *
@@ -561,8 +695,19 @@ struct Memory::Impl {
 
             page_table.entries.ZeroRegion(base, end);
         } else {
-            auto current_block = block_count.fetch_add(1, std::memory_order_relaxed);
-            ASSERT(current_block != 65535);
+            u64 mapping_id = block_count.load(std::memory_order_relaxed);
+            constexpr u64 exhausted_count =
+                u64{Common::PageTable::PageEntryData::INVALID_BLOCK_ID} + 1;
+            while (mapping_id < exhausted_count &&
+                   !block_count.compare_exchange_weak(mapping_id, mapping_id + 1,
+                                                      std::memory_order_relaxed)) {
+            }
+            const u16 current_block =
+                Common::PageTable::PageEntryData::BlockIdForMapping(mapping_id);
+            if (mapping_id == Common::PageTable::PageEntryData::INVALID_BLOCK_ID) {
+                LOG_WARNING(HW_Memory,
+                            "Page table block ids are exhausted; validating spans page by page");
+            }
 
             page_table.entries.CommitRegion(base, end);
             while (base != end) {
@@ -615,85 +760,6 @@ struct Memory::Impl {
         }
     }
 
-    /// Diagnostic only: EDEN_DUMP_NULL_FAULT=1 (with EDEN_LOG_UNMAPPED_PC=1) dumps the registers and the
-    /// memory around the objects they point to on a null-page access, to identify the object involved.
-    void DumpNullFaultObjects(const Kernel::Svc::ThreadContext& ctx) const {
-        static const bool enabled = [] {
-            const char* v = std::getenv("EDEN_DUMP_NULL_FAULT");
-            return v && *v == '1';
-        }();
-        if (!enabled) {
-            return;
-        }
-        const auto read64 = [this](u64 a, bool& mapped) {
-            u64 v{};
-            const u8* ptr = GetPointerSilent(a);
-            mapped = ptr != nullptr;
-            if (ptr) std::memcpy(&v, ptr, sizeof(v));
-            return v;
-        };
-        const auto dump = [&](const char* tag, u64 start, u64 size) {
-            for (u64 off = 0; off < size; off += 0x20) {
-                bool m0{}, m1{}, m2{}, m3{};
-                const u64 a = read64(start + off, m0), b = read64(start + off + 8, m1),
-                          c = read64(start + off + 16, m2), d = read64(start + off + 24, m3);
-                if (!m0) break;
-                LOG_ERROR(HW_Memory, "NullFault {}[{:#x}] {:016x} {:016x} {:016x} {:016x}", tag, start + off, a, b, c, d);
-            }
-        };
-        for (const size_t reg : {size_t{0}, size_t{1}, size_t{19}, size_t{20}, size_t{21}, size_t{22},
-                                 size_t{23}, size_t{24}, size_t{25}, size_t{26}, size_t{27}, size_t{28}}) {
-            const u64 base = ctx.r[reg];
-            LOG_ERROR(HW_Memory, "NullFault x{}={:#x}", reg, base);
-            if (base < 0x100000) continue;
-            if (reg == 1) dump("  ", base - 0x100, 0x300);
-            else dump("  ", base, 0xa0);
-        }
-        dump("stack", ctx.sp, 0x200);
-    }
-
-    /// Diagnostic only: EDEN_LOG_UNMAPPED_PC=1 appends the guest PC/LR and frame chain of the
-    /// faulting core to unmapped access errors.
-    void LogUnmappedGuestPC(u64 addr) const {
-        static const bool enabled = [] {
-            const char* v = std::getenv("EDEN_LOG_UNMAPPED_PC");
-            return v && *v == '1';
-        }();
-        if (!enabled) {
-            return;
-        }
-        auto* process = system.ApplicationProcess();
-        const size_t core = system.GetCurrentHostThreadID();
-        if (process == nullptr || core >= Core::Hardware::NUM_CPU_CORES) {
-            return;
-        }
-        auto* interface = process->GetArmInterface(core);
-        if (interface == nullptr) {
-            return;
-        }
-        Kernel::Svc::ThreadContext ctx{};
-        interface->GetContext(ctx);
-        LOG_ERROR(HW_Memory, "Unmapped access @ {:#x} from guest core={} pc={:#x} lr={:#x} sp={:#x}", addr,
-                  core, ctx.pc, ctx.lr, ctx.sp);
-        if (addr < 0x1000) {
-            DumpNullFaultObjects(ctx);
-        }
-        u64 fp = ctx.fp;
-        for (int depth = 0; depth < 12 && fp != 0; ++depth) {
-            const u8* frame = GetPointerSilent(fp);
-            const u8* frame_lr = GetPointerSilent(fp + 8);
-            if (frame == nullptr || frame_lr == nullptr) {
-                break;
-            }
-            u64 next_fp{};
-            u64 return_address{};
-            std::memcpy(&next_fp, frame, sizeof(next_fp));
-            std::memcpy(&return_address, frame_lr, sizeof(return_address));
-            LOG_ERROR(HW_Memory, "  frame {}: lr={:#x}", depth, return_address);
-            fp = next_fp;
-        }
-    }
-
     [[nodiscard]] u8* GetPointer(const Common::ProcessAddress vaddr) const {
         return GetPointerImpl(
             GetInteger(vaddr),
@@ -708,6 +774,24 @@ struct Memory::Impl {
             GetInteger(vaddr), []() {}, []() {});
     }
 
+    [[nodiscard]] u8* GetContiguousSpan(VAddr addr, std::size_t size) const noexcept {
+        u8* const base = GetPointerSilent(addr);
+        if (base == nullptr) {
+            return nullptr;
+        }
+
+        const VAddr end = addr + size;
+        const VAddr first_page = ((addr >> YUZU_PAGEBITS) + 1) << YUZU_PAGEBITS;
+        const std::uintptr_t base_ptr = reinterpret_cast<std::uintptr_t>(base);
+        for (VAddr page = first_page; page < end; page += YUZU_PAGESIZE) {
+            const std::uintptr_t expected = base_ptr + (page - addr);
+            if (reinterpret_cast<std::uintptr_t>(GetPointerSilent(page)) != expected) {
+                return nullptr;
+            }
+        }
+        return base;
+    }
+
     /// @brief Reads a particular data type out of memory at the given virtual address.
     /// @param vaddr The virtual address to read the data type from.
     /// @tparam T The data type to read out of memory.
@@ -715,12 +799,18 @@ struct Memory::Impl {
     template <typename T>
     inline T Read(Common::ProcessAddress vaddr) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
-        if (auto const ptr = GetPointerImpl(addr, [this, addr]() {
-            LOG_ERROR(HW_Memory, "Unmapped Read{} @ {:#016x}", sizeof(T) * 8, addr);
-            LogUnmappedGuestPC(addr);
+        if (auto const ptr = GetPointerImpl(addr, [addr]() {
+            // A guest spinning on a bad pointer reads unmapped memory tens of thousands of times
+            // a second: keep the first ones and then a sample.
+            static std::atomic<u64> unmapped_reads{};
+            if (const u64 count = unmapped_reads.fetch_add(1); count < 1000 || count % 100000 == 0) {
+                LOG_ERROR(HW_Memory, "Unmapped Read{} @ {:#016x} (#{})", sizeof(T) * 8, addr, count);
+            }
             ++UnmappedReadFlag();
         }, [&]() {
-            HandleRasterizerDownload(addr, sizeof(T));
+            if (!ReadTrapsEnabled() || ReadTrapArmed(addr & 0xffffffffffffULL, sizeof(T))) {
+                HandleRasterizerDownload(addr, sizeof(T));
+            }
         }); ptr) [[likely]] {
             // It may be tempting to rewrite this particular section to use "reinterpret_cast";
             // afterall, it's trivially copyable so surely it can be copied ov- Alignment.
@@ -738,13 +828,10 @@ struct Memory::Impl {
     template <typename T>
     inline void Write(Common::ProcessAddress vaddr, const T data) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
-        if (auto const ptr = GetPointerImpl(addr, [this, addr, data]() {
+        if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
-            LogUnmappedGuestPC(addr);
-        }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]] {
-            Core::HLE::DlssTrace::WriteWatch("Memory::Write<T>", ptr, sizeof(T));
+        }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]]
             std::memcpy(ptr, &data, sizeof(T));
-        }
     }
 
     template <typename T>
@@ -757,7 +844,6 @@ struct Memory::Impl {
             },
             [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T)); });
         if (ptr) {
-            Core::HLE::DlssTrace::WriteWatch("Memory::WriteExclusive<T>", ptr, sizeof(T));
             return Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
         }
         return true;
@@ -772,10 +858,26 @@ struct Memory::Impl {
             },
             [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128)); });
         if (ptr) {
-            Core::HLE::DlssTrace::WriteWatch("Memory::WriteExclusive128", ptr, 16);
             return Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
         }
         return true;
+    }
+
+    /// A rasterizer-cached page whose host pointer is outside the emulated physical memory has no
+    /// device address to flush or invalidate (its lookup used to read far out of bounds).
+    void ReportForeignPointer(VAddr v_address, const u8* p) const {
+        static std::atomic<u32> reported{};
+        if (reported.fetch_add(1, std::memory_order_relaxed) >= 16) {
+            return;
+        }
+        const auto raw =
+            current_page_table->entries[(v_address & 0xffffffffffffULL) >> YUZU_PAGEBITS].Raw();
+        LOG_ERROR(HW_Memory,
+                  "Rasterizer access at {:#x}: host pointer {} is outside the emulated physical "
+                  "memory at {} (page type {}, block {})",
+                  v_address, fmt::ptr(p),
+                  fmt::ptr(system.DeviceMemory().buffer.BackingBasePointer()),
+                  static_cast<u32>(raw.type), static_cast<u32>(raw.block));
     }
 
     void HandleRasterizerDownload(VAddr v_address, size_t size) {
@@ -784,24 +886,37 @@ struct Memory::Impl {
         if (!gpu_device_memory) [[unlikely]] {
             gpu_device_memory = &system.Host1x().MemoryManager();
         }
+        if (!gpu_device_memory->IsPhysicalPointer(p)) [[unlikely]] {
+            ReportForeignPointer(v_address, p);
+            return;
+        }
         const size_t core = system.GetCurrentHostThreadID();
-        auto& current_area = rasterizer_read_areas[core];
-        gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
-            if (VideoCommon::NativeReactiveReadbackEnabled() &&
-                Settings::values.use_reactive_flushing.GetValue()) {
-                const u64 observed = VideoCommon::native_readback_epoch.Observe();
-                auto& hint = native_readback_hints[core];
-                if (hint.Contains(address, size, observed)) return;
-                current_area = system.GPU().OnCPURead(address, size);
-                // A write queued during the read must invalidate this hint too.
-                hint.Remember(current_area.start_address, current_area.end_address, observed);
-                return;
+        if (core >= Core::Hardware::NUM_CPU_CORES) {
+            // A service thread has no slot in the arrays below, and it does not use a slot of a
+            // core. It keeps no area, so it asks on each read.
+            if (static std::atomic_flag logged; !logged.test_and_set(std::memory_order_relaxed)) {
+                LOG_INFO(HW_Memory, "Read of cached guest memory from a thread that is not a core");
             }
+            Common::ScratchBuffer<u32> scratch;
+            gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
+                DisarmReadTraps(v_address, size);
+                (void)system.GPU().OnCPURead(address, size);
+            });
+            return;
+        }
+        auto& current_area = rasterizer_read_areas[core];
+        if (const u64 generation = read_trap_generation.load(std::memory_order_acquire);
+            read_area_generations[core] != generation) {
+            current_area = {};
+            read_area_generations[core] = generation;
+        }
+        gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             const DAddr end_address = address + size;
             if (current_area.start_address <= address && end_address <= current_area.end_address)
                 [[likely]] {
                 return;
             }
+            DisarmReadTraps(v_address, size);
             current_area = system.GPU().OnCPURead(address, size);
         });
     }
@@ -814,6 +929,10 @@ struct Memory::Impl {
                                      sys_core); // any other calls threads go to syscore.
         if (!gpu_device_memory) [[unlikely]] {
             gpu_device_memory = &system.Host1x().MemoryManager();
+        }
+        if (!gpu_device_memory->IsPhysicalPointer(p)) [[unlikely]] {
+            ReportForeignPointer(v_address, p);
+            return;
         }
         // Guard on sys_core;
         if (core == sys_core) [[unlikely]] {
@@ -875,7 +994,11 @@ struct Memory::Impl {
     Common::PageTable* current_page_table = nullptr;
 
     std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
-    std::array<VideoCommon::NativeReadbackHint, Core::Hardware::NUM_CPU_CORES> native_readback_hints{};
+    std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
+    std::atomic<u64> read_trap_generation{};
+    std::set<u64> armed_read_traps;
+    std::atomic<size_t> armed_read_trap_count{};
+    std::mutex read_trap_mutex;
     std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
@@ -886,7 +1009,7 @@ struct Memory::Impl {
 #else
     Common::HostMemory* host_buffer{};
 #endif
-    std::atomic<u16> block_count = 0;
+    std::atomic<u64> block_count = 0;
 };
 
 Memory::Memory(Core::System& system_) : system{system_} {
@@ -932,6 +1055,9 @@ bool Memory::IsValidVirtualAddress(const Common::ProcessAddress vaddr) const {
 
 bool Memory::IsValidVirtualAddressRange(Common::ProcessAddress base, u64 size) const {
     Common::ProcessAddress end = base + size;
+    if (end < base) {
+        return false;
+    }
     Common::ProcessAddress page = Common::AlignDown(GetInteger(base), YUZU_PAGESIZE);
 
     for (; page < end; page += YUZU_PAGESIZE) {
@@ -965,6 +1091,10 @@ u16 Memory::Read16(const Common::ProcessAddress addr) {
 
 u32 Memory::Read32(const Common::ProcessAddress addr) {
     return impl->Read32(addr);
+}
+
+bool Memory::Read32Acquire(const Common::ProcessAddress addr, u32& value) {
+    return impl->Read32Acquire(addr, value);
 }
 
 u64 Memory::Read64(const Common::ProcessAddress addr) {
@@ -1066,6 +1196,10 @@ Result Memory::FlushDataCache(Common::ProcessAddress dest_addr, const std::size_
 
 void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, bool cached) {
     impl->RasterizerMarkRegionCached(GetInteger(vaddr), size, cached);
+}
+
+void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
+    impl->RasterizerArmReadTraps(GetInteger(vaddr), size);
 }
 
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {

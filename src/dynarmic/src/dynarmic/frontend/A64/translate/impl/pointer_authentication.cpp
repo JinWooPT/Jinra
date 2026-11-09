@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// ARMv8.3 pointer-authenticated branches and loads, implemented as the identity: PAC* never adds a
-// code (system.cpp), so signed pointers are just plain pointers.
+// ARMv8.3 pointer authentication, implemented as the identity: PAC* never adds a code and
+// AUT*/XPAC* have nothing to strip, so signed pointers are just plain pointers. The HINT-space
+// forms (PACIASP, AUTIBSP, ...) already decode as HINT/NOP.
 
 #include "dynarmic/frontend/A64/translate/impl/impl.h"
 
@@ -15,6 +16,26 @@ bool TranslatorVisitor::PACAUT_reg(bool Z, Imm<3> op, Reg Rn, Reg Rd) {
         return UnallocatedEncoding();
     }
     return true;
+}
+
+bool TranslatorVisitor::XPAC_1(bool D, Reg Rd) {
+    (void)D;
+    (void)Rd;
+    return true;
+}
+
+bool TranslatorVisitor::PACGA(Reg Rm, Reg Rn, Reg Rd) {
+    // Any deterministic value works, since the code is only ever compared to a recomputation.
+    const IR::U64 m = Rm == Reg::SP ? IR::U64{SP(64)} : IR::U64{X(64, Rm)};
+    X(64, Rd, ir.And(ir.Eor(X(64, Rn), m), ir.Imm64(0xFFFFFFFF00000000ULL)));
+    return true;
+}
+
+bool TranslatorVisitor::RETA(bool M) {
+    (void)M;
+    ir.SetPC(X(64, Reg::R30));
+    ir.SetTerm(IR::Term::PopRSBHint{});
+    return false;
 }
 
 bool TranslatorVisitor::BRA_BLRA(bool Z, bool L, bool M, Reg Rn, Reg Rm) {

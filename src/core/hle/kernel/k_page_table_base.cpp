@@ -217,8 +217,7 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
         return KAddressSpaceInfo::GetAddressSpaceStart(m_address_space_width, type);
     };
     auto GetSpaceSize = [&](KAddressSpaceInfo::Type type) {
-        return KAddressSpaceInfo::GetAddressSpaceSize(
-            m_address_space_width, type, KSystemControl::Init::GetIntendedMemorySize());
+        return KAddressSpaceInfo::GetAddressSpaceSize(m_address_space_width, type);
     };
 
     // Set our bit width and heap/alias sizes.

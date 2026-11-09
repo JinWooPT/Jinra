@@ -6,31 +6,23 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
-#include <limits>
 #include <list>
 #include <map>
+#include <random>
+#include <span>
 #include <unordered_map>
-#include <unordered_set>
 
+#include <fmt/format.h>
 #include <openssl/evp.h>
 #include <zstd.h>
 
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/swap.h"
 #include "core/file_sys/vfs/vfs_offset.h"
 
 namespace FileSys {
 namespace {
-
-bool Fits(u64 offset, u64 size, u64 total) {
-    return offset <= total && size <= total - offset;
-}
-
-bool SafeName(const std::string& name) {
-    return !name.empty() && name != "." && name != ".." &&
-           name.find_first_of("/\\") == std::string::npos &&
-           name.find(char(0)) == std::string::npos;
-}
 
 constexpr u32 NoDir = 0xFFFFFFFF;
 constexpr std::size_t SuperblockSize = 0x80;
@@ -43,6 +35,7 @@ constexpr u32 TocMagic = 0x01434F54; // "TOC\x01" little-endian
 constexpr u8 CodecRaw = 0;
 constexpr u8 CodecZstd = 1;
 constexpr u8 PackageFlagStandaloneUpdate = 0x01;
+constexpr u32 MaxDirDepth = 128;
 
 #pragma pack(push, 1)
 struct Superblock {
@@ -73,17 +66,17 @@ struct TocHeader {
 static_assert(sizeof(TocHeader) == TocHeaderSize);
 
 struct PackageRecord {
-    u64_le title_id;              // 0x00
-    u32_le root_dir;              // 0x08
-    u32_le exefs_dir;             // 0x0C
-    u32_le romfs_dir;             // 0x10
-    u32_le version;               // 0x14
-    u8 kind;                      // 0x18
-    u8 flags;                     // 0x19
-    u16_le reserved;              // 0x1A
-    u32_le reserved2;             // 0x1C
-    u64_le meta_offset;           // 0x20
-    u32_le meta_size;             // 0x28
+    u64_le title_id; // 0x00
+    u32_le root_dir; // 0x08
+    u32_le exefs_dir; // 0x0C
+    u32_le romfs_dir; // 0x10
+    u32_le version; // 0x14
+    u8 kind; // 0x18
+    u8 flags; // 0x19
+    u16_le reserved; // 0x1A
+    u32_le reserved2; // 0x1C
+    u64_le meta_offset; // 0x20
+    u32_le meta_size; // 0x28
     std::array<u8, 20> reserved3; // 0x2C
 };
 static_assert(sizeof(PackageRecord) == PackageRecordSize);
@@ -109,15 +102,15 @@ struct DirRecord {
 static_assert(sizeof(DirRecord) == DirRecordSize);
 
 struct FileRecord {
-    u32_le name_offset;           // 0x00
-    u32_le name_length;           // 0x04
-    u64_le size;                  // 0x08
-    u64_le extent_offset;         // 0x10
-    u64_le extent_size;           // 0x18
-    std::array<u8, 0x20> sha256;  // 0x20
-    u8 codec;                     // 0x40
-    u8 codec_flags;               // 0x41
-    u16_le reserved2;             // 0x42
+    u32_le name_offset; // 0x00
+    u32_le name_length; // 0x04
+    u64_le size; // 0x08
+    u64_le extent_offset; // 0x10
+    u64_le extent_size; // 0x18
+    std::array<u8, 0x20> sha256; // 0x20
+    u8 codec; // 0x40
+    u8 codec_flags; // 0x41
+    u16_le reserved2; // 0x42
     std::array<u8, 12> reserved3; // 0x44
 };
 static_assert(sizeof(FileRecord) == FileRecordSize);
@@ -144,6 +137,8 @@ enum MetaType : u16 {
     MetaIcon = 0x0003,
     MetaDisplayVersion = 0x0004,
     MetaTitleName = 0x0005,
+    MetaPublisher = 0x0006,
+    MetaSourceDump = 0x0008,
     MetaLocalizedTitles = 0x0009,
     MetaLocalizedIcons = 0x000A,
 };
@@ -154,8 +149,8 @@ bool Sha256(const u8* data, std::size_t size, std::array<u8, 0x20>& out) {
     return length == out.size();
 }
 
-/// A member file whose extent is zstd-compressed. Decompresses on first read
-/// and caches the result (LRU-evicted) unless the file exceeds the cache cap.
+/// A member file whose extent is zstd-compressed. Decompresses on first read and caches the
+/// result (LRU-evicted); a file over half the cache cap is decompressed once to a temporary file.
 class NupVfsFile final : public VfsFile {
 public:
     NupVfsFile(VirtualFile backing_, u64 extent_offset_, u64 extent_size_, u64 uncompressed_size_,
@@ -163,8 +158,7 @@ public:
                std::size_t cache_index_)
         : backing(std::move(backing_)), extent_offset(extent_offset_), extent_size(extent_size_),
           uncompressed_size(uncompressed_size_), name(std::move(name_)), cache(std::move(cache_)),
-          cache_index(cache_index_),
-          cache_enabled(uncompressed_size <= NupDecompressCache::MaxCachedExtent) {}
+          cache_index(cache_index_), cache_enabled(uncompressed_size <= cache->cap / 2) {}
 
     std::string GetName() const override {
         return name;
@@ -196,8 +190,9 @@ public:
         }
         length = std::min(length, static_cast<std::size_t>(uncompressed_size) - offset);
 
-        if (!cache_enabled)
-            return ReadStreaming(data, length, offset);
+        if (!cache_enabled) {
+            return ReadSpilled(data, length, offset);
+        }
 
         {
             std::scoped_lock lock{cache->mutex};
@@ -214,9 +209,7 @@ public:
         }
         {
             std::scoped_lock lock{cache->mutex};
-            if (cache_enabled) {
-                cache->Insert(cache_index, scratch);
-            }
+            cache->Insert(cache_index, scratch);
             if (const auto* cached = cache->Find(cache_index)) {
                 std::memcpy(data, cached->data() + offset, length);
                 return length;
@@ -236,52 +229,86 @@ public:
     }
 
 private:
-    std::size_t ReadStreaming(u8* data, std::size_t length, std::size_t offset) const {
-        std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> decoder(ZSTD_createDCtx(),
-                                                                     ZSTD_freeDCtx);
-        if (!decoder ||
-            ZSTD_isError(ZSTD_DCtx_setParameter(decoder.get(), ZSTD_d_windowLogMax, 27)))
-            return 0;
-        const auto header = backing->ReadBytes(std::min<u64>(extent_size, 18), extent_offset);
-        if (ZSTD_getFrameContentSize(header.data(), header.size()) != uncompressed_size)
-            return 0;
-        std::vector<u8> input(128 * 1024), output(128 * 1024);
-        ZSTD_inBuffer in{input.data(), 0, 0};
-        u64 compressed_read = 0, produced = 0;
-        std::size_t copied = 0;
-        while (copied < length) {
-            if (in.pos == in.size) {
-                const auto count = static_cast<std::size_t>(
-                    std::min<u64>(input.size(), extent_size - compressed_read));
-                if (count != 0 &&
-                    backing->Read(input.data(), count, extent_offset + compressed_read) != count)
-                    return 0;
-                compressed_read += count;
-                in = {input.data(), count, 0};
-            }
-            ZSTD_outBuffer out{output.data(), output.size(), 0};
-            const auto previous_input = in.pos;
-            const auto result = ZSTD_decompressStream(decoder.get(), &out, &in);
-            if (ZSTD_isError(result) || out.pos > uncompressed_size - produced)
-                return 0;
-            const u64 begin = std::max<u64>(produced, offset);
-            const u64 end = std::min<u64>(produced + out.pos, offset + length);
-            if (end > begin) {
-                const auto amount = static_cast<std::size_t>(end - begin);
-                std::memcpy(data + copied, output.data() + (begin - produced), amount);
-                copied += amount;
-            }
-            produced += out.pos;
-            if (result == 0) {
-                if (produced != uncompressed_size || compressed_read != extent_size ||
-                    in.pos != in.size)
-                    return 0;
-                break;
-            }
-            if (out.pos == 0 && in.pos == previous_input)
-                return 0;
+    std::size_t ReadSpilled(u8* data, std::size_t length, std::size_t offset) const {
+        std::shared_ptr<NupSpillFile> spill;
+        {
+            std::scoped_lock lock{cache->mutex};
+            spill = cache->GetSpill(cache_index);
         }
-        return copied;
+        std::scoped_lock lock{spill->mutex};
+        if (!spill->attempted) {
+            spill->attempted = true;
+            DecompressToFile(*spill);
+        }
+        if (!spill->file.IsOpen() || !spill->file.Seek(static_cast<s64>(offset))) {
+            return 0;
+        }
+        return spill->file.ReadSpan(std::span{data, length});
+    }
+
+    void DecompressToFile(NupSpillFile& spill) const {
+        const auto fail = [&](const char* reason) {
+            LOG_ERROR(Loader, "NUP zstd decompression of {} to a temporary file failed: {}", name,
+                      reason);
+            spill.file.Close();
+            if (!spill.path.empty()) {
+                std::error_code ec;
+                std::filesystem::remove(spill.path, ec);
+            }
+        };
+        if (extent_size > backing->GetSize() || extent_offset > backing->GetSize() - extent_size) {
+            return fail("extent out of range");
+        }
+
+        std::random_device random;
+        std::error_code ec;
+        std::filesystem::create_directories(cache->spill_dir, ec);
+        spill.path =
+            cache->spill_dir / fmt::format("{:08x}{:08x}-{}.tmp", random(), random(), cache_index);
+        Common::FS::IOFile out{spill.path, Common::FS::FileAccessMode::Write};
+        if (!out.IsOpen()) {
+            return fail("cannot create the temporary file");
+        }
+
+        std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{ZSTD_createDCtx(),
+                                                                  &ZSTD_freeDCtx};
+        std::vector<u8> in_buffer(ZSTD_DStreamInSize());
+        std::vector<u8> out_buffer(ZSTD_DStreamOutSize());
+        u64 read = 0;
+        u64 written = 0;
+        bool frame_done = false;
+        while (!frame_done && read < extent_size) {
+            const auto chunk =
+                static_cast<std::size_t>(std::min<u64>(in_buffer.size(), extent_size - read));
+            if (backing->Read(in_buffer.data(), chunk,
+                              static_cast<std::size_t>(extent_offset + read)) != chunk) {
+                return fail("short read of the compressed data");
+            }
+            read += chunk;
+            ZSTD_inBuffer input{in_buffer.data(), chunk, 0};
+            ZSTD_outBuffer output{};
+            do {
+                output = {out_buffer.data(), out_buffer.size(), 0};
+                const std::size_t result = ZSTD_decompressStream(dctx.get(), &output, &input);
+                if (ZSTD_isError(result) || output.pos > uncompressed_size - written) {
+                    return fail("corrupt or oversized data");
+                }
+                if (out.WriteSpan(std::span<const u8>{out_buffer.data(), output.pos}) !=
+                    output.pos) {
+                    return fail("cannot write the temporary file");
+                }
+                written += output.pos;
+                frame_done = result == 0;
+            } while (!frame_done && (input.pos < input.size || output.pos == output.size));
+        }
+        if (!frame_done || written != uncompressed_size) {
+            return fail("size mismatch");
+        }
+        out.Close();
+        spill.file.Open(spill.path, Common::FS::FileAccessMode::Read);
+        if (!spill.file.IsOpen()) {
+            fail("cannot reopen the temporary file");
+        }
     }
 
     std::vector<u8> Decompress() const {
@@ -293,8 +320,6 @@ private:
         if (compressed.size() != extent_size) {
             return {};
         }
-        if (ZSTD_getFrameContentSize(compressed.data(), compressed.size()) != uncompressed_size)
-            return {};
         std::vector<u8> out(static_cast<std::size_t>(uncompressed_size));
         const std::size_t result =
             ZSTD_decompress(out.data(), out.size(), compressed.data(), compressed.size());
@@ -317,6 +342,14 @@ private:
 
 } // namespace
 
+NupSpillFile::~NupSpillFile() {
+    file.Close();
+    if (!path.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+}
+
 bool NupContainer::IsNupFile(const VirtualFile& file) {
     if (file == nullptr || file->GetSize() < SuperblockSize) {
         return false;
@@ -326,8 +359,13 @@ bool NupContainer::IsNupFile(const VirtualFile& file) {
     return magic == HeaderMagic;
 }
 
-NupContainer::NupContainer(VirtualFile file_)
+NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,
+                           std::filesystem::path spill_dir_)
     : file(std::move(file_)), cache(std::make_shared<NupDecompressCache>()) {
+    cache->cap = memory_cache_cap;
+    cache->spill_dir = spill_dir_.empty()
+                           ? Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "nup"
+                           : std::move(spill_dir_);
     if (file == nullptr) {
         return;
     }
@@ -350,8 +388,7 @@ bool NupContainer::Parse() {
         status = Loader::ResultStatus::ErrorNUPBadFormat;
         return false;
     }
-    if (super.magic != HeaderMagic || super.header_size < SuperblockSize ||
-        super.header_version != 1 || super.flags != 0) {
+    if (super.magic != HeaderMagic || super.header_size < SuperblockSize || super.flags != 0) {
         status = Loader::ResultStatus::ErrorNUPBadFormat;
         return false;
     }
@@ -359,16 +396,15 @@ bool NupContainer::Parse() {
     toc_size = super.toc_size;
     blob_offset = super.blob_offset;
     file_size = super.file_size;
-    if (file_size != file->GetSize() || toc_offset != super.header_size ||
-        !Fits(toc_offset, toc_size, file_size) || toc_size > 256ull * 1024 * 1024 ||
-        toc_size % 16 != 0 || blob_offset < toc_offset + toc_size || blob_offset % 0x10 != 0 ||
-        blob_offset > file_size) {
+    if (file_size != file->GetSize() || toc_offset < SuperblockSize || blob_offset > file_size ||
+        toc_offset > blob_offset || toc_size > blob_offset - toc_offset ||
+        blob_offset % 0x10 != 0) {
         status = Loader::ResultStatus::ErrorNUPBadFormat;
         return false;
     }
 
-    const auto toc =
-        file->ReadBytes(static_cast<std::size_t>(toc_size), static_cast<std::size_t>(toc_offset));
+    const auto toc = file->ReadBytes(static_cast<std::size_t>(toc_size),
+                                     static_cast<std::size_t>(toc_offset));
     if (toc.size() != toc_size) {
         status = Loader::ResultStatus::ErrorNUPBadFormat;
         return false;
@@ -392,22 +428,22 @@ bool NupContainer::Parse() {
         return false;
     }
 
-    u64 needed = TocHeaderSize;
-    for (const auto [count, stride] : {std::pair<u64, u64>{header.package_count, PackageRecordSize},
-                                       {header.dir_count, DirRecordSize},
-                                       {header.file_count, FileRecordSize}}) {
-        if (count > (toc.size() - needed) / stride)
-            return false;
-        needed += count * stride;
-    }
-    const u64 children_offset = needed;
-    const u64 children_bytes = header.pool_offset - needed;
-    if (toc.size() < needed || header.pool_offset < needed ||
-        !Fits(header.pool_offset, header.pool_size, toc.size()) ||
-        children_bytes % sizeof(u32) != 0) {
+    // The counts come from the file, so bound them by the TOC size before multiplying.
+    if (header.dir_count > toc.size() / DirRecordSize ||
+        header.file_count > toc.size() / FileRecordSize) {
         status = Loader::ResultStatus::ErrorNUPBadFormat;
         return false;
     }
+    const u64 needed = TocHeaderSize + static_cast<u64>(header.package_count) * PackageRecordSize +
+                       header.dir_count * DirRecordSize + header.file_count * FileRecordSize;
+    if (needed > toc.size() || header.pool_offset < needed || header.pool_offset > toc.size() ||
+        header.pool_size > toc.size() - header.pool_offset ||
+        (header.pool_offset - needed) % sizeof(u32) != 0) {
+        status = Loader::ResultStatus::ErrorNUPBadFormat;
+        return false;
+    }
+    const u64 children_offset = needed;
+    const u64 children_bytes = header.pool_offset - needed;
     const u8* base = toc.data();
 
     std::size_t pos = TocHeaderSize;
@@ -432,16 +468,11 @@ bool NupContainer::Parse() {
         package.root_dir = record.root_dir;
         package.exefs_dir = record.exefs_dir;
         package.romfs_dir = record.romfs_dir;
-        if (record.meta_size > 0 && record.meta_offset != 0 &&
-            Fits(record.meta_offset, record.meta_size, file_size)) {
-            if (record.meta_offset < blob_offset || record.meta_size > 16 * 1024 * 1024)
-                return false;
+        if (record.meta_size > 0 && record.meta_offset != 0 && record.meta_offset <= file_size &&
+            record.meta_size <= file_size - record.meta_offset) {
             package.meta_offset = record.meta_offset;
             package.meta_size = record.meta_size;
         }
-        if ((record.meta_size == 0) != (record.meta_offset == 0) ||
-            (record.meta_size != 0 && package.meta_offset == 0))
-            return false;
         packages.push_back(std::move(package));
     }
 
@@ -450,8 +481,9 @@ bool NupContainer::Parse() {
         DirRecord record{};
         std::memcpy(&record, base + pos, sizeof(record));
         pos += DirRecordSize;
-        if (!Fits(record.first_child, record.child_count, children_bytes / sizeof(u32)) ||
-            !Fits(record.name_offset, record.name_length, header.pool_size)) {
+        if (static_cast<u64>(record.first_child) + record.child_count >
+                children_bytes / sizeof(u32) ||
+            static_cast<u64>(record.name_offset) + record.name_length > header.pool_size) {
             status = Loader::ResultStatus::ErrorNUPBadFormat;
             return false;
         }
@@ -469,13 +501,11 @@ bool NupContainer::Parse() {
         pos += FileRecordSize;
         if (record.codec > CodecZstd || record.codec_flags != 0 ||
             (record.size == 0 && (record.extent_offset != 0 || record.extent_size != 0)) ||
-            (record.size != 0 && (record.extent_size == 0 || record.extent_offset < blob_offset ||
-                                  record.extent_offset % 0x10 != 0 ||
-                                  !Fits(record.extent_offset, record.extent_size, file_size))) ||
-            (record.codec == CodecRaw && record.extent_size != record.size) ||
-            (record.size == 0 && record.codec != CodecRaw) ||
-            record.size > std::numeric_limits<std::size_t>::max() ||
-            !Fits(record.name_offset, record.name_length, header.pool_size)) {
+            (record.size != 0 &&
+             (record.extent_size == 0 || record.extent_offset < blob_offset ||
+              record.extent_offset % 0x10 != 0 || record.extent_offset > file_size ||
+              record.extent_size > file_size - record.extent_offset)) ||
+            static_cast<u64>(record.name_offset) + record.name_length > header.pool_size) {
             status = Loader::ResultStatus::ErrorNUPBadFormat;
             return false;
         }
@@ -498,42 +528,66 @@ bool NupContainer::Parse() {
         }
     }
 
-    std::vector<u8> parents(dirs.size() + files.size());
-    for (const auto& dir : dirs) {
-        std::unordered_set<std::string> names;
-        for (u64 i = dir.first_child; i < u64(dir.first_child) + dir.child_count; ++i) {
-            const auto child = children[i];
-            const auto& name =
-                child < dirs.size() ? dirs[child].name : files[child - dirs.size()].name;
-            if (!SafeName(name) || ++parents[child] > 1 || !names.insert(name).second)
-                return false;
-        }
-    }
-    std::vector<u8> visited(dirs.size());
-    std::function<bool(u32, unsigned)> visit = [&](u32 node, unsigned depth) {
-        if (depth > 128 || visited[node] == 1)
-            return false;
-        if (visited[node] == 2)
-            return true;
-        visited[node] = 1;
-        for (u64 i = dirs[node].first_child;
-             i < u64(dirs[node].first_child) + dirs[node].child_count; ++i) {
-            if (children[i] < dirs.size() && !visit(children[i], depth + 1))
-                return false;
-        }
-        visited[node] = 2;
-        return true;
-    };
-    for (u32 i = 0; i < dirs.size(); ++i)
-        if (!visit(i, 0))
-            return false;
-    if (std::count_if(packages.begin(), packages.end(),
-                      [](const auto& p) { return p.kind == PackageKind::Base; }) > 1)
+    if (!ValidateDirTree()) {
+        status = Loader::ResultStatus::ErrorNUPBadFormat;
         return false;
+    }
+
     for (auto& package : packages) {
         if (!ParseMeta(package)) {
             status = Loader::ResultStatus::ErrorNUPBadFormat;
             return false;
+        }
+    }
+    return true;
+}
+
+bool NupContainer::ValidateDirTree() const {
+    enum : u8 { Unvisited, InProgress, Done };
+    struct Frame {
+        u32 dir;
+        u32 next;
+    };
+    std::vector<u8> state(dirs.size(), Unvisited);
+    std::vector<u32> height(dirs.size(), 0);
+    std::vector<Frame> stack;
+    for (u32 start = 0; start < dirs.size(); ++start) {
+        if (state[start] != Unvisited) {
+            continue;
+        }
+        state[start] = InProgress;
+        stack.push_back({start, 0});
+        while (!stack.empty()) {
+            const Frame frame = stack.back();
+            const DirNode& node = dirs[frame.dir];
+            if (frame.next == node.child_count) {
+                state[frame.dir] = Done;
+                stack.pop_back();
+                if (!stack.empty()) {
+                    u32& parent_height = height[stack.back().dir];
+                    parent_height = (std::max)(parent_height, height[frame.dir] + 1);
+                }
+                continue;
+            }
+            ++stack.back().next;
+            const u32 child = children[static_cast<std::size_t>(node.first_child) + frame.next];
+            if (child >= dirs.size()) {
+                continue;
+            }
+            if (state[child] == InProgress) {
+                LOG_ERROR(Loader, "NUP directory tree contains a cycle");
+                return false;
+            }
+            if (stack.size() + height[child] + 1 > MaxDirDepth) {
+                LOG_ERROR(Loader, "NUP directory tree is nested too deeply");
+                return false;
+            }
+            if (state[child] == Done) {
+                height[frame.dir] = (std::max)(height[frame.dir], height[child] + 1);
+            } else {
+                state[child] = InProgress;
+                stack.push_back({child, 0});
+            }
         }
     }
     return true;
@@ -568,6 +622,12 @@ bool NupContainer::ParseMeta(PackageInfo& package) {
         case MetaTitleName:
             package.title_name = std::string(reinterpret_cast<const char*>(payload), header.size);
             break;
+        case MetaPublisher:
+            package.publisher = std::string(reinterpret_cast<const char*>(payload), header.size);
+            break;
+        case MetaSourceDump:
+            package.source_dump = std::string(reinterpret_cast<const char*>(payload), header.size);
+            break;
         case MetaDisplayVersion:
             package.display_version =
                 std::string(reinterpret_cast<const char*>(payload), header.size);
@@ -596,8 +656,8 @@ bool NupContainer::ParseMeta(PackageInfo& package) {
                                           data_length));
                 } else {
                     package.localized_icons.emplace_back(
-                        lang,
-                        std::vector<u8>(payload + record_pos, payload + record_pos + data_length));
+                        lang, std::vector<u8>(payload + record_pos,
+                                              payload + record_pos + data_length));
                 }
                 record_pos += data_length;
             }
@@ -650,9 +710,9 @@ VirtualFile NupContainer::OpenFile(std::size_t file_index) {
         return std::make_shared<VectorVfsFile>(std::vector<u8>{}, node.name);
     }
     if (node.codec == CodecRaw) {
-        return std::make_shared<OffsetVfsFile>(file, static_cast<std::size_t>(node.extent_size),
-                                               static_cast<std::size_t>(node.extent_offset),
-                                               node.name);
+        return std::make_shared<OffsetVfsFile>(
+            file, static_cast<std::size_t>(node.extent_size),
+            static_cast<std::size_t>(node.extent_offset), node.name);
     }
     return std::make_shared<NupVfsFile>(file, node.extent_offset, node.extent_size, node.size,
                                         node.name, cache, file_index);
@@ -660,13 +720,15 @@ VirtualFile NupContainer::OpenFile(std::size_t file_index) {
 
 void NupContainer::BuildDirTree(u32 dir_index, VectorVfsDirectory& out) {
     const DirNode& node = dirs[dir_index];
-    for (u32 slot = node.first_child; slot < node.first_child + node.child_count; ++slot) {
+    const u64 end = static_cast<u64>(node.first_child) + node.child_count;
+    for (u64 slot = node.first_child; slot < end; ++slot) {
         const u32 child = children[slot];
         if (child >= dirs.size()) {
             out.AddFile(OpenFile(child - static_cast<u32>(dirs.size())));
         } else {
-            auto sub = std::make_shared<VectorVfsDirectory>(
-                std::vector<VirtualFile>{}, std::vector<VirtualDir>{}, dirs[child].name);
+            auto sub = std::make_shared<VectorVfsDirectory>(std::vector<VirtualFile>{},
+                                                            std::vector<VirtualDir>{},
+                                                            dirs[child].name);
             BuildDirTree(child, *sub);
             out.AddDirectory(sub);
         }
@@ -674,8 +736,8 @@ void NupContainer::BuildDirTree(u32 dir_index, VectorVfsDirectory& out) {
 }
 
 VirtualDir NupContainer::BuildPackageDir(u32 dir_index) {
-    auto out = std::make_shared<VectorVfsDirectory>(
-        std::vector<VirtualFile>{}, std::vector<VirtualDir>{}, dirs[dir_index].name);
+    auto out = std::make_shared<VectorVfsDirectory>(std::vector<VirtualFile>{},
+                                                    std::vector<VirtualDir>{}, dirs[dir_index].name);
     BuildDirTree(dir_index, *out);
     return out;
 }
@@ -688,7 +750,11 @@ VirtualDir NupContainer::GetExeFSDir(std::size_t package_index) {
         exefs_dir_cache.resize(packages.size());
     }
     if (exefs_dir_cache[package_index] == nullptr) {
-        exefs_dir_cache[package_index] = BuildPackageDir(packages[package_index].exefs_dir);
+        auto dir = BuildPackageDir(packages[package_index].exefs_dir);
+        if (dir->GetFiles().empty() && dir->GetSubdirectories().empty()) {
+            return nullptr;
+        }
+        exefs_dir_cache[package_index] = std::move(dir);
     }
     return exefs_dir_cache[package_index];
 }
@@ -704,6 +770,13 @@ VirtualDir NupContainer::GetRomFSDir(std::size_t package_index) {
         romfs_dir_cache[package_index] = BuildPackageDir(packages[package_index].romfs_dir);
     }
     return romfs_dir_cache[package_index];
+}
+
+VirtualDir NupContainer::GetPackageDir(std::size_t package_index) {
+    if (package_index >= packages.size()) {
+        return nullptr;
+    }
+    return BuildPackageDir(packages[package_index].root_dir);
 }
 
 VirtualDir NupContainer::MergeShadowDirs(const VirtualDir& base, const VirtualDir& overlay) {
@@ -724,11 +797,9 @@ VirtualDir NupContainer::MergeShadowDirs(const VirtualDir& base, const VirtualDi
 
     std::map<std::string, VirtualDir, std::less<>> dir_map;
     for (const auto& entry : base->GetSubdirectories()) {
-        if (overlay->GetFile(entry->GetName()) == nullptr)
-            dir_map.insert_or_assign(entry->GetName(), entry);
+        dir_map.insert_or_assign(entry->GetName(), entry);
     }
     for (const auto& entry : overlay->GetSubdirectories()) {
-        file_map.erase(entry->GetName());
         const auto it = dir_map.find(entry->GetName());
         if (it != dir_map.end()) {
             dir_map.insert_or_assign(entry->GetName(), MergeShadowDirs(it->second, entry));
@@ -761,32 +832,22 @@ Loader::ResultStatus NupContainer::VerifyIntegrity(
     const std::size_t total = files.size();
     for (std::size_t i = 0; i < total; ++i) {
         const FileNode& node = files[i];
-        VirtualFile view;
-        if (node.codec == CodecRaw)
-            view = std::make_shared<OffsetVfsFile>(file, node.extent_size, node.extent_offset,
-                                                   node.name);
-        else
-            view = std::make_shared<NupVfsFile>(file, node.extent_offset, node.extent_size,
-                                                node.size, node.name, cache, i);
-        std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(EVP_MD_CTX_new(),
-                                                                        EVP_MD_CTX_free);
-        if (!context || EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1)
+        std::vector<u8> content;
+        if (node.size == 0) {
+            content = ReadExtentRaw(node);
+        } else if (node.codec == CodecRaw) {
+            content = ReadExtentRaw(node);
+        } else {
+            NupVfsFile view(file, node.extent_offset, node.extent_size, node.size, node.name,
+                            cache, i);
+            content = view.ReadAllBytes();
+        }
+        if (content.size() != node.size) {
+            LOG_ERROR(Loader, "NUP integrity check failed for {}: short read", node.name);
             return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
-        std::vector<u8> chunk(1024 * 1024);
-        for (u64 offset = 0; offset < node.size;) {
-            const auto amount =
-                static_cast<std::size_t>(std::min<u64>(chunk.size(), node.size - offset));
-            if (view->Read(chunk.data(), amount, offset) != amount ||
-                EVP_DigestUpdate(context.get(), chunk.data(), amount) != 1)
-                return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
-            offset += amount;
-            if (progress_callback && !progress_callback(i, total))
-                return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
         }
         std::array<u8, 0x20> hash{};
-        unsigned int hash_size{};
-        if (EVP_DigestFinal_ex(context.get(), hash.data(), &hash_size) != 1 ||
-            hash_size != hash.size() || hash != node.sha256) {
+        if (!Sha256(content.data(), content.size(), hash) || hash != node.sha256) {
             LOG_ERROR(Loader, "NUP integrity check failed for {}: SHA-256 mismatch", node.name);
             return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
         }

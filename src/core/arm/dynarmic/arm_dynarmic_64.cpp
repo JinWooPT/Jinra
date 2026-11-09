@@ -13,9 +13,8 @@
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
-#include "core/guest_clock.h"
-#include "core/hle/dlss_trace.h"
 #include "core/hle/kernel/k_process.h"
 #include "dynarmic/interface/A64/config.h"
 
@@ -63,26 +62,19 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
         m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
         last_code_addr = aligned_vaddr;
     }
-    return cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
-}
-
-namespace {
-// Diagnostic only (EDEN_DLSS_TRACE=1, which also disables fastmem and the page table so that every guest
-// store reaches the callbacks below).
-template <typename Jit, typename Mem>
-void TraceGuestStore(Jit& jit, Mem& memory, const char* tag, u64 vaddr, size_t size, u64 value) {
-    const u64 watch = Core::HLE::DlssTrace::g_watch_address.load(std::memory_order_relaxed);
-    if (watch == 0 || vaddr >= watch + 0x40 || vaddr + size <= watch) {
-        return;
+    const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+    if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
+        if (!m_window_trace) {
+            m_window_trace = WindowTrace::sessions.Find(m_process);
+        }
+        if (m_window_trace) {
+            return WindowTrace::InstructionFor(m_window_trace->base, vaddr, instruction);
+        }
     }
-    Core::HLE::DlssTrace::GuestWriteWatch(memory, tag, vaddr, size, value, jit->GetPC(), jit->GetRegister(30),
-                                          jit->GetRegister(29), jit->GetRegister(0), jit->GetRegister(1),
-                                          jit->GetRegister(2));
+    return instruction;
 }
-} // namespace
 
 void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) {
-    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWrite", vaddr, size, value);
     if (CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Write)) {
         switch (size) {
         case sizeof(u64): return m_memory.Write64(vaddr, u64(value));
@@ -94,7 +86,6 @@ void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std
     }
 }
 void DynarmicCallbacks64::MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value) {
-    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWrite128", vaddr, 16, value[0]);
     if (CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write)) {
         m_memory.Write64(vaddr, value[0]);
         m_memory.Write64(vaddr + 8, value[1]);
@@ -102,27 +93,22 @@ void DynarmicCallbacks64::MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value)
 }
 
 bool DynarmicCallbacks64::MemoryWriteExclusive8(u64 vaddr, std::uint8_t value, std::uint8_t expected) {
-    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWriteExclusive8", vaddr, 1, value);
     return CheckMemoryAccess(vaddr, 1, Kernel::DebugWatchpointType::Write) &&
             m_memory.WriteExclusive8(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive16(u64 vaddr, std::uint16_t value, std::uint16_t expected) {
-    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWriteExclusive16", vaddr, 2, value);
     return CheckMemoryAccess(vaddr, 2, Kernel::DebugWatchpointType::Write) &&
             m_memory.WriteExclusive16(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive32(u64 vaddr, std::uint32_t value, std::uint32_t expected) {
-    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWriteExclusive32", vaddr, 4, value);
     return CheckMemoryAccess(vaddr, 4, Kernel::DebugWatchpointType::Write) &&
             m_memory.WriteExclusive32(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive64(u64 vaddr, std::uint64_t value, std::uint64_t expected) {
-    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWriteExclusive64", vaddr, 8, value);
     return CheckMemoryAccess(vaddr, 8, Kernel::DebugWatchpointType::Write) &&
             m_memory.WriteExclusive64(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive128(u64 vaddr, Dynarmic::A64::Vector value, Dynarmic::A64::Vector expected) {
-    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWriteExclusive128", vaddr, 16, value[0]);
     return CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write) &&
             m_memory.WriteExclusive128(vaddr, value, expected);
 }
@@ -148,6 +134,70 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
 }
 
 void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) {
+    if (m_window_trace && exception == Dynarmic::A64::Exception::Breakpoint) {
+        const auto point = WindowTrace::Identify(m_window_trace->base, pc, m_memory.Read32(pc));
+        if (point != WindowTrace::Point::None) {
+            auto& jit = *m_parent.m_jit;
+            const u64 x0 = jit.GetRegister(0);
+            const u64 x1 = jit.GetRegister(1);
+            u64 native = 0;
+            if (point == WindowTrace::Point::WindowInitialize) {
+                native = m_memory.Read64(x1 + 0x18);
+            } else if (point == WindowTrace::Point::NativeInitialize ||
+                       point == WindowTrace::Point::Acquire ||
+                       point == WindowTrace::Point::Finalize) {
+                native = m_memory.Read64(x0);
+            }
+            const auto identity = m_window_trace->Record(
+                point, m_tpidrro_el0, point == WindowTrace::Point::WindowInitialize ? x0 : 0, native);
+            if (!identity) {
+                WindowTrace::Resume(point, jit, m_memory);
+                return;
+            }
+            u32 registrations = 0;
+            if (identity->native != 0) {
+                for (u32 i = 0; i < 8; ++i) {
+                    const u64 entry = m_window_trace->base + 0xF633F8 + i * 0x128;
+                    registrations += m_memory.Read64(entry) == identity->native;
+                }
+            }
+            LOG_INFO(Core_ARM, "Star Fox window trace session={} {} pc={:#x} lr={:#x} tls={:#x} window={:#x} native={:#x} registrations={} x0={:#x}",
+                     m_window_trace->id, WindowTrace::Name(point), pc, jit.GetRegister(30),
+                     m_tpidrro_el0, identity->window, identity->native, registrations, x0);
+            if (point == WindowTrace::Point::NativeInitialize) {
+                const u32 count = static_cast<u32>(jit.GetRegister(2));
+                LOG_INFO(Core_ARM, "Star Fox window textures session={} tls={:#x} native={:#x} count={}",
+                         m_window_trace->id, m_tpidrro_el0, identity->native, count);
+                for (u32 i = 0; i < std::min(count, 4U); ++i) {
+                    const u64 texture = x1 + i * 0x28;
+                    LOG_INFO(Core_ARM, "Star Fox window texture session={} tls={:#x} native={:#x} index={} {}x{} format={} block_format={} pitch_gobs={} block_height={} fd={} pool_size={:#x} offset={:#x}",
+                             m_window_trace->id, m_tpidrro_el0, identity->native,
+                             i, m_memory.Read32(texture + 8), m_memory.Read32(texture + 12),
+                             m_memory.Read8(texture + 16), m_memory.Read8(texture + 17),
+                             m_memory.Read32(texture + 20), m_memory.Read32(texture + 24),
+                             m_memory.Read32(texture + 28), m_memory.Read32(texture + 32),
+                             m_memory.Read32(texture + 36));
+                }
+            } else if (point == WindowTrace::Point::ValidateTexture) {
+                const u64 texture = jit.GetRegister(25);
+                LOG_INFO(Core_ARM, "Star Fox window validation session={} tls={:#x} native={:#x} required_size={:#x} alignment={:#x} pool_size={:#x} offset={:#x}",
+                         m_window_trace->id, m_tpidrro_el0, identity->native,
+                         m_memory.Read64(jit.GetSP() + 0x10), m_memory.Read32(jit.GetSP() + 0x18),
+                         m_memory.Read32(texture + 12), m_memory.Read32(texture + 16));
+            } else if (point == WindowTrace::Point::Acquire || point == WindowTrace::Point::Finalize) {
+                if (point == WindowTrace::Point::Acquire && registrations == 0) {
+                    for (u32 i = 0; i < 8; ++i) {
+                        const u64 entry = m_window_trace->base + 0xF633F8 + i * 0x128;
+                        LOG_INFO(Core_ARM, "Star Fox window slot session={} tls={:#x} requested={:#x} slot={} native={:#x} active={}",
+                                 m_window_trace->id, m_tpidrro_el0, identity->native, i,
+                                 m_memory.Read64(entry), m_memory.Read8(entry + 0x120));
+                    }
+                }
+            }
+            WindowTrace::Resume(point, jit, m_memory);
+            return;
+        }
+    }
     switch (exception) {
     case Dynarmic::A64::Exception::WaitForInterrupt:
     case Dynarmic::A64::Exception::WaitForEvent:
@@ -182,8 +232,7 @@ void DynarmicCallbacks64::AddTicks(u64 ticks) {
     // if not all cores are doing a similar amount of work. Instead of doing this, we should
     // device a way so that timing is consistent across all cores without increasing the ticks 4
     // times.
-    // Stays at the Switch 1 core count so guest time does not change with the extra emulated cores.
-    u64 amortized_ticks = ticks / Core::Hardware::NUM_LEGACY_CPU_CORES;
+    u64 amortized_ticks = ticks / Core::Hardware::NUM_CPU_CORES;
     // Always execute at least one tick.
     amortized_ticks = std::max<u64>(amortized_ticks, 1);
     m_parent.m_system.CoreTiming().AddTicks(amortized_ticks);
@@ -195,9 +244,7 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
 }
 
 u64 DynarmicCallbacks64::GetCNTPCT() {
-    const bool native_abi = m_process && m_process->UsesPAuthReturns();
-    const u64 ticks = Timing::GetGuestCounterTicks(m_parent.m_system.CoreTiming().GetClockTicks(),
-                                                   native_abi);
+    const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
     // Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
     // times a second while waiting for the GPU) keeps a host core busy at full speed, and the
     // GPU thread is often on the other half of that SMT core. Two reads within ~1.7 us of each
@@ -207,9 +254,7 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
         const char* value = std::getenv("EDEN_NX2_CNTPCT_PAUSE");
         return value == nullptr || value[0] != '0';
     }();
-    // ~1.7 us in guest ticks: 32 at 19.2 MHz, 52 at the Switch 2's 31.25 MHz.
-    const u64 spin_ticks = Timing::GetGuestCounterFrequency(native_abi) / 600'000;
-    if (pause_spins && ticks - m_last_cntpct < spin_ticks) {
+    if (pause_spins && ticks - m_last_cntpct < m_spin_ticks) {
 #if defined(_M_X64) || defined(__x86_64__)
         _mm_pause();
         _mm_pause();
@@ -258,7 +303,6 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
     // Callbacks
     config.callbacks = std::addressof(*m_cb);
-    config.enable_pauth_returns = m_cb->m_process && m_cb->m_process->UsesPAuthReturns();
 
     // Memory
     if (page_table) {
@@ -299,7 +343,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     config.tpidr_el0 = &m_cb->m_tpidr_el0;
     config.dczid_el0 = 4;
     config.ctr_el0 = 0x8444c004;
-    config.cntfrq_el0 = Timing::GetGuestCounterFrequency(config.enable_pauth_returns);
+    // 31.25 MHz for Switch 2 titles (Common::WallClock::SetGuestCNTFRQ, set at boot).
+    config.cntfrq_el0 = static_cast<u32>(Common::g_wall_clock.GetGuestCNTFRQ());
+    m_cb->m_spin_ticks = config.cntfrq_el0 / 600'000;
 
     // Unpredictable instructions
     config.define_unpredictable_behaviour = true;
@@ -410,11 +456,6 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
-    if (Core::HLE::DlssTrace::TraceActive()) {
-        config.page_table = nullptr;
-        config.fastmem_pointer = std::nullopt;
-        config.fastmem_exclusive_access = false;
-    }
     m_jit.emplace(config);
 }
 
@@ -514,7 +555,9 @@ void ArmDynarmic64::ClearInstructionCache() {
 }
 
 void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
-    // Refetch the source page too, including instructions restored by the debugger.
+    // Drop the cached code page too: blocks recompiled after the invalidation would
+    // otherwise still decode the old instructions (e.g. a gdbstub breakpoint written
+    // into or removed from that page).
     m_cb->last_code_addr = u64(-1);
     m_jit->InvalidateCacheRange(addr, size);
 }

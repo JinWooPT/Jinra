@@ -251,7 +251,7 @@ struct TranslatorVisitor final {
     bool CASP(bool sz, bool L, Reg Rs, bool o0, Reg Rn, Reg Rt);
     bool CASB(bool L, Reg Rs, bool o0, Reg Rn, Reg Rt);
     bool CASH(bool L, Reg Rs, bool o0, Reg Rn, Reg Rt);
-    bool CAS(Imm<2> sz, bool L, Reg Rs, bool o0, Reg Rn, Reg Rt);
+    bool CAS(bool sz, bool L, Reg Rs, bool o0, Reg Rn, Reg Rt);
 
     // Loads and stores - Load register (literal)
     bool LDR_lit_gen(bool opc_0, Imm<19> imm19, Reg Rt);
@@ -315,16 +315,16 @@ struct TranslatorVisitor final {
     bool LDUMINH(bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
     bool SWPH(bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
     bool LDAPRH(Reg Rn, Reg Rt);
-    bool LDADD(bool sz, bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
-    bool LDCLR(bool sz, bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
-    bool LDEOR(bool sz, bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
-    bool LDSET(bool sz, bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
+    bool LDADD(bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
+    bool LDCLR(bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
+    bool LDEOR(bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
+    bool LDSET(bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
     bool LDSMAX(bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
     bool LDSMIN(bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
     bool LDUMAX(bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
     bool LDUMIN(bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
-    bool SWP(bool sz, bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
-    bool LDAPR(Imm<2> size, Reg Rn, Reg Rt);
+    bool SWP(bool A, bool R, Reg Rs, Reg Rn, Reg Rt);
+    bool LDAPR(Reg Rn, Reg Rt);
 
     // ARMv8.1+ forms decoded for Switch 2 code (load_store_atomic.cpp, pointer_authentication.cpp,
     // memory_tagging.cpp)
@@ -604,9 +604,9 @@ struct TranslatorVisitor final {
     bool FMINP_pair_2(bool sz, Vec Vn, Vec Vd);
 
     // Data Processing - FP and SIMD - SIMD Scalar three different
-    bool SQDMLAL_vec_1(Imm<2> size, Reg Rm, Reg Rn, Vec Vd);
-    bool SQDMLSL_vec_1(Imm<2> size, Reg Rm, Reg Rn, Vec Vd);
-    bool SQDMULL_vec_1(Imm<2> size, Reg Rm, Reg Rn, Vec Vd);
+    bool SQDMLAL_vec_1(Imm<2> size, Vec Vm, Vec Vn, Vec Vd);
+    bool SQDMLSL_vec_1(Imm<2> size, Vec Vm, Vec Vn, Vec Vd);
+    bool SQDMULL_vec_1(Imm<2> size, Vec Vm, Vec Vn, Vec Vd);
 
     // Data Processing - FP and SIMD - SIMD Scalar three same
     bool SQADD_1(Imm<2> size, Vec Vm, Vec Vn, Vec Vd);

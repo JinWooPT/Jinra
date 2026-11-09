@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <QApplication>
-#include <QTimer>
+
+#include "common/fs/fs_paths.h"
+#include "common/fs/path_util.h"
+#include "nx2_switches.h"
 #include "startup_checks.h"
 
 #if YUZU_ROOM
@@ -79,6 +82,7 @@ static Qt::HighDpiScaleFactorRoundingPolicy GetHighDpiRoundingPolicy() {
 }
 
 int main(int argc, char* argv[]) {
+    LoadNx2Switches(argv[0]);
 #if YUZU_ROOM
     bool launch_room = false;
     for (int i = 1; i < argc; i++) {
@@ -110,7 +114,7 @@ int main(int argc, char* argv[]) {
 
     // Init settings params
     QCoreApplication::setOrganizationName(QStringLiteral("eden"));
-    QCoreApplication::setApplicationName(QStringLiteral("eden"));
+    QCoreApplication::setApplicationName(QStringLiteral("Jinra"));
 
     // Increases the maximum open file limit.
     // TODO: This should be common to all frontends.
@@ -123,11 +127,11 @@ int main(int argc, char* argv[]) {
     _setmaxstdio(8192);
 #endif // __MSVCRT__
 #elif defined(__unix__) || defined(__APPLE__)
-    // Set the max open file limit to 8192, or the hard limit.
+    // Raise the open file limit to at least 8192, or the hard limit.
     // Most sane systems should not hit the hard limit here.
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
-        rl.rlim_cur = std::min<rlim_t>(8192, rl.rlim_max);
+        rl.rlim_cur = std::min<rlim_t>(1048576, rl.rlim_max);
         setrlimit(RLIMIT_NOFILE, &rl);
     }
 #endif // _WIN32
@@ -162,7 +166,7 @@ int main(int argc, char* argv[]) {
 
     // Fix the Wayland appId. This needs to match the name of the .desktop file without the .desktop
     // suffix.
-    QGuiApplication::setDesktopFileName(QStringLiteral("dev.eden_emu.eden"));
+    QGuiApplication::setDesktopFileName(QStringLiteral("io.github.JinWooPT.jinra"));
 #endif
 
     auto rounding_policy = GetHighDpiRoundingPolicy();
@@ -181,7 +185,6 @@ int main(int argc, char* argv[]) {
 #endif
 
     QApplication app(argc, argv);
-    QGuiApplication::setApplicationDisplayName(QStringLiteral("Jinra"));
 
 #ifdef _WIN32
     OverrideWindowsFont();
@@ -205,12 +208,6 @@ int main(int argc, char* argv[]) {
     MainWindow main_window{has_broken_vulkan};
     // After settings have been loaded by GMainWindow, apply the filter
     main_window.show();
-    if (qEnvironmentVariableIsSet("EDEN_BACKGROUND_TEST")) {
-        const int seconds = qEnvironmentVariableIntValue("EDEN_BG_TEST_SECONDS");
-        const int maximum = qEnvironmentVariableIsSet("EDEN_EXTENDED_GPU_REPRO") ? 1800 : 600;
-        QTimer::singleShot((seconds >= 30 && seconds <= maximum ? seconds : 120) * 1000,
-                           &main_window, [&main_window] { main_window.close(); });
-    }
 
     app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window, &MainWindow::OnAppFocusStateChanged);
     return app.exec();

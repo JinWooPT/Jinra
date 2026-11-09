@@ -9,8 +9,8 @@
 #include "common/logging.h"
 #include "common/string_util.h"
 #include "core/core.h"
-#include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nup_container.h"
+#include "core/file_sys/control_metadata.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
@@ -32,24 +32,10 @@ struct LanguageSlot {
 };
 
 constexpr std::array<LanguageSlot, 18> LanguageSlots{{
-    {"en-us", 0},
-    {"en-gb", 1},
-    {"ja", 2},
-    {"fr", 3},
-    {"de", 4},
-    {"es-419", 5},
-    {"es", 6},
-    {"it", 7},
-    {"nl", 8},
-    {"fr-ca", 9},
-    {"pt", 10},
-    {"ru", 11},
-    {"ko", 12},
-    {"zh-hant", 13},
-    {"zh-hans", 14},
-    {"pt-br", 15},
-    {"pl", 16},
-    {"th", 17},
+    {"en-us", 0},   {"en-gb", 1},  {"ja", 2},     {"fr", 3},     {"de", 4},
+    {"es-419", 5},  {"es", 6},     {"it", 7},     {"nl", 8},     {"fr-ca", 9},
+    {"pt", 10},     {"ru", 11},    {"ko", 12},    {"zh-hant", 13}, {"zh-hans", 14},
+    {"pt-br", 15},  {"pl", 16},    {"th", 17},
 }};
 
 void CopyNameToEntry(FileSys::LanguageEntry& entry, std::string_view name) {
@@ -58,9 +44,18 @@ void CopyNameToEntry(FileSys::LanguageEntry& entry, std::string_view name) {
     entry.application_name[length] = '\0';
 }
 
+void CopyDeveloperToEntry(FileSys::LanguageEntry& entry, std::string_view developer) {
+    const std::size_t length = std::min(developer.size(), entry.developer_name.size() - 1);
+    std::memcpy(entry.developer_name.data(), developer.data(), length);
+    entry.developer_name[length] = '\0';
+}
+
 std::unique_ptr<FileSys::NACP> BuildNacp(const NupContainer::PackageInfo& base,
                                          const std::string& version) {
-    if (base.title_name.empty() && base.localized_titles.empty() && version.empty()) {
+    const std::string& effective_title =
+        !base.title_name.empty() ? base.title_name : base.source_dump;
+    if (effective_title.empty() && base.localized_titles.empty() && base.publisher.empty() &&
+        version.empty()) {
         return nullptr;
     }
     auto nacp = std::make_unique<FileSys::NACP>();
@@ -75,8 +70,13 @@ std::unique_ptr<FileSys::NACP> BuildNacp(const NupContainer::PackageInfo& base,
             }
         }
     }
-    if (!base.title_name.empty()) {
-        CopyNameToEntry(nacp->raw.language_entries.language_entries[0], base.title_name);
+    if (!effective_title.empty()) {
+        CopyNameToEntry(nacp->raw.language_entries.language_entries[0], effective_title);
+    }
+    if (!base.publisher.empty()) {
+        for (auto& entry : nacp->raw.language_entries.language_entries) {
+            CopyDeveloperToEntry(entry, base.publisher);
+        }
     }
     if (!version.empty()) {
         const std::size_t length = std::min(version.size(), nacp->raw.version_string.size() - 1);
@@ -115,8 +115,9 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
     std::optional<std::size_t> exefs_index;
     if (base_index && nup->GetExeFSDir(*base_index) != nullptr) {
         program_index = base_index;
-        exefs_index =
-            update_index && nup->GetExeFSDir(*update_index) != nullptr ? update_index : base_index;
+        exefs_index = update_index && nup->GetExeFSDir(*update_index) != nullptr
+                          ? update_index
+                          : base_index;
     } else if (update_index && nup->GetExeFSDir(*update_index) != nullptr) {
         LOG_INFO(Loader,
                  "NUP container is a standalone update; booting the update program directly");
@@ -130,6 +131,35 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
 
     const auto& program = nup->GetPackages()[*program_index];
     base_title_id = program.title_id;
+
+    NupContainer::PackageInfo meta;
+    meta.title_id = program.title_id;
+    meta.title_name = program.title_name;
+    meta.localized_titles = program.localized_titles;
+    meta.source_dump = program.source_dump;
+    meta.publisher = program.publisher;
+    meta.icon = program.icon;
+    meta.localized_icons = program.localized_icons;
+    if (base_index && *base_index != *program_index) {
+        const auto& base = nup->GetPackages()[*base_index];
+        if (!base.title_name.empty()) {
+            meta.title_name = base.title_name;
+        }
+        if (!base.localized_titles.empty()) {
+            meta.localized_titles = base.localized_titles;
+        }
+        if (!base.source_dump.empty()) {
+            meta.source_dump = base.source_dump;
+        }
+        if (!base.publisher.empty()) {
+            meta.publisher = base.publisher;
+        }
+        if (!base.icon.empty() || !base.localized_icons.empty()) {
+            meta.icon = base.icon;
+            meta.localized_icons = base.localized_icons;
+        }
+    }
+    display_title = meta.title_name;
     has_program = true;
 
     const auto exefs = nup->GetExeFSDir(*exefs_index);
@@ -142,31 +172,34 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
 
     if (update_index) {
         const auto& update = nup->GetPackages()[*update_index];
-        display_version =
-            update.display_version.empty() ? DecodeVersion(update.version) : update.display_version;
+        content_version = update.version;
+        display_version = update.display_version.empty() ? DecodeVersion(update.version)
+                                                         : update.display_version;
     } else {
+        content_version = program.version;
         display_version = program.display_version.empty() ? DecodeVersion(program.version)
                                                           : program.display_version;
     }
-    nacp_file = BuildNacp(program, display_version);
-    if (nacp_file != nullptr && !program.icon.empty()) {
-        icon_file = std::make_shared<FileSys::VectorVfsFile>(program.icon, "icon.dat");
-    } else if (nacp_file != nullptr) {
-        for (const auto& [lang, icon] : program.localized_icons) {
+    nacp_file = BuildNacp(meta, display_version);
+    if (!meta.icon.empty()) {
+        icon_file = std::make_shared<FileSys::VectorVfsFile>(meta.icon, "icon.dat");
+    } else {
+        for (const auto& [lang, icon] : meta.localized_icons) {
             if (lang == "en-us") {
                 icon_file = std::make_shared<FileSys::VectorVfsFile>(icon, "icon_" + lang + ".dat");
-                break;
             }
         }
-        if (icon_file == nullptr && !program.localized_icons.empty()) {
+        if (icon_file == nullptr && !meta.localized_icons.empty()) {
             icon_file = std::make_shared<FileSys::VectorVfsFile>(
-                program.localized_icons.front().second, "icon.dat");
+                meta.localized_icons.front().second, "icon.dat");
         }
     }
 
-    const auto addon_count = std::count_if(
-        nup->GetPackages().begin(), nup->GetPackages().end(),
-        [](const auto& package) { return package.kind == NupContainer::PackageKind::Addon; });
+    const auto addon_count = std::count_if(nup->GetPackages().begin(), nup->GetPackages().end(),
+                                           [](const auto& package) {
+                                               return package.kind ==
+                                                      NupContainer::PackageKind::Addon;
+                                           });
     if (addon_count > 0) {
         LOG_WARNING(Loader,
                     "NUP container has {} add-on content package(s); AoC mounting is not "
@@ -206,7 +239,8 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
     return result;
 }
 
-ResultStatus AppLoader_NUP::VerifyIntegrity(std::function<bool(size_t, size_t)> progress_callback) {
+ResultStatus AppLoader_NUP::VerifyIntegrity(
+    std::function<bool(size_t, size_t)> progress_callback) {
     if (nup->GetStatus() != ResultStatus::Success) {
         return nup->GetStatus();
     }
@@ -262,6 +296,10 @@ ResultStatus AppLoader_NUP::ReadIcon(std::vector<u8>& buffer) {
 }
 
 ResultStatus AppLoader_NUP::ReadTitle(std::string& title) {
+    if (!display_title.empty()) {
+        title = display_title;
+        return ResultStatus::Success;
+    }
     if (nacp_file == nullptr) {
         return ResultStatus::ErrorNoControl;
     }

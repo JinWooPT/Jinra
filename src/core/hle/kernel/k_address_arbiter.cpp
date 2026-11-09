@@ -31,6 +31,19 @@ bool ReadFromUser(KernelCore& kernel, s32* out, KProcessAddress address) {
     return true;
 }
 
+bool ReadFromUser(KernelCore& kernel, s64* out, KProcessAddress address) {
+    auto& memory = GetCurrentMemory(kernel);
+    const u64 addr = GetInteger(address);
+
+    // Reject ranges that wrap past the end of the address space; the range check accepts them.
+    if (addr + sizeof(s64) < addr || !memory.IsValidVirtualAddressRange(addr, sizeof(s64))) {
+        return false;
+    }
+
+    *out = static_cast<s64>(memory.Read64(addr));
+    return true;
+}
+
 bool DecrementIfLessThan(KernelCore& kernel, s32* out, KProcessAddress address, s32 value) {
     auto& monitor = GetCurrentProcess(kernel).GetExclusiveMonitor();
     const auto current_core = kernel.CurrentPhysicalCoreIndex();
@@ -303,7 +316,7 @@ Result KAddressArbiter::WaitIfLessThan(uint64_t addr, s32 value, bool decrement,
     return cur_thread->GetWaitResult();
 }
 
-Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool compare_64_bits) {
+Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool is_64_bit) {
     // Prepare to wait.
     KThread* cur_thread = GetCurrentThreadPointer(system.Kernel());
     KHardwareTimer* timer{};
@@ -320,20 +333,17 @@ Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool 
 
         // Read the value from userspace.
         s64 user_value{};
-        if (compare_64_bits) {
-            auto& memory = GetCurrentMemory(system.Kernel());
-            if (!memory.IsValidVirtualAddress(addr)) {
-                slp.CancelSleep();
-                R_THROW(ResultInvalidCurrentMemory);
-            }
-            user_value = static_cast<s64>(memory.Read64(addr));
+        bool succeeded{};
+        if (is_64_bit) {
+            succeeded = ReadFromUser(system.Kernel(), std::addressof(user_value), addr);
         } else {
-            s32 user_value_32{};
-            if (!ReadFromUser(system.Kernel(), std::addressof(user_value_32), addr)) {
-                slp.CancelSleep();
-                R_THROW(ResultInvalidCurrentMemory);
-            }
-            user_value = user_value_32;
+            s32 user_value32{};
+            succeeded = ReadFromUser(system.Kernel(), std::addressof(user_value32), addr);
+            user_value = user_value32;
+        }
+        if (!succeeded) {
+            slp.CancelSleep();
+            R_THROW(ResultInvalidCurrentMemory);
         }
 
         // Check that the value is equal.

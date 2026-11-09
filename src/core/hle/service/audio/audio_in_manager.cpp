@@ -13,7 +13,7 @@ namespace Service::Audio {
 using namespace AudioCore::AudioIn;
 
 IAudioInManager::IAudioInManager(Core::System& system_)
-    : ServiceFramework{system_, "audin:u"}, impl{std::make_unique<AudioCore::AudioIn::Manager>(
+    : ServiceFramework{system_, "audin:u"}, impl{std::make_shared<AudioCore::AudioIn::Manager>(
                                                 system_)} {
     // clang-format off
     static const FunctionInfo functions[] = {
@@ -72,6 +72,7 @@ Result IAudioInManager::ListAudioInsAutoFiltered(
     R_SUCCEED();
 }
 
+/// Validate input configuration before allocating a session or retaining its process reference.
 Result IAudioInManager::OpenAudioInProtocolSpecified(
     Out<AudioInParameterInternal> out_parameter_internal, Out<SharedPointer<IAudioIn>> out_audio_in,
     OutArray<AudioDeviceName, BufferAttr_HipcAutoSelect> out_name,
@@ -91,6 +92,9 @@ Result IAudioInManager::OpenAudioInProtocolSpecified(
 
     std::scoped_lock l{impl->mutex};
 
+    const auto device_name = Common::StringFromBuffer(name[0].name);
+    R_TRY(AudioCore::AudioIn::System::IsConfigValid(device_name, parameter));
+
     size_t new_session_id{};
 
     R_TRY(impl->LinkToManager());
@@ -99,7 +103,6 @@ Result IAudioInManager::OpenAudioInProtocolSpecified(
     LOG_DEBUG(Service_Audio, "Opening new AudioIn, session_id={}, free sessions={}", new_session_id,
               impl->num_free_sessions);
 
-    const auto device_name = Common::StringFromBuffer(name[0].name);
     *out_audio_in = std::make_shared<IAudioIn>(system, *impl, new_session_id, device_name,
                                                parameter, process_handle.Get(), aruid.pid);
     impl->sessions[new_session_id] = (*out_audio_in)->GetImpl();

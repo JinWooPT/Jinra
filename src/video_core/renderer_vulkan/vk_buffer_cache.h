@@ -16,7 +16,6 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
-#include "video_core/buffer_cache/reusable_storage_batch.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
@@ -31,10 +30,6 @@ class Scheduler;
 struct HostVertexBinding;
 
 class BufferCacheRuntime;
-
-[[nodiscard]] VideoCore::Surface::PixelFormat ResolveTextureBufferFormat(
-    const Shader::TextureBufferDescriptor& descriptor, VideoCore::Surface::PixelFormat format,
-    GPUVAddr address, u32 size);
 
 class Buffer : public VideoCommon::BufferBase {
 public:
@@ -52,20 +47,12 @@ public:
         return device_address;
     }
 
-    [[nodiscard]] bool IsNull() const noexcept {
-        return !device || is_null;
-    }
-
     [[nodiscard]] bool IsSparseCompatible() const noexcept {
         return sparse_compatible;
     }
 
     [[nodiscard]] vk::MemoryLocation Location() const noexcept {
         return buffer.Location();
-    }
-
-    [[nodiscard]] std::span<const u8> MappedReadback() const noexcept {
-        return buffer.IsHostCoherent() ? buffer.Mapped() : std::span<const u8>{};
     }
 
     [[nodiscard]] bool IsRegionUsed(u64 offset, u64 size) const noexcept {
@@ -80,6 +67,10 @@ public:
 
     [[nodiscard]] u64 LastUsageTick() const noexcept {
         return last_usage_tick;
+    }
+
+    [[nodiscard]] std::span<const u8> Mapped() const noexcept {
+        return buffer.IsHostCoherent() ? buffer.Mapped() : std::span<const u8>{};
     }
 
     operator VkBuffer() const noexcept {
@@ -123,16 +114,25 @@ public:
 
     void TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept;
 
+    /// Returns the mask of bindings whose repacked state changed.
+    u32 SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs, bool dynamic_input);
+
+    bool IsVertexRepacked(u32 binding) const {
+        return (vertex_repack_mask & (1U << binding)) != 0;
+    }
+
     u64 CurrentTick();
 
     bool IsFree(u64 tick);
 
     void Wait(u64 tick);
 
+    /// Waits for a submitted tick without flushing: safe on threads other than the GPU thread.
+    void WaitSubmittedTick(u64 tick);
+
     void Finish();
 
-    std::span<const u8> ReadMappedBuffer(Buffer& buffer,
-                                        std::span<const VideoCommon::BufferCopy> copies);
+    void FinishForHostRead();
 
     u64 GetDeviceLocalMemory() const;
 
@@ -143,6 +143,9 @@ public:
     u32 GetUniformBufferAlignment() const;
 
     u32 GetStorageBufferAlignment() const;
+
+    /// Largest range a storage buffer binding may have
+    u64 GetMaxStorageBufferRange() const;
 
     [[nodiscard]] StagingBufferRef UploadStagingBuffer(size_t size);
 
@@ -167,6 +170,12 @@ public:
 
     void BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count);
 
+    bool WidensUint8IndicesOnHost() const {
+        return device.IsMoltenVK() && !device.IsExtIndexTypeUint8Supported();
+    }
+
+    void BindHostUint8IndexBuffer(std::span<const u8> indices);
+
     void BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset, u32 size, u32 stride);
 
     void BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bindings);
@@ -175,13 +184,38 @@ public:
 
     void BindTransformFeedbackBuffers(VideoCommon::HostBindings<Buffer>& bindings);
 
+    /// This and the two members below are the hooks of VideoCommon::StreamUniformReusable
+    /// (buffer_cache/uniform_stream_reuse.h).
+    struct StreamUniformRef {
+        VkBuffer buffer;
+        VkDeviceAddress device_address; // base of `buffer`, 0 without buffer device address
+        u32 offset;
+    };
+
     std::span<u8> BindMappedUniformBuffer([[maybe_unused]] size_t stage,
                                           [[maybe_unused]] u32 binding_index,
                                           u32 size) {
         const StagingBufferRef ref = staging_pool.Request(size, MemoryUsage::Upload);
-        guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address,
-                                         static_cast<u32>(ref.offset), size);
+        last_stream_uniform = StreamUniformRef{
+            .buffer = ref.buffer,
+            .device_address = ref.device_address,
+            .offset = static_cast<u32>(ref.offset),
+        };
+        RebindStreamUniform(last_stream_uniform, size);
         return ref.mapped_span;
+    }
+
+    /// The allocation of the latest BindMappedUniformBuffer call.
+    [[nodiscard]] StreamUniformRef LastStreamUniformRef() const noexcept {
+        return last_stream_uniform;
+    }
+
+    /// Adds `ref` to the descriptor payload exactly as BindMappedUniformBuffer did when it made
+    /// the allocation (it is the very same call). The caller guarantees the allocation is still
+    /// live: made on the scheduler tick that is current now, so the staging pool has not recycled
+    /// it and the GPU has not even started on it.
+    void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
+        guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address, ref.offset, size);
     }
 
     [[nodiscard]] VkDeviceSize SparseAlignmentFor(bool sparse_compatible) const noexcept {
@@ -214,21 +248,7 @@ public:
         multi_range_total += size;
     }
 
-    void BeginStorageBatch(bool native) {
-        grouped_storage = native;
-        static const bool reuse = [] {
-            const char* value = std::getenv("EDEN_NATIVE_STORAGE_REUSE");
-            return value && value[0] == '1';
-        }();
-        retain_storage_batch = native && reuse;
-        storage_batch.Reset(retain_storage_batch);
-    }
-
-    [[nodiscard]] bool UseGroupedStorage() const noexcept { return grouped_storage; }
-
-    void FlushStorageWrites();
-
-    bool BindMultiRangeStorageBuffer(u64 key, bool is_written, u32 offset = 0, u32 size = 0);
+    bool BindMultiRangeStorageBuffer(u64 key, bool is_written);
 
     void InvalidateMultiRange(u64 key) {
         multi_range_buffers.Invalidate(key);
@@ -249,9 +269,9 @@ public:
 
     void BindTextureBuffer(Buffer& buffer, u32 offset, u32 size,
                            VideoCore::Surface::PixelFormat format) {
-        if (buffer.IsNull()) {
-            offset = 0;
-            size = 16;
+        // An unmapped texture buffer has no format; its view is the null buffer's anyway.
+        if (format == VideoCore::Surface::PixelFormat::Invalid) {
+            format = VideoCore::Surface::PixelFormat::R8_UNORM;
         }
         guest_descriptor_queue.AddTexelBuffer(buffer.View(offset, size, format),
                                               buffer.DeviceAddress(), offset, size,
@@ -293,24 +313,26 @@ private:
     vk::Buffer null_buffer;
 
     std::unique_ptr<Uint8Pass> uint8_pass;
+    std::unique_ptr<VertexRepackPass> vertex_repack_pass;
+    u32 vertex_repack_mask{};
+    bool static_vertex_repack{};
     QuadIndexedPass quad_index_pass;
-
-    struct StorageBatchEntry {
-        u64 key{};
-        MultiRangeRef ref;
-        std::vector<MultiRangeSource> sources;
-        bool written{};
-    };
-    VideoCommon::ReusableStorageBatch<StorageBatchEntry> storage_batch;
-    bool retain_storage_batch{};
-    bool grouped_storage{};
 
     MultiRangeBufferCache multi_range_buffers;
     boost::container::small_vector<MultiRangeSource, 16> multi_range_sources;
     VkDeviceSize multi_range_total{};
 
+    StreamUniformRef last_stream_uniform{};
+
     bool limit_dynamic_storage_buffers = false;
     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();
+
+    /// The index buffer BindIndexBuffer recorded last, at scheduler recording epoch bound_index_epoch.
+    VkBuffer bound_index_buffer = VK_NULL_HANDLE;
+    VkDeviceSize bound_index_offset = 0;
+    VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
+    u64 bound_index_epoch = 0;
+    bool bound_index_valid = false;
 };
 
 struct BufferCacheParams {

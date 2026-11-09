@@ -26,7 +26,6 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
-#include "video_core/native_root_table.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -84,7 +83,7 @@ public:
         static constexpr std::size_t MaxShaderProgram = 6;
         static constexpr std::size_t MaxShaderStage = 5;
         // Maximum number of const buffers per shader stage.
-        static constexpr std::size_t MaxConstBuffers = 32;
+        static constexpr std::size_t MaxConstBuffers = 18;
         static constexpr std::size_t MaxConstBufferSize = 0x10000;
 
         struct ID {
@@ -3065,11 +3064,13 @@ public:
             Maxwell3D::Regs::PrimitiveTopology topology{};
             DrawMode draw_mode{};
             bool draw_indexed{};
+            u32 draw_element_count{}; // Zero for indirect draws whose count is not known yet.
             u32 base_index{};
             Maxwell3D::Regs::VertexBuffer vertex_buffer;
             Maxwell3D::Regs::IndexBuffer index_buffer;
             u32 base_instance{};
             u32 instance_count{};
+            /// Deferred instances already drawn by flushes in the middle of the current loop.
             u32 drawn_instances{};
             std::vector<u8> inline_index_draw_indexes;
         };
@@ -3097,11 +3098,14 @@ public:
         };
         void ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument);
         void Clear(Maxwell3D& maxwell3d, u32 layer_count);
-        bool HasDeferredDraw() const {
+        /// Draws the waiting instances. loop_continues is set when the loop goes on afterwards.
+        void DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues = false);
+        /// Instances after the first wait to be drawn together (DrawDeferred).
+        [[nodiscard]] bool HasDeferredDraw() const noexcept {
             return draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0;
         }
-        static bool IsInstanceLoopMethod(u32 method) noexcept;
-        void DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues = false);
+        /// Methods an instance loop writes between its draws; any other write ends the loop.
+        [[nodiscard]] static bool IsInstanceLoopMethod(u32 method) noexcept;
         void DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances);
         void DrawArrayInstanced(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, bool subsequent);
         void DrawIndex(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count, u32 base_index, u32 base_instance, u32 num_instances);
@@ -3156,7 +3160,6 @@ public:
     };
 
     State state{};
-    NativeRootTables native_root_tables;
 
     /// Reads a register value located at the input method address
     u32 GetRegisterValue(u32 method) const;
@@ -3176,10 +3179,21 @@ public:
         native_macro_context = std::move(context);
     }
     MacroEngine& GetNativeMacroEngine() { return native_macro_context ? native_macro_context->engine : macro_engine; }
-    TuringMacroInterpreter& GetNativeMacroInterpreter() { return native_interpreter; }
     /// This channel's MME data RAM (shared with its compute engine).
     std::array<u32, 0xc00>& GetNativeDataRam() { return native_data_ram; }
     std::span<u32> GetNativeMacroPositions() { return native_macro_context ? std::span<u32>{native_macro_context->positions} : std::span<u32>{macro_positions}; }
+
+    /// Root tables: eight 256-byte tables written inline (method 0x504 selects a table, bits 0-2,
+    /// and a byte offset, bits 8-15; each 0x508 writes the next word) that shaders read as constant
+    /// banks 24-31. NVN2 keeps push constants in bank 24, which the Ampere lowering reads as bank 17.
+    struct RootTables {
+        static constexpr u32 SelectMethod = 0x504 / 4;
+        static constexpr u32 LoadMethod = 0x508 / 4;
+        std::array<std::array<u32, 64>, 8> tables{};
+        u32 selected{};
+        u32 offset{};
+        bool loaded{};
+    } root_tables;
 
 
     /// Write the value to the register identified by method.
@@ -3187,6 +3201,11 @@ public:
 
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
+
+    /// GpuSplit's back (fast_maxwell3d): CallMethod for each of up to 64 single writes to the
+    /// constant buffer data registers, uploaded in one memory write within a device page.
+    void CallConstBufferWords(Core::System& system, const u32* methods, const u32* arguments,
+                              u32 count);
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
@@ -3230,8 +3249,6 @@ public:
         return 0;
     }
 
-    bool ReadMacroMemory(GPUVAddr address, std::span<u32> words);
-
     void RefreshParameters() {
         if (!current_macro_dirty) {
             return;
@@ -3271,6 +3288,12 @@ private:
     void ConsumeSinkImpl(Core::System& system) override;
 
     void ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call);
+
+    /// CallMethod with every check, for the cases and tools CallMethodFast leaves out.
+    void CallMethodSlow(Core::System& system, u32 method, u32 method_argument, bool is_last_call);
+    void CallMethodFast(u32 method, u32 method_argument, bool is_last_call);
+    /// EDEN_NX2_PERF_VERIFY: CallMethodFast's register state against CallMethodSlow's.
+    void VerifyCallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call);
 
     /// Retrieves information about a specific TIC entry from the TIC buffer.
     Texture::TICEntry GetTICEntry(u32 tic_index) const;
@@ -3339,9 +3362,19 @@ private:
         u32 amount;
         u32 pending;
     };
-    std::array<RecentWrite, 64> recent_writes{};
+    std::array<RecentWrite, 48> recent_writes{};
     size_t recent_write_index = 0;
+    const bool record_write_history{
+#ifdef NDEBUG
+        std::getenv("EDEN_NX2_3D_HISTORY") != nullptr
+#else
+        true
+#endif
+    };
     void RecordWrite(u32 method, u32 argument, u32 amount, u32 pending) {
+        if (!record_write_history) {
+            return;
+        }
         recent_writes[recent_write_index++ % recent_writes.size()] = {method, argument, amount, pending};
     }
     void DumpRecentWrites(u32 method);
@@ -3352,7 +3385,6 @@ private:
     std::shared_ptr<NativeMacroContext> native_macro_context;
     std::array<u32, 0xc00> native_data_ram{};
     MacroEngine macro_engine;
-    TuringMacroInterpreter native_interpreter;
 
     Upload::State upload_state;
 
@@ -3365,10 +3397,14 @@ private:
     // the front owns the macro code and bindings (the back thread then leaves them alone).
     struct FrontState;
     FrontState& Front(Core::System& system, VideoCommon::GpuSplit& split);
+    void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
-    void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
+    void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
+    bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
+    void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
+                      u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;

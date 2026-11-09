@@ -6,20 +6,15 @@
 
 #pragma once
 
-#include <atomic>
 #include <cstddef>
 #include <optional>
 
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
-#include "common/logging.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
-#include "shader_recompiler/exception.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
-#include "video_core/renderer_vulkan/vk_buffer_texture_array.h"
-#include "video_core/renderer_vulkan/vk_push_constant_state.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
@@ -247,16 +242,18 @@ public:
         });
     }
 
-    VkShaderStageFlags PushConstantStages() const noexcept {
-        return Vulkan::PushConstantStages(shader_stages);
-    }
-
     vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
         using Shader::Backend::SPIRV::RenderAreaLayout;
         using Shader::Backend::SPIRV::RescalingLayout;
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
         const VkPushConstantRange range{
-            .stageFlags = PushConstantStages(),
+            .stageFlags = static_cast<VkShaderStageFlags>(
+                is_compute ? VK_SHADER_STAGE_COMPUTE_BIT
+                : mesh_emulation
+                    ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT
+                    : (uses_mesh ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                       VK_SHADER_STAGE_MESH_BIT_EXT
+                                 : VK_SHADER_STAGE_ALL_GRAPHICS)),
             .offset = 0,
             .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
                     static_cast<u32>(sizeof(RenderAreaLayout)),
@@ -272,9 +269,38 @@ public:
         });
     }
 
+    /// Mesh emulation: a graphics pipeline layout whose mesh program runs as a compute shader
+    /// (its bindings carry VK_SHADER_STAGE_COMPUTE_BIT and so does the push constant range).
+    void EnableMeshEmulation() noexcept {
+        mesh_emulation = true;
+    }
+
+    /// Mesh emulation: the output storage buffer the compute shader writes and the vertex
+    /// shader reads, at an explicit binding (after every program's bindings).
+    void AddMeshEmulationOutput(u32 output_binding) {
+        bindings.push_back({
+            .binding = output_binding,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = nullptr,
+        });
+        entries.push_back({
+            .dstBinding = output_binding,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .offset = offset,
+            .stride = sizeof(DescriptorUpdateEntry),
+        });
+        binding = (std::max)(binding, output_binding + 1);
+        ++num_descriptors;
+        offset += sizeof(DescriptorUpdateEntry);
+    }
+
     void Add(const Shader::Info& info, VkShaderStageFlags stage) {
-        is_compute |= (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
-        shader_stages |= stage;
+        is_compute |= (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0 && !mesh_emulation;
+        uses_mesh |= (stage & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
 
         Add(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage, info.constant_buffer_descriptors);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage, info.storage_buffers_descriptors);
@@ -312,7 +338,8 @@ private:
 
     const Device* device{};
     bool is_compute{};
-    VkShaderStageFlags shader_stages{};
+    bool uses_mesh{};
+    bool mesh_emulation{};
     boost::container::small_vector<VkDescriptorSetLayoutBinding, 32> bindings;
     boost::container::small_vector<VkDescriptorUpdateTemplateEntry, 32> entries;
     u32 binding{};
@@ -364,57 +391,26 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
-                                 const VideoCommon::ImageViewInOut*& views,
-                                 bool allow_actual_array_views = false, u64 debug_shader_hash = 0,
-                                 bool legacy_array_scope = false) {
+                                 const VideoCommon::ImageViewInOut*& views) {
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
     views += num_texture_buffers;
     views += num_image_buffers;
     for (const auto& desc : info.texture_descriptors) {
         bool is_rescaled{};
-        const bool preserve_actual_views = allow_actual_array_views &&
-            IsReadOnlyBufferTextureArray(desc, info.storage_buffers_descriptors) &&
-            (!legacy_array_scope ||
-             MatchesLegacyBufferTextureArrayScope(desc, info.storage_buffers_descriptors));
         for (u32 index = 0; index < desc.count; ++index) {
-            const auto& guest_view = *views++;
-            const VideoCommon::ImageViewId image_view_id{guest_view.id};
+            const VideoCommon::ImageViewId image_view_id{(views++)->id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             VkImageView vk_image_view{image_view.Handle(desc.type)};
-            bool actual_view{};
-            if (desc.buffer_source.enabled && image_view_id != VideoCommon::NULL_IMAGE_VIEW_ID &&
-                (VideoCore::Surface::IsPixelFormatInteger(image_view.format) || vk_image_view == VK_NULL_HANDLE)) {
-                // PARTIALLY_BOUND arrays may contain other guest view types in unused slots.
-                if (preserve_actual_views) {
-                    if (const auto type = ActualBufferTextureView(
-                            image_view.type, VideoCore::Surface::IsPixelFormatInteger(image_view.format))) {
-                        vk_image_view = image_view.Handle(*type);
-                        actual_view = vk_image_view != VK_NULL_HANDLE;
-                        static std::atomic_flag logged;
-                        if (actual_view && !logged.test_and_set(std::memory_order_relaxed)) {
-                            LOG_DEBUG(Render_Vulkan, "Preserved guest texture array view: slot {}, TIC {}, type {}, format {}, shader {:016x}",
-                                      index, guest_view.index, static_cast<u32>(image_view.type),
-                                      static_cast<u32>(image_view.format), debug_shader_hash);
-                        }
-                    }
-                }
-                if (!actual_view)
-                    throw Shader::NotImplementedException(
-                        "Buffer-backed texture entry {} (CB{}+{:#x}, field {:#x}) has format {}, expected type {}, view available {}, texture index {}, guest type {}, width query {}",
-                        index, desc.cbuf_index, desc.cbuf_offset, desc.buffer_source.offset,
-                        static_cast<u32>(image_view.format), static_cast<u32>(desc.type), vk_image_view != VK_NULL_HANDLE,
-                        guest_view.index, static_cast<u32>(image_view.type), desc.buffer_source.width_query);
-            }
             if (vk_image_view == VK_NULL_HANDLE) {
                 const VkImageView null_image_view{texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID).Handle(desc.type)};
                 if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
             }
             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
             guest_descriptor_queue.AddSampledImage(vk_image_view,
-                                                   sampler.HandleFor(image_view, desc.is_depth && !actual_view));
-            const bool element_rescaled{!actual_view && texture_cache.IsRescaling(image_view)};
+                                                   sampler.HandleFor(image_view, desc.is_depth));
+            const bool element_rescaled{texture_cache.IsRescaling(image_view)};
             is_rescaled |= element_rescaled;
         }
         rescaling.PushTexture(is_rescaled);
@@ -423,10 +419,11 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
         bool is_rescaled{};
         for (u32 index = 0; index < desc.count; ++index) {
             ImageView& image_view{texture_cache.GetImageView((views++)->id)};
+            const VkImageView vk_image_view{
+                image_view.StorageView(desc.type, desc.format, desc.is_byte_addressed)};
             if (desc.is_written) {
                 texture_cache.MarkModification(image_view.image_id);
             }
-            const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
             guest_descriptor_queue.AddImage(vk_image_view);
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
             is_rescaled |= element_rescaled;

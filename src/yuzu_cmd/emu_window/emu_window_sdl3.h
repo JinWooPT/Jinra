@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdlib>
+#include <string>
 #include <tuple>
 #include <utility>
 
@@ -15,6 +17,7 @@
 
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
+#include "yuzu_cmd/emu_window/sdl_window_state.h"
 
 namespace Core {
 class System;
@@ -40,6 +43,9 @@ public:
 
     /// Whether the window is still open, and a close request hasn't yet been sent
     bool IsOpen() const;
+
+    /// Sets the title the titlebar timer prepared; call from the main thread.
+    void ApplyPendingTitle();
 
     /// Returns if window is shown (not minimized)
     bool IsShown() const override;
@@ -92,6 +98,7 @@ protected:
 
     /// Periodic changer of titlebar (independent of event loop)
     SDL_TimerID titlebar_timer;
+    std::atomic<std::string*> pending_title{};
 
     // Mouse resetter once it
     SDL_TimerID mouse_timer;
@@ -99,8 +106,8 @@ protected:
     /// Is the window still open?
     bool is_open = true;
 
-    /// Is the window being shown?
-    bool is_shown = true;
+    /// SDL-thread updates, queried by the renderer.
+    SdlWindowState window_state;
 
     /// Internal SDL3 render window
     SDL_Window* render_window{};

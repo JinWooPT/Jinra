@@ -6,15 +6,23 @@
 
 #pragma once
 
+#include <optional>
+#include <vector>
+
 #include <sirit/sirit.h>
 
 #include "common/common_types.h"
+
+namespace Shader {
+struct Profile;
+}
 
 namespace Shader::IR {
 enum class Attribute : u64;
 enum class Patch : u64;
 class Inst;
 class Value;
+struct Program;
 } // namespace Shader::IR
 
 namespace Shader::Backend::SPIRV {
@@ -22,6 +30,7 @@ namespace Shader::Backend::SPIRV {
 using Sirit::Id;
 
 class EmitContext;
+struct CooperativeHmmaTypes;
 
 // Microinstruction emitters
 Id EmitPhi(EmitContext& ctx, IR::Inst* inst);
@@ -96,17 +105,17 @@ Id EmitUndefU8(EmitContext& ctx);
 Id EmitUndefU16(EmitContext& ctx);
 Id EmitUndefU32(EmitContext& ctx);
 Id EmitUndefU64(EmitContext& ctx);
-Id EmitLoadGlobalU8(EmitContext& ctx, Id address);
-Id EmitLoadGlobalS8(EmitContext& ctx, Id address);
-Id EmitLoadGlobalU16(EmitContext& ctx, Id address);
-Id EmitLoadGlobalS16(EmitContext& ctx, Id address);
+void EmitLoadGlobalU8(EmitContext& ctx);
+void EmitLoadGlobalS8(EmitContext& ctx);
+void EmitLoadGlobalU16(EmitContext& ctx);
+void EmitLoadGlobalS16(EmitContext& ctx);
 Id EmitLoadGlobal32(EmitContext& ctx, Id address);
 Id EmitLoadGlobal64(EmitContext& ctx, Id address);
 Id EmitLoadGlobal128(EmitContext& ctx, Id address);
-void EmitWriteGlobalU8(EmitContext& ctx, Id address, Id value);
-void EmitWriteGlobalS8(EmitContext& ctx, Id address, Id value);
-void EmitWriteGlobalU16(EmitContext& ctx, Id address, Id value);
-void EmitWriteGlobalS16(EmitContext& ctx, Id address, Id value);
+void EmitWriteGlobalU8(EmitContext& ctx);
+void EmitWriteGlobalS8(EmitContext& ctx);
+void EmitWriteGlobalU16(EmitContext& ctx);
+void EmitWriteGlobalS16(EmitContext& ctx);
 void EmitWriteGlobal32(EmitContext& ctx, Id address, Id value);
 void EmitWriteGlobal64(EmitContext& ctx, Id address, Id value);
 void EmitWriteGlobal128(EmitContext& ctx, Id address, Id value);
@@ -372,6 +381,8 @@ Id EmitStorageAtomicXor32(EmitContext& ctx, const IR::Value& binding, const IR::
                           Id value);
 Id EmitStorageAtomicExchange32(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                                Id value);
+Id EmitStorageAtomicCompareExchange32(EmitContext& ctx, const IR::Value& binding,
+                                      const IR::Value& offset, Id comparator, Id value);
 Id EmitStorageAtomicIAdd64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                            Id value);
 Id EmitStorageAtomicSMin64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
@@ -422,17 +433,19 @@ Id EmitStorageAtomicMaxF16x2(EmitContext& ctx, const IR::Value& binding, const I
                              Id value);
 Id EmitStorageAtomicMaxF32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                              Id value);
-Id EmitGlobalAtomicIAdd32(EmitContext& ctx, Id address, Id value);
-Id EmitGlobalAtomicSMin32(EmitContext& ctx, Id address, Id value);
-Id EmitGlobalAtomicUMin32(EmitContext& ctx, Id address, Id value);
-Id EmitGlobalAtomicSMax32(EmitContext& ctx, Id address, Id value);
-Id EmitGlobalAtomicUMax32(EmitContext& ctx, Id address, Id value);
-Id EmitGlobalAtomicInc32(EmitContext& ctx, Id address, Id value);
-Id EmitGlobalAtomicDec32(EmitContext& ctx, Id address, Id value);
-Id EmitGlobalAtomicAnd32(EmitContext& ctx, Id address, Id value);
-Id EmitGlobalAtomicOr32(EmitContext& ctx, Id address, Id value);
-Id EmitGlobalAtomicXor32(EmitContext& ctx, Id address, Id value);
-Id EmitGlobalAtomicExchange32(EmitContext& ctx, Id address, Id value);
+Id EmitGlobalAtomicIAdd32(EmitContext& ctx, const IR::Value& address, Id value);
+Id EmitGlobalAtomicSMin32(EmitContext& ctx, const IR::Value& address, Id value);
+Id EmitGlobalAtomicUMin32(EmitContext& ctx, const IR::Value& address, Id value);
+Id EmitGlobalAtomicSMax32(EmitContext& ctx, const IR::Value& address, Id value);
+Id EmitGlobalAtomicUMax32(EmitContext& ctx, const IR::Value& address, Id value);
+Id EmitGlobalAtomicInc32(EmitContext& ctx, const IR::Value& address, Id value);
+Id EmitGlobalAtomicDec32(EmitContext& ctx, const IR::Value& address, Id value);
+Id EmitGlobalAtomicAnd32(EmitContext& ctx, const IR::Value& address, Id value);
+Id EmitGlobalAtomicOr32(EmitContext& ctx, const IR::Value& address, Id value);
+Id EmitGlobalAtomicXor32(EmitContext& ctx, const IR::Value& address, Id value);
+Id EmitGlobalAtomicExchange32(EmitContext& ctx, const IR::Value& address, Id value);
+Id EmitGlobalAtomicCompareExchange32(EmitContext& ctx, const IR::Value& address, Id comparator,
+                                     Id value);
 Id EmitGlobalAtomicIAdd64(EmitContext& ctx);
 Id EmitGlobalAtomicSMin64(EmitContext& ctx);
 Id EmitGlobalAtomicUMin64(EmitContext& ctx);
@@ -455,7 +468,7 @@ Id EmitGlobalAtomicAnd32x2(EmitContext& ctx);
 Id EmitGlobalAtomicOr32x2(EmitContext& ctx);
 Id EmitGlobalAtomicXor32x2(EmitContext& ctx);
 Id EmitGlobalAtomicExchange32x2(EmitContext& ctx);
-Id EmitGlobalAtomicAddF32(EmitContext& ctx);
+Id EmitGlobalAtomicAddF32(EmitContext& ctx, const IR::Value& address, Id value);
 Id EmitGlobalAtomicAddF16x2(EmitContext& ctx);
 Id EmitGlobalAtomicAddF32x2(EmitContext& ctx);
 Id EmitGlobalAtomicMinF16x2(EmitContext& ctx);
@@ -636,5 +649,12 @@ Id EmitDPdxFine(EmitContext& ctx, Id op_a);
 Id EmitDPdyFine(EmitContext& ctx, Id op_a);
 Id EmitDPdxCoarse(EmitContext& ctx, Id op_a);
 Id EmitDPdyCoarse(EmitContext& ctx, Id op_a);
+
+Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c);
+void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program);
+void PatchCooperativeHmma(std::vector<u32>& code, const CooperativeHmmaTypes& types);
+/// Appends the shared memory of the 16x16x16 HMMA path to a program that runs it, and returns the
+/// word where it starts.
+std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Program& program);
 
 } // namespace Shader::Backend::SPIRV

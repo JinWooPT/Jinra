@@ -7,8 +7,6 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
-#include <memory>
 #include <condition_variable>
 #include <mutex>
 #include <boost/container/deque.hpp>
@@ -27,7 +25,6 @@ namespace Vulkan {
 class Device;
 class Scheduler;
 class Swapchain;
-class PresentationTimingStats;
 
 struct Frame {
     u32 width;
@@ -41,8 +38,6 @@ struct Frame {
     vk::Semaphore render_ready;
     vk::Fence present_done;
     bool storage_capable{};
-    std::chrono::steady_clock::time_point diagnostic_request{};
-    double diagnostic_reuse_wait_ms{};
 };
 
 class PresentManager {
@@ -107,7 +102,6 @@ private:
     std::mutex swapchain_mutex;
     std::mutex queue_mutex;
     std::mutex free_mutex;
-    std::unique_ptr<PresentationTimingStats> timing_stats;
     std::jthread present_thread;
     bool blit_supported;
     bool storage_supported;

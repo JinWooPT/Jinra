@@ -14,6 +14,7 @@
 #include "common/logging.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/vulkan_common/vulkan_pipeline_binary_cache.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan::vk {
@@ -167,6 +168,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdSetColorBlendEnableEXT);
     X(vkCmdSetColorBlendEquationEXT);
     X(vkCmdResetQueryPool);
+    X(vkCmdWriteTimestamp);
     X(vkCmdResolveImage);
     X(vkCreateBuffer);
     X(vkCreateBufferView);
@@ -220,13 +222,20 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkGetEventStatus);
     X(vkGetFenceStatus);
     X(vkGetImageMemoryRequirements);
+    X(vkGetImageSparseMemoryRequirements);
     X(vkGetPipelineCacheData);
     X(vkGetMemoryFdKHR);
 #ifdef _WIN32
     X(vkGetMemoryWin32HandleKHR);
 #endif
     X(vkGetQueryPoolResults);
+    X(vkGetDeviceFaultInfoEXT);
     X(vkGetPipelineExecutablePropertiesKHR);
+    X(vkGetPipelineKeyKHR);
+    X(vkCreatePipelineBinariesKHR);
+    X(vkDestroyPipelineBinaryKHR);
+    X(vkGetPipelineBinaryDataKHR);
+    X(vkReleaseCapturedPipelineDataKHR);
     X(vkGetPipelineExecutableStatisticsKHR);
     X(vkGetSemaphoreCounterValue);
     X(vkMapMemory);
@@ -313,6 +322,7 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
     X(vkDestroyDebugUtilsMessengerEXT);
     X(vkDestroyDebugReportCallbackEXT);
     X(vkDestroySurfaceKHR);
+    X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR);
     X(vkGetPhysicalDeviceFeatures2);
     X(vkGetPhysicalDeviceFormatProperties2);
     X(vkGetPhysicalDeviceProperties2);
@@ -523,6 +533,28 @@ void Image::Release() const noexcept {
     if (handle) {
         vmaDestroyImage(allocator, handle, allocation);
     }
+}
+
+Image::MemoryBlock Image::GetMemoryBlock() const noexcept {
+    if (allocation == nullptr) {
+        return {};
+    }
+    VmaAllocationInfo2 info{};
+    vmaGetAllocationInfo2(allocator, allocation, &info);
+    if (info.dedicatedMemory) {
+        return {0, info.blockSize, info.allocationInfo.size};
+    }
+    return {reinterpret_cast<u64>(info.allocationInfo.deviceMemory), info.blockSize,
+            info.allocationInfo.size};
+}
+
+bool Image::IsDeviceLocal() const noexcept {
+    if (allocation == nullptr) {
+        return false;
+    }
+    VkMemoryPropertyFlags flags{};
+    vmaGetAllocationMemoryProperties(allocator, allocation, &flags);
+    return (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
 }
 
 void Buffer::Flush() const {
@@ -759,7 +791,10 @@ PipelineLayout Device::CreatePipelineLayout(const VkPipelineLayoutCreateInfo& ci
 
 Pipeline Device::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, VkPipelineCache cache) const {
     VkPipeline object = VK_NULL_HANDLE;
-    auto const result = dld->vkCreateGraphicsPipelines(handle, cache, 1, &ci, nullptr, &object);
+    VkResult result;
+    if (!PipelineBinaryCache::CreateGraphicsPipeline(handle, *dld, ci, cache, &object, &result)) {
+        result = dld->vkCreateGraphicsPipelines(handle, cache, 1, &ci, nullptr, &object);
+    }
     // Adreno 5xx drivers do not properly return when a graphics pipeline fails to be created
     // Some (unkown) Mali drivers also do not properly return
     // This result code is out of spec, but should be handled as "kinda working"
@@ -771,9 +806,21 @@ Pipeline Device::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, 
 
 Pipeline Device::CreateComputePipeline(const VkComputePipelineCreateInfo& ci,
                                        VkPipelineCache cache) const {
-    VkPipeline object;
-    Check(dld->vkCreateComputePipelines(handle, cache, 1, &ci, nullptr, &object));
+    VkPipeline object = VK_NULL_HANDLE;
+    VkResult result;
+    if (!PipelineBinaryCache::CreateComputePipeline(handle, *dld, ci, cache, &object, &result)) {
+        result = dld->vkCreateComputePipelines(handle, cache, 1, &ci, nullptr, &object);
+    }
+    Check(result);
     return Pipeline(object, handle, *dld);
+}
+
+bool Device::EnablePipelineBinaryCache(const std::filesystem::path& file) const {
+    return PipelineBinaryCache::Activate(handle, *dld, file);
+}
+
+void Device::DisablePipelineBinaryCache() const {
+    PipelineBinaryCache::Deactivate(handle);
 }
 
 Sampler Device::CreateSampler(const VkSamplerCreateInfo& ci) const {
@@ -864,6 +911,16 @@ VkMemoryRequirements Device::GetBufferMemoryRequirements(VkBuffer buffer,
 VkMemoryRequirements Device::GetImageMemoryRequirements(VkImage image) const noexcept {
     VkMemoryRequirements requirements;
     dld->vkGetImageMemoryRequirements(handle, image, &requirements);
+    return requirements;
+}
+
+std::vector<VkSparseImageMemoryRequirements> Device::GetImageSparseMemoryRequirements(
+    VkImage image) const {
+    u32 count = 0;
+    dld->vkGetImageSparseMemoryRequirements(handle, image, &count, nullptr);
+    std::vector<VkSparseImageMemoryRequirements> requirements(count);
+    dld->vkGetImageSparseMemoryRequirements(handle, image, &count, requirements.data());
+    requirements.resize(count);
     return requirements;
 }
 
@@ -978,6 +1035,29 @@ std::vector<VkPhysicalDeviceToolProperties> PhysicalDevice::GetPhysicalDeviceToo
     dld->vkGetPhysicalDeviceToolProperties(physical_device, &num, nullptr);
     std::vector<VkPhysicalDeviceToolProperties> properties(num);
     dld->vkGetPhysicalDeviceToolProperties(physical_device, &num, properties.data());
+    return properties;
+}
+
+std::vector<VkCooperativeMatrixPropertiesKHR> PhysicalDevice::GetCooperativeMatrixPropertiesKHR()
+    const {
+    if (!dld->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) {
+        return {};
+    }
+    u32 num = 0;
+    if (dld->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physical_device, &num, nullptr) !=
+        VK_SUCCESS) {
+        return {};
+    }
+    std::vector<VkCooperativeMatrixPropertiesKHR> properties(
+        num, VkCooperativeMatrixPropertiesKHR{
+                 .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
+                 .pNext = nullptr,
+             });
+    if (dld->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physical_device, &num,
+                                                               properties.data()) != VK_SUCCESS) {
+        return {};
+    }
+    properties.resize(num);
     return properties;
 }
 

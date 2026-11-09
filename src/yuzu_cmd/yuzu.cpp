@@ -4,18 +4,23 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdio>
 #include <algorithm>
-#include <cctype>
-#include <chrono>
-#include <filesystem>
+#include <atomic>
+#include <iterator>
+#include <fstream>
+#include <vector>
 #include <cstdlib>
+#include <chrono>
+#include <cstdio>
+#include <csignal>
+#include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <regex>
 #include <string>
-#include <thread>
 #include "common/settings_enums.h"
 #include "core/launch_params.h"
 #ifdef __EMSCRIPTEN__
@@ -23,10 +28,11 @@
 #endif
 #define SDL_MAIN_USE_CALLBACKS 1
 #include <SDL3/SDL_main.h>
-#include <SDL3/SDL_hints.h>
 
 #include <fmt/ostream.h>
 
+#include "common/fs/fs_util.h"
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
@@ -35,21 +41,15 @@
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/crypto/key_manager.h"
+#include "core/file_sys/common_funcs.h"
+#include "core/file_sys/nup_writer.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
-#include "core/hle/kernel/k_process.h"
-#include "core/hle/kernel/global_scheduler_context.h"
-#include "core/hle/kernel/k_scheduler.h"
-#include "core/hle/kernel/k_thread.h"
-#include "core/hle/kernel/physical_core.h"
-#include "core/hle/kernel/svc.h"
-#include "core/hle/service/service.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
-#include "core/memory.h"
 #include "frontend_common/config.h"
-#include "input_common/drivers/tas_input.h"
+#include "input_common/drivers/keyboard.h"
 #include "input_common/main.h"
 #include "network/network.h"
 #include "sdl_config.h"
@@ -63,13 +63,15 @@
 #include "yuzu_cmd/emu_window/emu_window_sdl3_null.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3_vk.h"
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/resource.h>
+#endif
+
 #ifdef _WIN32
 // windows.h needs to be included before shellapi.h
 #include <windows.h>
 #include <shellapi.h>
-#include <dbghelp.h>
 #include "common/windows/timer_resolution.h"
-#pragma comment(lib, "dbghelp.lib")
 #endif
 
 #ifdef _WIN32
@@ -78,6 +80,75 @@ extern "C" {
 // graphics
 __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+
+// EDEN_NX2_CRASH_DUMP=<dir>: on an unhandled exception (a real crash; fastmem faults are handled
+// before this), write <dir>/eden-crash-<pid>.dmp. A debugger changes the timing enough to hide
+// some crashes, so this catches them at full speed. dbghelp.dll is loaded only then.
+// Prints a code address as module+offset (resolve with llvm-symbolizer and the module's PDB).
+static void PrintCodeAddress(const char* label, const void* address) {
+    HMODULE module{};
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCSTR>(address), &module)) {
+        GetModuleFileNameA(module, name, sizeof(name));
+    }
+    const char* base_name = std::strrchr(name, '\\');
+    std::fprintf(stderr, "  %s %p %s+%#llx\n", label, address, base_name ? base_name + 1 : name,
+                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address) -
+                                                 reinterpret_cast<uintptr_t>(module)));
+}
+
+static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* exception) {
+    static std::atomic<bool> written{};
+    const char* directory = std::getenv("EDEN_NX2_CRASH_DUMP");
+    if (directory == nullptr || written.exchange(true)) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // The faulting address and stack first: they survive even if the dump fails.
+    const EXCEPTION_RECORD& record = *exception->ExceptionRecord;
+    std::fprintf(stderr, "Unhandled exception %#lx on thread %lu, info %#llx %#llx\n",
+                 record.ExceptionCode, GetCurrentThreadId(),
+                 static_cast<unsigned long long>(record.NumberParameters > 0 ? record.ExceptionInformation[0] : 0),
+                 static_cast<unsigned long long>(record.NumberParameters > 1 ? record.ExceptionInformation[1] : 0));
+    PrintCodeAddress("at", record.ExceptionAddress);
+    void* frames[48];
+    const USHORT count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+    for (USHORT i = 0; i < count; ++i) {
+        PrintCodeAddress("frame", frames[i]);
+    }
+    std::fflush(stderr);
+    struct ExceptionInformation {
+        DWORD thread_id;
+        EXCEPTION_POINTERS* exception_pointers;
+        BOOL client_pointers;
+    };
+    using MiniDumpWriteDumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, const ExceptionInformation*,
+                                              const void*, const void*);
+    const HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+    const auto write = dbghelp ? reinterpret_cast<MiniDumpWriteDumpFn>(
+                                     GetProcAddress(dbghelp, "MiniDumpWriteDump"))
+                               : nullptr;
+    if (write == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    char path[MAX_PATH];
+    std::snprintf(path, sizeof(path), "%s\\eden-crash-%lu.dmp", directory, GetCurrentProcessId());
+    const HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        const ExceptionInformation information{GetCurrentThreadId(), exception, FALSE};
+        // MiniDumpWithThreadInfo; the larger MiniDumpWithIndirectlyReferencedMemory failed on
+        // Eden's address space and left an empty file.
+        const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), file, 0x1000,
+                              &information, nullptr, nullptr);
+        const DWORD error = ok ? 0 : GetLastError();
+        CloseHandle(file);
+        std::fprintf(stderr, ok ? "Crash dump written to %s\n" : "Crash dump to %s failed (%#lx)\n",
+                     path, error);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif
 
@@ -178,106 +249,258 @@ static void OnStatusMessageReceived(const Network::StatusMessageEntry& msg) {
 
 struct SdlState {
     Core::System system{};
+    // Must outlive emu_window, which keeps a pointer to it.
     InputCommon::InputSubsystem input_subsystem{};
     std::unique_ptr<EmuWindow_SDL3> emu_window;
+    bool network_initialized{};
 };
 
-#ifdef _WIN32
-// Diagnostic only: EDEN_CRASH_REPORT=1 writes a symbolized host stack and a minidump on fatal SEH.
-static LONG WINAPI CrashReportFilter(EXCEPTION_POINTERS* info) {
-    static volatile LONG entered = 0;
-    if (InterlockedExchange(&entered, 1)) {
-        return EXCEPTION_CONTINUE_SEARCH;
+constexpr int kRestartExitCode = 75;
+static std::atomic_bool restart_requested{false};
+
+// ExecuteProgram state for the restarted process: what the Qt frontend keeps in-process when it
+// reboots a game. Only read when the launcher sets EDEN_CLI_RESTART_HANDOFF, so a leftover file
+// never changes a normal launch.
+struct RestartHandoff {
+    u64 program_id{};
+    s32 program_index{};
+    s32 previous_program_index{-1};
+    std::vector<std::vector<u8>> user_channel;
+};
+
+static std::filesystem::path RestartHandoffPath() {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / "restart-handoff.bin";
+}
+
+template <typename T>
+static void PutRaw(std::ostream& out, const T& value) {
+    out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+template <typename T>
+static void GetRaw(std::istream& in, T& value) {
+    in.read(reinterpret_cast<char*>(&value), sizeof(value));
+}
+
+// Bounds keep a damaged handoff from requesting huge allocations; the writer refuses anything the
+// reader would reject.
+constexpr u32 kHandoffMaxEntries = 256;
+constexpr u64 kHandoffMaxTotalSize = 64u << 20;
+
+static bool WriteRestartHandoff(const RestartHandoff& handoff) {
+    u64 total = 0;
+    for (const auto& entry : handoff.user_channel) {
+        total += entry.size();
     }
-    const DWORD code = info->ExceptionRecord->ExceptionCode;
-    HANDLE process = GetCurrentProcess();
-    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-    SymInitialize(process, nullptr, TRUE);
-    FILE* f = nullptr;
-    fopen_s(&f, "crash_report.txt", "w");
-    if (f) {
-        fprintf(f, "exception=0x%08lx address=%p thread=%lu\n", code,
-                info->ExceptionRecord->ExceptionAddress, GetCurrentThreadId());
-        CONTEXT ctx = *info->ContextRecord;
-        STACKFRAME64 frame{};
-        frame.AddrPC.Offset = ctx.Rip;
-        frame.AddrFrame.Offset = ctx.Rbp;
-        frame.AddrStack.Offset = ctx.Rsp;
-        frame.AddrPC.Mode = frame.AddrFrame.Mode = frame.AddrStack.Mode = AddrModeFlat;
-        for (int i = 0; i < 64; ++i) {
-            if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, process, GetCurrentThread(), &frame, &ctx,
-                             nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr) ||
-                frame.AddrPC.Offset == 0) {
-                break;
+    if (handoff.user_channel.size() > kHandoffMaxEntries || total > kHandoffMaxTotalSize) {
+        return false;
+    }
+    std::ofstream out{RestartHandoffPath(), std::ios::binary | std::ios::trunc};
+    PutRaw(out, handoff.program_id);
+    PutRaw(out, handoff.program_index);
+    PutRaw(out, handoff.previous_program_index);
+    PutRaw(out, static_cast<u32>(handoff.user_channel.size()));
+    for (const auto& entry : handoff.user_channel) {
+        PutRaw(out, static_cast<u32>(entry.size()));
+        out.write(reinterpret_cast<const char*>(entry.data()), std::streamsize(entry.size()));
+    }
+    out.close();
+    return !out.fail();
+}
+
+// Leaves the file in place; the caller removes it once the game has loaded.
+static std::optional<RestartHandoff> ReadRestartHandoff() {
+    std::ifstream in{RestartHandoffPath(), std::ios::binary};
+    RestartHandoff handoff;
+    u32 count{};
+    GetRaw(in, handoff.program_id);
+    GetRaw(in, handoff.program_index);
+    GetRaw(in, handoff.previous_program_index);
+    GetRaw(in, count);
+    if (in.fail() || count > kHandoffMaxEntries) {
+        return std::nullopt;
+    }
+    u64 total = 0;
+    for (u32 i = 0; i < count; ++i) {
+        u32 size{};
+        GetRaw(in, size);
+        total += size;
+        if (in.fail() || total > kHandoffMaxTotalSize) {
+            return std::nullopt;
+        }
+        auto& entry = handoff.user_channel.emplace_back(size);
+        in.read(reinterpret_cast<char*>(entry.data()), std::streamsize(size));
+        if (in.fail()) {
+            return std::nullopt;
+        }
+    }
+    return handoff;
+}
+
+static std::atomic_bool pack_nup_cancel{false};
+static std::atomic_bool unpack_nup_cancel{false};
+static std::atomic_bool edit_nup_cancel{false};
+
+// eden-cli --pack-nup <dump> [<out.nup>]; the output defaults to <dump>.nup next to the dump.
+static bool PackNup(const std::string& source, const std::string& output) {
+    const auto to_path = [](const std::string& utf8) {
+        return std::filesystem::path{std::u8string{utf8.begin(), utf8.end()}};
+    };
+    const auto dump_root = to_path(source);
+    const auto archive =
+        output.empty() ? FileSys::Nup::DefaultArchivePath(dump_root) : to_path(output);
+    std::signal(SIGINT, [](int) { pack_nup_cancel = true; });
+
+    const auto start = std::chrono::steady_clock::now();
+    auto last_report = start;
+    std::string error;
+    const auto result = FileSys::Nup::PackDump(
+        dump_root, archive, {},
+        [&](const FileSys::Nup::PackProgress& p) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_report < std::chrono::seconds(1) && p.files_done != p.files_total) {
+                return;
             }
-            const DWORD64 pc = frame.AddrPC.Offset;
-            const DWORD64 base = SymGetModuleBase64(process, pc);
-            char buf[sizeof(SYMBOL_INFO) + 512]{};
-            auto* sym = reinterpret_cast<SYMBOL_INFO*>(buf);
-            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
-            sym->MaxNameLen = 511;
-            DWORD64 disp = 0;
-            char modname[MAX_PATH] = "?";
-            if (base) {
-                GetModuleFileNameA(reinterpret_cast<HMODULE>(base), modname, MAX_PATH);
+            last_report = now;
+            fmt::print(stderr, "\r{} / {} MiB, {} / {} files", p.bytes_done >> 20,
+                       p.bytes_total >> 20, p.files_done, p.files_total);
+        },
+        &pack_nup_cancel, &error);
+    const auto seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    fmt::print(stderr, "\n");
+    switch (result) {
+    case FileSys::Nup::PackResult::Success:
+        fmt::print(stderr, "Wrote {} in {:.1f} s\n", archive.string(), seconds);
+        return true;
+    case FileSys::Nup::PackResult::Cancelled:
+        fmt::print(stderr, "Cancelled\n");
+        return false;
+    default:
+        fmt::print(stderr, "Packing failed: {}\n", error);
+        return false;
+    }
+}
+
+// eden-cli --unpack-nup <file.nup> [<out_dir>]; the output defaults to <name>/ next to the NUP.
+static bool UnpackNup(const std::string& source, const std::string& output) {
+    const auto to_path = [](const std::string& utf8) {
+        return std::filesystem::path{std::u8string{utf8.begin(), utf8.end()}};
+    };
+    const auto archive = to_path(source);
+    const auto out_dir =
+        output.empty() ? FileSys::Nup::DefaultExtractPath(archive) : to_path(output);
+    std::signal(SIGINT, [](int) { unpack_nup_cancel = true; });
+
+    const auto start = std::chrono::steady_clock::now();
+    auto last_report = start;
+    std::string error;
+    const auto result = FileSys::Nup::ExtractNup(
+        archive, out_dir,
+        [&](const FileSys::Nup::PackProgress& p) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_report < std::chrono::seconds(1) && p.files_done != p.files_total) {
+                return;
             }
-            if (SymFromAddr(process, pc, &disp, sym)) {
-                IMAGEHLP_LINE64 line{};
-                line.SizeOfStruct = sizeof(line);
-                DWORD ldisp = 0;
-                if (SymGetLineFromAddr64(process, pc, &ldisp, &line)) {
-                    fprintf(f, "#%02d %s+0x%llx (%s:%lu) [%s +0x%llx]\n", i, sym->Name, disp,
-                            line.FileName, line.LineNumber, modname, pc - base);
-                } else {
-                    fprintf(f, "#%02d %s+0x%llx [%s +0x%llx]\n", i, sym->Name, disp, modname,
-                            pc - base);
-                }
-            } else {
-                fprintf(f, "#%02d 0x%llx [%s +0x%llx]\n", i, pc, modname, pc - base);
+            last_report = now;
+            fmt::print(stderr, "\r{} / {} MiB, {} / {} files", p.bytes_done >> 20,
+                       p.bytes_total >> 20, p.files_done, p.files_total);
+        },
+        &unpack_nup_cancel, &error);
+    const auto seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    fmt::print(stderr, "\n");
+    switch (result) {
+    case FileSys::Nup::ExtractResult::Success:
+        fmt::print(stderr, "Extracted to {} in {:.1f} s\n", out_dir.string(), seconds);
+        return true;
+    case FileSys::Nup::ExtractResult::Cancelled:
+        fmt::print(stderr, "Cancelled\n");
+        return false;
+    default:
+        fmt::print(stderr, "Extraction failed: {}\n", error);
+        return false;
+    }
+}
+
+static bool EditNup(const Core::LaunchParams& lp) {
+    const auto to_path = [](const std::string& utf8) {
+        return std::filesystem::path{std::u8string{utf8.begin(), utf8.end()}};
+    };
+    const auto archive = to_path(*lp.edit_nup_source);
+    FileSys::Nup::MetadataEdit edit;
+    if (lp.edit_nup_name) {
+        edit.title_name = *lp.edit_nup_name;
+    }
+    if (lp.edit_nup_publisher) {
+        edit.publisher = *lp.edit_nup_publisher;
+    }
+    if (lp.edit_nup_version) {
+        edit.display_version = *lp.edit_nup_version;
+    }
+    if (lp.edit_nup_icon) {
+        if (lp.edit_nup_icon->empty()) {
+            edit.icon = std::vector<u8>{};
+        } else {
+            const auto icon_path = to_path(*lp.edit_nup_icon);
+            std::ifstream in(icon_path, std::ios::binary);
+            if (!in) {
+                fmt::print(stderr, "Cannot read icon {}\n", icon_path.string());
+                return false;
+            }
+            edit.icon = std::vector<u8>((std::istreambuf_iterator<char>(in)), {});
+            if (edit.icon->empty()) {
+                fmt::print(stderr, "Icon file is empty\n");
+                return false;
             }
         }
-        fclose(f);
     }
-    HANDLE file = CreateFileA("crash_report.dmp", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file != INVALID_HANDLE_VALUE) {
-        MINIDUMP_EXCEPTION_INFORMATION mei{GetCurrentThreadId(), info, FALSE};
-        MiniDumpWriteDump(process, GetCurrentProcessId(), file, MiniDumpNormal, &mei, nullptr,
-                          nullptr);
-        CloseHandle(file);
+    if (!edit.title_name && !edit.icon && !edit.display_version && !edit.publisher) {
+        fmt::print(stderr, "Nothing to edit: pass --nup-name, --nup-icon, --nup-version or "
+                           "--nup-publisher (or a --clear-* flag)\n");
+        return false;
     }
-    return EXCEPTION_CONTINUE_SEARCH;
+    std::signal(SIGINT, [](int) { edit_nup_cancel = true; });
+    std::string error;
+    switch (FileSys::Nup::EditNupMetadata(archive, edit, &error, &edit_nup_cancel)) {
+    case FileSys::Nup::EditResult::Success:
+        fmt::print(stderr, "Updated {}\n", archive.string());
+        return true;
+    case FileSys::Nup::EditResult::NoChange:
+        fmt::print(stderr, "No changes to apply\n");
+        return true;
+    case FileSys::Nup::EditResult::Cancelled:
+        fmt::print(stderr, "Cancelled\n");
+        return false;
+    default:
+        fmt::print(stderr, "Edit failed: {}\n", error);
+        return false;
+    }
 }
-#endif
 
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
-    if (const char* crash_report = std::getenv("EDEN_CRASH_REPORT"); crash_report && *crash_report == '1') {
-        SetUnhandledExceptionFilter(CrashReportFilter);
-    }
+    SetUnhandledExceptionFilter(WriteCrashDump);
 #endif
-#ifdef _WIN32
-#ifdef __MSVCRT__
-    _setmaxstdio(2048);
-#else
-    _setmaxstdio(8192);
-#endif
-#endif
-
+    // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
+    // input; 240 Hz is plenty for input and the key script.
+    SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "240");
     SdlState* state = new SdlState();
     *appstate = state;
-    // Emulation and presentation run on their own threads.
-    SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "240");
 
 #ifdef _WIN32
-#ifdef __MSVCRT__
-    _setmaxstdio(2048);
-#else
-    _setmaxstdio(8192);
-#endif
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         freopen("CONOUT$", "wb", stdout);
         freopen("CONOUT$", "wb", stderr);
+    }
+    // Raise the CRT's open-file limit like the Qt frontend: loose RomFS folders keep thousands of
+    // files open through the VFS cache.
+    _setmaxstdio(8192);
+#elif defined(__unix__) || defined(__APPLE__)
+    // Same for the open file limit (macOS shells default to 256).
+    if (struct rlimit rl; getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        rl.rlim_cur = std::min<rlim_t>(8192, rl.rlim_max);
+        setrlimit(RLIMIT_NOFILE, &rl);
     }
 #endif
 
@@ -304,32 +527,22 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 
     Core::ApplyLaunchParams(lp);
 
-    // Folder boots have no control data, so name the window after the folder that holds the
-    // exefs (skipping base/updates/version folders). EDEN_WINDOW_TITLE wins when set.
-    if (!std::getenv("EDEN_WINDOW_TITLE") && !lp.filepath.empty()) {
-        std::filesystem::path dir = std::filesystem::path{lp.filepath}.parent_path();
-        const auto skipped = [](const std::filesystem::path& part) {
-            const std::string name = part.filename().string();
-            return name.empty() || name == "exefs" || name == "base" || name == "updates" ||
-                   std::all_of(name.begin(), name.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
-        };
-        while (dir.has_filename() && skipped(dir)) {
-            dir = dir.parent_path();
-        }
-        if (dir.has_filename()) {
-#ifdef _WIN32
-            _putenv_s("EDEN_WINDOW_TITLE", dir.filename().string().c_str());
-#else
-            setenv("EDEN_WINDOW_TITLE", dir.filename().string().c_str(), 0);
-#endif
-        }
+    // Informational options already printed by ApplyLaunchParams; handle them before any
+    // archive operation so --help/--version never packs, unpacks or edits.
+    if (lp.print_help || lp.print_version) {
+        return SDL_APP_SUCCESS;
     }
 
-    // Scripted input for unattended smoke runs: user/tas/script0-N.txt, played at 60 Hz from launch.
-    const bool tas_autostart = std::getenv("EDEN_TAS_AUTOSTART") != nullptr;
-    if (tas_autostart) {
-        Settings::values.tas_enable.SetValue(true);
-        Settings::values.tas_loop.SetValue(false);
+    if (lp.pack_nup_source) {
+        return PackNup(*lp.pack_nup_source, lp.filepath) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
+
+    if (lp.unpack_nup_source) {
+        return UnpackNup(*lp.unpack_nup_source, lp.filepath) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
+
+    if (lp.edit_nup_source) {
+        return EditNup(lp) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
     }
 
     if (lp.filepath.empty()) {
@@ -337,7 +550,14 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         return SDL_APP_FAILURE;
     }
 
+    state->network_initialized = Network::Init();
+    if (!state->network_initialized) {
+        LOG_CRITICAL(Network, "Failed to initialize room networking");
+        return SDL_APP_FAILURE;
+    }
+
     state->system.Initialize();
+
 
     // Apply the command line arguments
     state->system.ApplySettings();
@@ -374,12 +594,39 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Service::AM::FrontendAppletParameters load_parameters{
         .applet_id = Service::AM::AppletId::Application,
     };
+    const char* const handoff_env = std::getenv("EDEN_CLI_RESTART_HANDOFF");
+    const bool restarted = handoff_env != nullptr && handoff_env[0] != '\0';
+    if (restarted) {
+        auto handoff = ReadRestartHandoff();
+        if (!handoff) {
+            // Booting as a frontend launch would clear the game's temp storage.
+            LOG_CRITICAL(Frontend, "Restart handoff {} is missing or damaged, not booting",
+                         Common::FS::PathToUTF8String(RestartHandoffPath()));
+            return SDL_APP_FAILURE;
+        }
+        state->system.GetUserChannel() = std::move(handoff->user_channel);
+        load_parameters.program_id = handoff->program_id;
+        load_parameters.launch_type = Service::AM::LaunchType::ApplicationInitiated;
+        load_parameters.program_index = handoff->program_index;
+        load_parameters.previous_program_index = handoff->previous_program_index;
+        LOG_INFO(Frontend, "Restarted by the game: program index {}, {} user channel entries",
+                 handoff->program_index, state->system.GetUserChannel().size());
+    }
     const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, lp.filepath, load_parameters);
     switch (load_result) {
     case Core::SystemResultStatus::Success:
+        if (restarted) {
+            std::error_code ec;
+            std::filesystem::remove(RestartHandoffPath(), ec);
+        }
         break; // Expected case
     case Core::SystemResultStatus::ErrorGetLoader:
         LOG_CRITICAL(Frontend, "Failed to obtain loader for {}!", lp.filepath);
+        return SDL_APP_FAILURE;
+    case Core::SystemResultStatus::ErrorMemoryAllocation:
+        LOG_CRITICAL(Frontend,
+                     "Not enough host memory to start the game. Close other applications and "
+                     "check available memory and paging-file space, then try again.");
         return SDL_APP_FAILURE;
     case Core::SystemResultStatus::ErrorLoader:
         LOG_CRITICAL(Frontend, "Failed to load ROM!");
@@ -428,9 +675,34 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // don't do anything, SDL3 already exists for us :D
     state->system.RegisterExitCallback([] {});
 
+    // A game executing a program (e.g. restarting after a settings change) writes its launch state
+    // to the restart handoff and quits with kRestartExitCode; the launcher boots the same file again
+    // with EDEN_CLI_RESTART_HANDOFF set. Mirrors MainWindow::OnExecuteProgram.
+    state->system.RegisterExecuteProgramCallback([system = &state->system](std::size_t program_index) {
+        RestartHandoff handoff{
+            .program_index = static_cast<s32>(program_index),
+            .user_channel = system->GetUserChannel(),
+        };
+        const u64 previous_program_id = system->GetApplicationProcessProgramID();
+        if (previous_program_id > static_cast<u64>(Service::AM::AppletProgramId::MaxProgramId)) {
+            handoff.previous_program_index =
+                static_cast<s32>(previous_program_id - FileSys::GetBaseTitleID(previous_program_id));
+            handoff.program_id = previous_program_id;
+        }
+        // Without the handoff, a relaunch would boot as a frontend launch and clear temp storage.
+        if (!WriteRestartHandoff(handoff)) {
+            LOG_CRITICAL(Frontend, "ExecuteProgram: could not write {}, not restarting",
+                         Common::FS::PathToUTF8String(RestartHandoffPath()));
+            return;
+        }
+        LOG_INFO(Frontend, "ExecuteProgram: program index {}, exiting with code {} to restart",
+                 program_index, kRestartExitCode);
+        restart_requested = true;
+    });
+
     // QLaunch launched applications (should) now reload shader cache.
     static std::mutex shader_cache_reload_mutex;
-    state->system.RegisterApplicationChangedCallback([state](u64 changed_program_id) {
+    state->system.RegisterApplicationChangedCallback([&state](u64 changed_program_id) {
         if (!Settings::values.use_disk_shader_cache.GetValue()) {
             return;
         }
@@ -452,116 +724,80 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     });
 
     void(state->system.Run());
-    if (tas_autostart) {
-        state->input_subsystem.GetTas()->StartStop();
-        // The GUI drives Tas::UpdateThread once per rendered frame; the CLI has no such loop.
-        std::thread([state] {
-            for (;;) {
-                std::this_thread::sleep_for(std::chrono::microseconds(16667));
-                state->input_subsystem.GetTas()->UpdateThread();
-            }
-        }).detach();
-    }
     if (state->system.DebuggerEnabled())
         state->system.InitializeDebugger();
     return SDL_APP_CONTINUE;
 }
-// Diagnostic only: EDEN_DUMP_THREADS_AT=<seconds> logs every guest thread of the application once,
-// that many seconds after the first frontend iteration (the list is read unlocked): scheduler state, wait reason, wait address,
-// saved registers and the frame-pointer chain. Used to see what a silent title is blocked on.
-static void DumpGuestThreads(Core::System& system) {
-    auto* process = system.ApplicationProcess();
-    if (process == nullptr) {
-        return;
-    }
-    auto& memory = system.ApplicationMemory();
-    // Callee-saved registers x19..x28 plus the 32-bit words at x25 and at x21 + 8 and x21 + 0x18 (a wait loop
-    // keeps its counter and wait object there): enough to map a polled counter to a memory address.
-    const auto describe_callee_saved = [&memory](const auto& regs) {
-        std::string text = " callee:";
-        for (int i = 19; i <= 28; ++i) {
-            text += fmt::format(" x{}={:#x}", i, regs[i]);
-        }
-        const auto word = [&memory](u64 address) -> std::string {
-            if (address == 0 || (address & 3) != 0 || !memory.IsValidVirtualAddress(address + 3)) {
-                return "?";
-            }
-            return fmt::format("{:#x}", memory.Read32(address));
-        };
-        text += fmt::format(" [x25]={} [x21+8]={} [x21+0x18]={}", word(regs[25]), word(regs[21] + 8),
-                            word(regs[21] + 0x18));
-        return text;
+// EDEN_NX2_KEY_SCRIPT="seconds:code,seconds:-code,..." (or "@<file>"): press (code) or release (-code) keyboard
+// keys, by SDL scancode, that many seconds after start. Lets hidden test runs drive menus.
+double Nx2KeyClockSeconds(); // emu_window_sdl3.cpp
+
+static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
+    struct KeyEvent {
+        double seconds; // when frame is 0
+        u64 frame;      // "f<frame>:code": after that many presents
+        int code;
     };
-    // Scheduler lock owner and what each physical core is running: a thread that is runnable
-    // but never runs usually waits on the scheduler lock or on a core stuck in a handler.
-    auto& kernel = system.Kernel();
-    const auto& scheduler_lock = kernel.GlobalSchedulerContext().SchedulerLock();
-    const auto* lock_owner = scheduler_lock.GetOwnerForDebugging();
-    LOG_INFO(Frontend, "scheduler lock owner thread={} count={}",
-             lock_owner != nullptr ? static_cast<s64>(lock_owner->GetThreadId()) : -1,
-             scheduler_lock.GetLockCountForDebugging());
-    for (std::size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
-        const auto* current = kernel.Scheduler(core).GetSchedulerCurrentThread();
-        const auto* idle = kernel.Scheduler(core).GetIdleThread();
-        LOG_INFO(Frontend, "core {} current thread={} idle={} disable_dispatch={}", core,
-                 current != nullptr ? static_cast<s64>(current->GetThreadId()) : -1,
-                 current == idle, current != nullptr ? current->GetDisableDispatchCount() : -1);
-        // The saved context of a running thread is stale; read the live registers of busy cores.
-        Kernel::Svc::ThreadContext live{};
-        if (current != nullptr && current != idle &&
-            kernel.PhysicalCore(core).GetLiveContextForDebugging(live)) {
-            LOG_INFO(Frontend, "core {} live pc={:#x} lr={:#x} sp={:#x} x0={:#x} x1={:#x} x2={:#x}{}", core,
-                     live.pc, live.lr, live.sp, live.r[0], live.r[1], live.r[2],
-                     describe_callee_saved(live.r));
-        }
-    }
-    // EDEN_DIAG_SVC=1 only: HLE service requests running or waiting for the service lock.
-    if (const auto in_flight = Service::DescribeInFlightRequests(); !in_flight.empty()) {
-        LOG_INFO(Frontend, "in-flight HLE requests:\n{}", in_flight);
-    }
-    for (auto& thread : process->GetThreadList()) {
-        const auto& ctx = thread.GetContext();
-        std::string frames;
-        u64 fp = ctx.fp;
-        for (int i = 0; i < 12 && fp != 0 && (fp & 7) == 0 && memory.IsValidVirtualAddress(fp + 15); ++i) {
-            frames += fmt::format(" {:#x}", memory.Read64(fp + 8));
-            const u64 next = memory.Read64(fp);
-            if (next <= fp) {
-                break;
+    static const std::vector<KeyEvent> script = [] {
+        std::vector<KeyEvent> events;
+        if (const char* text = std::getenv("EDEN_NX2_KEY_SCRIPT")) {
+            // "@<file>" reads the list from a file: long scripts in the environment slow down
+            // every getenv in the process.
+            std::string list{text};
+            if (!list.empty() && list[0] == '@') {
+                std::ifstream file{list.substr(1)};
+                list.assign(std::istreambuf_iterator<char>{file}, {});
             }
-            fp = next;
+            size_t start = 0;
+            while (start < list.size()) {
+                const size_t end = (std::min)(list.find(',', start), list.size());
+                const std::string item = list.substr(start, end - start);
+                if (const size_t colon = item.find(':'); colon != std::string::npos) {
+                    const std::string when = item.substr(0, colon);
+                    const int code = std::stoi(item.substr(colon + 1));
+                    if (!when.empty() && when[0] == 'f') {
+                        events.push_back({0.0, std::stoull(when.substr(1)), code});
+                    } else {
+                        events.push_back({std::stod(when), 0, code});
+                    }
+                }
+                start = end + 1;
+            }
         }
-        LOG_INFO(Frontend,
-                 "thread id={} prio={} state={:#x} wait={} key={:#x} pc={:#x} lr={:#x} sp={:#x} "
-                 "x0={:#x} x1={:#x} x2={:#x} frames:{}{}",
-                 thread.GetThreadId(), thread.GetPriority(), static_cast<u32>(thread.GetState()),
-                 static_cast<u32>(thread.GetWaitReasonForDebugging()), GetInteger(thread.GetAddressKey()),
-                 ctx.pc, ctx.lr, ctx.sp, ctx.r[0], ctx.r[1], ctx.r[2], frames,
-                 Kernel::Svc::DescribeDiagSvc(thread.GetThreadId()) +
-                     (static_cast<u32>(thread.GetState()) == 2 ? describe_callee_saved(ctx.r) : std::string{}));
-    }
-    // A stalled guest logs nothing afterwards and the log is cut when the process is killed, so pad
-    // the tail to push the lines above out of the log buffer.
-    for (int i = 0; i < 200; ++i) {
-        LOG_INFO(Frontend, "dump end padding {:3} ------------------------------------------------------------------------------------------------------------------------------------", i);
+        return events;
+    }();
+    static size_t next = 0;
+    const double elapsed = Nx2KeyClockSeconds();
+    const u64 frame = Core::g_nx2_present_count.load();
+    while (next < script.size() && (script[next].frame != 0 ? script[next].frame <= frame
+                                                            : script[next].seconds <= elapsed)) {
+        const int code = script[next].code;
+        LOG_INFO(Frontend, "Key script: {} key {} at {:.1f} s (frame {})",
+                 code < 0 ? "release" : "press", code < 0 ? -code : code, elapsed, frame);
+        if (code < 0) {
+            input_subsystem.GetKeyboard()->ReleaseKey(static_cast<std::size_t>(-code));
+        } else {
+            input_subsystem.GetKeyboard()->PressKey(static_cast<std::size_t>(code));
+        }
+        ++next;
     }
 }
 
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
-    static const char *dump_at = std::getenv("EDEN_DUMP_THREADS_AT");
-    static const auto dump_start = std::chrono::steady_clock::now();
-    static bool dumped = dump_at == nullptr;
-    if (!dumped && std::chrono::steady_clock::now() - dump_start >=
-                       std::chrono::seconds{std::atoi(dump_at)}) {
-        dumped = true;
-        DumpGuestThreads(state->system);
+    RunKeyScript(state->input_subsystem);
+    if (state->emu_window) {
+        state->emu_window->ApplyPendingTitle();
     }
-    return state->emu_window->IsOpen() ? SDL_APP_CONTINUE : SDL_APP_SUCCESS;
+    if (restart_requested) {
+        return SDL_APP_SUCCESS;
+    }
+    return state->emu_window && state->emu_window->IsOpen() ? SDL_APP_CONTINUE : SDL_APP_SUCCESS;
 }
 extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     SdlState *state = (SdlState *)appstate;
-    state->emu_window->OnEvent(*event);
+    if (state->emu_window)
+        state->emu_window->OnEvent(*event);
     return SDL_APP_CONTINUE;
 }
 extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
@@ -570,9 +806,23 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         return;
     }
     state->system.DetachDebugger();
-    void(state->system.Pause());
-    state->system.ShutdownMainProcess();
+    // SDL calls this even when SDL_AppInit never powered the system on (no ROM given, --help or
+    // --version): the kernel is uninitialised then, and Pause()/ShutdownMainProcess() would
+    // dereference it.
+    if (state->system.IsPoweredOn()) {
+        void(state->system.Pause());
+        state->system.ShutdownMainProcess();
+    }
+    const bool network_initialized = state->network_initialized;
     delete state;
+    if (network_initialized) {
+        Network::Shutdown();
+    }
+    if (restart_requested) {
+        // SDL3 maps SDL_APP_SUCCESS to exit code 0; quit SDL ourselves to return the restart code.
+        SDL_Quit();
+        std::exit(kRestartExitCode);
+    }
 }
 
 #define VMA_IMPLEMENTATION

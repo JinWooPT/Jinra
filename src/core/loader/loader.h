@@ -47,8 +47,8 @@ enum class FileType {
     XCZ,
     NAX,
     KIP,
-    DeconstructedRomDirectory,
     NUP,
+    DeconstructedRomDirectory,
 };
 
 /**
@@ -186,6 +186,9 @@ public:
      * @return FileType corresponding to the loaded file
      */
     virtual FileType GetFileType() const = 0;
+    virtual std::optional<u32> GetContentVersion() const {
+        return std::nullopt;
+    }
 
     /**
      * Load the application and return the created Process instance

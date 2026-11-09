@@ -5,28 +5,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <array>
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <system_error>
-#include <vector>
-#include <optional>
 #include <chrono>
 #include <common/scope_exit.h>
 
 #include <ranges>
 #include "common/thread.h"
 #include "common/assert.h"
-#include "common/input_replay_clock.h"
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/frontend/input_converter.h"
 #include "hid_core/hid_util.h"
 
 namespace Core::HID {
-constexpr s32 HID_JOYSTICK_MAX = 0x7fff;
 constexpr s32 HID_TRIGGER_MAX = 0x7fff;
 constexpr u32 TURBO_BUTTON_DELAY = 4;
 // Use a common UUID for TAS and Virtual Gamepad
@@ -1814,135 +1803,32 @@ CaptureButtonState EmulatedController::GetCaptureButtons() const {
     return controller.capture_button_state;
 }
 
-// EDEN_AUTO_PRESS_A=<start>,<interval>,<end>[;...]: taps A for 200 ms every <interval> seconds
-// between <start> and <end> seconds after the emulator started. For unattended test runs.
-static bool AutoPressA() {
-    static const bool from_file = [] {
-        const char* background = std::getenv("EDEN_BACKGROUND_TEST");
-        const char* enabled = std::getenv("EDEN_AUTO_A_FILE");
-        const bool active = background && background[0] == '1' && enabled && enabled[0] == '1';
-        if (active) LOG_INFO(Service_HID, "Background controller entry uses file requests");
-        return active;
-    }();
-    if (from_file) {
-        static thread_local std::chrono::steady_clock::time_point last;
-        static thread_local bool pressed{};
-        static thread_local bool finished{};
-        if (finished) return false;
-        const auto now = std::chrono::steady_clock::now();
-        if (now - last >= std::chrono::milliseconds{20}) {
-            std::error_code error;
-            finished = std::filesystem::exists("auto-entry.ready", error);
-            if (finished) return false;
-            pressed = std::filesystem::exists("auto-a.hold", error);
-            last = now;
-        }
-        return pressed;
-    }
-    static const auto schedules = [] {
-        std::vector<std::array<double, 3>> parsed;
-        for (const char* cursor = std::getenv("EDEN_AUTO_PRESS_A"); cursor && *cursor;) {
-            std::array<double, 3> window{};
-            if (std::sscanf(cursor, "%lf,%lf,%lf", &window[0], &window[1], &window[2]) == 3 &&
-                window[1] > 0) {
-                parsed.push_back(window);
-            }
-            cursor = std::strchr(cursor, ';');
-            if (cursor) ++cursor;
-        }
-        return parsed;
-    }();
-    if (schedules.empty()) return false;
-    const double now = Common::InputReplay::Time();
-    return std::any_of(schedules.begin(), schedules.end(), [now](const auto& window) {
-        const auto [first, interval, last] = window;
-        return now >= first && now <= last && std::fmod(now - first, interval) < 0.2;
-    });
-}
-
-static bool AutoPressY() {
-    static const auto schedules = [] {
-        std::vector<std::array<double, 3>> parsed;
-        for (const char* cursor = std::getenv("EDEN_AUTO_PRESS_Y"); cursor && *cursor;) {
-            std::array<double, 3> window{};
-            if (std::sscanf(cursor, "%lf,%lf,%lf", &window[0], &window[1], &window[2]) == 3 &&
-                window[1] > 0) {
-                parsed.push_back(window);
-            }
-            cursor = std::strchr(cursor, ';');
-            if (cursor) ++cursor;
-        }
-        return parsed;
-    }();
-    if (schedules.empty()) return false;
-    const double now = Common::InputReplay::Time();
-    return std::any_of(schedules.begin(), schedules.end(), [now](const auto& window) {
-        const auto [first, interval, last] = window;
-        return now >= first && now <= last && std::fmod(now - first, interval) < 0.2;
-    });
-}
-
-// EDEN_AUTO_HOLD_PLUS=<start>,<end>[;...]: holds + between the two times (seconds after launch), for
-// unattended runs that have to skip "hold + to skip" screens.
-static bool AutoHoldPlus() {
-    static const auto windows = [] {
-        std::vector<std::array<double, 2>> parsed;
-        for (const char* cursor = std::getenv("EDEN_AUTO_HOLD_PLUS"); cursor && *cursor;) {
-            std::array<double, 2> window{};
-            if (std::sscanf(cursor, "%lf,%lf", &window[0], &window[1]) == 2) parsed.push_back(window);
-            cursor = std::strchr(cursor, ';');
-            if (cursor) ++cursor;
-        }
-        return parsed;
-    }();
-    if (windows.empty()) return false;
-    const double now = Common::InputReplay::Time();
-    return std::any_of(windows.begin(), windows.end(),
-                       [now](const auto& window) { return now >= window[0] && now <= window[1]; });
-}
-
-struct BackgroundInput {
-    NpadButton buttons{};
-    AnalogSticks sticks{};
-};
-
-static std::optional<BackgroundInput> ReadBackgroundInput() {
-    static const bool enabled = std::getenv("EDEN_BACKGROUND_TEST") &&
-                                std::getenv("EDEN_AUTO_INPUT_FILE");
-    if (!enabled) return std::nullopt;
-    static thread_local auto last = std::chrono::steady_clock::time_point{};
-    static thread_local BackgroundInput input{};
-    const auto now = std::chrono::steady_clock::now();
-    if (now - last >= std::chrono::milliseconds{20}) {
-        last = now;
-        input = {};
-        if (auto* file = std::fopen("auto-input.hold", "r")) {
-            unsigned long long buttons{};
-            std::array<double, 4> axes{};
-            if (std::fscanf(file, "%llx %lf %lf %lf %lf", &buttons,
-                            &axes[0], &axes[1], &axes[2], &axes[3]) == 5 &&
-                std::ranges::all_of(axes, [](double value) { return std::isfinite(value); })) {
-                const auto axis = [](double value) {
-                    return static_cast<s32>(std::clamp(value, -1.0, 1.0) * HID_JOYSTICK_MAX);
-                };
-                input.buttons = static_cast<NpadButton>(buttons);
-                input.sticks = {.left = {axis(axes[0]), axis(axes[1])},
-                                .right = {axis(axes[2]), axis(axes[3])}};
-            }
-            std::fclose(file);
-        }
-    }
-    return input;
-}
-
 NpadButtonState EmulatedController::GetNpadButtons() const {
     if (is_configuring)
         return {};
     NpadButtonState state{controller.npad_button_state.raw & GetTurboButtonMask()};
-    if (AutoPressA()) state.a.Assign(1);
-    if (AutoPressY()) state.y.Assign(1);
-    if (AutoHoldPlus()) state.plus.Assign(1);
-    if (const auto input = ReadBackgroundInput()) state.raw |= input->buttons;
+    const auto injected = Injected();
+    if (!injected) {
+        return state;
+    }
+    state.raw |= injected->buttons;
+    const auto directions = [&state](const AnalogStickState& stick, NpadButton left,
+                                     NpadButton up, NpadButton right, NpadButton down) {
+        constexpr s32 threshold = HID_JOYSTICK_MAX / 2;
+        state.raw &= ~(left | up | right | down);
+        state.raw |= stick.x < -threshold ? left : NpadButton::None;
+        state.raw |= stick.x > threshold ? right : NpadButton::None;
+        state.raw |= stick.y > threshold ? up : NpadButton::None;
+        state.raw |= stick.y < -threshold ? down : NpadButton::None;
+    };
+    if (injected->left) {
+        directions(*injected->left, NpadButton::StickLLeft, NpadButton::StickLUp,
+                   NpadButton::StickLRight, NpadButton::StickLDown);
+    }
+    if (injected->right) {
+        directions(*injected->right, NpadButton::StickRLeft, NpadButton::StickRUp,
+                   NpadButton::StickRRight, NpadButton::StickRDown);
+    }
     return state;
 }
 
@@ -1952,45 +1838,29 @@ DebugPadButton EmulatedController::GetDebugPadButtons() const {
     return controller.debug_pad_button_state;
 }
 
-// EDEN_AUTO_STICK=<start>,<end>,<left x>,<left y>,<right x>,<right y>[;...]: holds the sticks at
-// those positions (-1 to 1) between the two times (seconds after launch), for unattended runs
-// that have to walk or turn the camera.
-static std::optional<AnalogSticks> AutoSticks() {
-    static const auto windows = [] {
-        std::vector<std::array<double, 6>> parsed;
-        for (const char* cursor = std::getenv("EDEN_AUTO_STICK"); cursor && *cursor;) {
-            std::array<double, 6> window{};
-            if (std::sscanf(cursor, "%lf,%lf,%lf,%lf,%lf,%lf", &window[0], &window[1], &window[2],
-                            &window[3], &window[4], &window[5]) == 6) {
-                parsed.push_back(window);
-            }
-            cursor = std::strchr(cursor, ';');
-            if (cursor) ++cursor;
-        }
-        return parsed;
-    }();
-    if (windows.empty()) return std::nullopt;
-    const double now = Common::InputReplay::Time();
-    for (const auto& window : windows) {
-        if (now >= window[0] && now <= window[1]) {
-            const auto axis = [](double value) {
-                return static_cast<s32>(std::clamp(value, -1.0, 1.0) * HID_JOYSTICK_MAX);
-            };
-            return AnalogSticks{.left = {axis(window[2]), axis(window[3])},
-                                .right = {axis(window[4]), axis(window[5])}};
-        }
-    }
-    return std::nullopt;
-}
-
 AnalogSticks EmulatedController::GetSticks() const {
     if (is_configuring)
         return {};
-    if (const auto input = ReadBackgroundInput()) return input->sticks;
-    if (const auto scripted = AutoSticks()) {
-        return *scripted;
+    AnalogSticks sticks = controller.analog_stick_state;
+    if (const auto injected = Injected()) {
+        sticks.left = injected->left.value_or(sticks.left);
+        sticks.right = injected->right.value_or(sticks.right);
     }
-    return controller.analog_stick_state;
+    return sticks;
+}
+
+void EmulatedController::SetInputInjector(InputInjector injector_) {
+    std::scoped_lock lock{injector_mutex};
+    injector = std::move(injector_);
+    has_injector.store(static_cast<bool>(injector), std::memory_order_release);
+}
+
+std::optional<InjectedInput> EmulatedController::Injected() const {
+    if (!has_injector.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+    std::scoped_lock lock{injector_mutex};
+    return injector ? injector() : std::nullopt;
 }
 
 NpadGcTriggerState EmulatedController::GetTriggers() const {

@@ -62,8 +62,11 @@ add_library(video_core STATIC
     engines/puller.h
     framebuffer_config.cpp
     framebuffer_config.h
+    render_trace.h
     fsr.cpp
     fsr.h
+    game_dlss_status.cpp
+    game_dlss_status.h
     host1x/codecs/decoder.cpp
     host1x/codecs/decoder.h
     host1x/codecs/h264.cpp
@@ -79,11 +82,14 @@ add_library(video_core STATIC
     host1x/control.h
     host1x/gpu_device_memory_manager.cpp
     host1x/gpu_device_memory_manager.h
+    host1x/h264_packet.h
     host1x/host1x.cpp
     host1x/host1x.h
     host1x/nvdec.cpp
     host1x/nvdec.h
     host1x/nvdec_common.h
+    host1x/nx2_video_decoder.cpp
+    host1x/nx2_video_decoder.h
     host1x/syncpoint_manager.cpp
     host1x/syncpoint_manager.h
     host1x/vic.cpp
@@ -95,9 +101,7 @@ add_library(video_core STATIC
     fence_manager.h
     gpu.cpp
     gpu.h
-    native_query_trace.h
-    native_root_table.h
-    native_semaphore.h
+    gpu_timestamp.h
     gpu_split.cpp
     gpu_split.h
     gpu_thread.cpp
@@ -106,9 +110,17 @@ add_library(video_core STATIC
     invalidation_accumulator.h
     memory_manager.cpp
     memory_manager.h
+    page_filter.h
     native_qmd.h
+    native_query_trace.h
     nx2.h
+    nx2_cmdpage_diag.h
+    nx2_debug_control.cpp
+    nx2_debug_control.h
     nx2_profile.h
+    nx2_perf.h
+    nx2_download_trace.h
+    pending_maps.h
     present.h
     pte_kind.h
     query_cache/bank_base.h
@@ -118,6 +130,7 @@ add_library(video_core STATIC
     query_cache/query_stream.h
     query_cache/types.h
     query_cache.h
+    query_dma.h
     rasterizer_interface.h
     renderer_base.cpp
     renderer_base.h
@@ -134,6 +147,8 @@ add_library(video_core STATIC
     renderer_vulkan/present/filters.h
     renderer_vulkan/present/fsr.cpp
     renderer_vulkan/present/fsr.h
+    renderer_vulkan/present/fsr3.cpp
+    renderer_vulkan/present/fsr3.h
     renderer_vulkan/present/fxaa.cpp
     renderer_vulkan/present/fxaa.h
     renderer_vulkan/present/layer.cpp
@@ -151,9 +166,15 @@ add_library(video_core STATIC
     renderer_vulkan/blit_image.h
     renderer_vulkan/fixed_pipeline_state.cpp
     renderer_vulkan/fixed_pipeline_state.h
+    renderer_vulkan/framebuffer_clear_layers.h
+    renderer_vulkan/framebuffer_limits.h
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
+    renderer_vulkan/pipeline_build.h
+    renderer_vulkan/pipeline_build_trace.h
     renderer_vulkan/pipeline_helper.h
+    renderer_vulkan/pipeline_optimization.h
+    renderer_vulkan/pipeline_shader_emission.h
     renderer_vulkan/pipeline_statistics.cpp
     renderer_vulkan/pipeline_statistics.h
     renderer_vulkan/renderer_vulkan.h
@@ -167,14 +188,24 @@ add_library(video_core STATIC
     renderer_vulkan/vk_command_pool.h
     renderer_vulkan/vk_compute_pass.cpp
     renderer_vulkan/vk_compute_pass.h
+    renderer_vulkan/vk_fsr3_upscaler.cpp
+    renderer_vulkan/vk_fsr3_upscaler.h
+    renderer_vulkan/vk_dlss_network_probe.cpp
+    renderer_vulkan/vk_dlss_network_probe.h
+    renderer_vulkan/vk_ocarina_camera_motion.cpp
+    renderer_vulkan/vk_ocarina_camera_motion.h
     renderer_vulkan/vk_compute_pipeline.cpp
     renderer_vulkan/vk_compute_pipeline.h
+    renderer_vulkan/vk_cooperative_hmma_test.cpp
+    renderer_vulkan/vk_cooperative_hmma_test.h
     renderer_vulkan/vk_descriptor_buffer.cpp
     renderer_vulkan/vk_descriptor_buffer.h
     renderer_vulkan/vk_descriptor_pool.cpp
     renderer_vulkan/vk_descriptor_pool.h
     renderer_vulkan/vk_fence_manager.cpp
     renderer_vulkan/vk_fence_manager.h
+    renderer_vulkan/vk_frame_dump.cpp
+    renderer_vulkan/vk_frame_dump.h
     renderer_vulkan/vk_graphics_pipeline.cpp
     renderer_vulkan/vk_graphics_pipeline.h
     renderer_vulkan/vk_multi_range_buffer.cpp
@@ -183,21 +214,25 @@ add_library(video_core STATIC
     renderer_vulkan/vk_master_semaphore.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
+    renderer_vulkan/prepared_pipeline_file.h
+    renderer_vulkan/vk_precompiled_kept.cpp
+    renderer_vulkan/vk_precompiled_kept.h
     renderer_vulkan/vk_present_manager.cpp
     renderer_vulkan/vk_present_manager.h
     renderer_vulkan/vk_query_cache.cpp
     renderer_vulkan/vk_query_cache.h
     renderer_vulkan/vk_rasterizer.cpp
     renderer_vulkan/vk_rasterizer.h
+    renderer_vulkan/submission_policy.h
     renderer_vulkan/vk_render_pass_cache.cpp
     renderer_vulkan/vk_render_pass_cache.h
     renderer_vulkan/vk_resource_pool.cpp
     renderer_vulkan/vk_resource_pool.h
     renderer_vulkan/vk_scheduler.cpp
     renderer_vulkan/vk_scheduler.h
+    renderer_vulkan/fragment_barrier_state.h
     renderer_vulkan/vk_shader_util.cpp
     renderer_vulkan/vk_shader_util.h
-    renderer_vulkan/vk_shader_output.h
     renderer_vulkan/vk_staging_buffer_pool.cpp
     renderer_vulkan/vk_staging_buffer_pool.h
     renderer_vulkan/vk_state_tracker.cpp
@@ -211,6 +246,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_turbo_mode.h
     renderer_vulkan/vk_update_descriptor.cpp
     renderer_vulkan/vk_update_descriptor.h
+    renderer_vulkan/descriptor_payload_growth.h
     vulkan_common/vulkan_debug_callback.cpp
     vulkan_common/vulkan_debug_callback.h
     vulkan_common/vulkan_device.cpp
@@ -219,13 +255,18 @@ add_library(video_core STATIC
     vulkan_common/vulkan_instance.h
     vulkan_common/vulkan_library.cpp
     vulkan_common/vulkan_library.h
+    vulkan_common/vulkan_overlay_filter.h
+    vulkan_common/unbacked_fallback.h
     vulkan_common/vulkan_memory_allocator.cpp
     vulkan_common/vulkan_memory_allocator.h
     vulkan_common/vulkan_surface.cpp
     vulkan_common/vulkan_surface.h
+    vulkan_common/vulkan_pipeline_binary_cache.cpp
+    vulkan_common/vulkan_pipeline_binary_cache.h
     vulkan_common/vulkan_wrapper.cpp
     vulkan_common/vulkan_wrapper.h
     vulkan_common/nsight_aftermath_tracker.cpp
+    vulkan_common/aftermath_dump.h
     vulkan_common/nsight_aftermath_tracker.h
     vulkan_common/vma.h
     vulkan_common/vulkan.h
@@ -233,7 +274,12 @@ add_library(video_core STATIC
     shader_cache.cpp
     shader_cache.h
     shader_environment.cpp
+    nx2_precompile.cpp
+    nx2_precompile.h
+    nx2_recipe.cpp
+    nx2_recipe.h
     shader_environment.h
+    shader_handle_program.h
     shader_notify.cpp
     shader_notify.h
     smaa_area_tex.h
@@ -253,7 +299,6 @@ add_library(video_core STATIC
     texture_cache/image_base.h
     texture_cache/image_info.cpp
     texture_cache/image_info.h
-    texture_cache/pending_download.h
     texture_cache/image_view_base.cpp
     texture_cache/image_view_base.h
     texture_cache/image_view_info.cpp
@@ -274,6 +319,8 @@ add_library(video_core STATIC
     textures/decoders.h
     textures/texture.cpp
     textures/texture.h
+    textures/unswizzle_worker.cpp
+    textures/unswizzle_worker.h
     textures/workers.cpp
     textures/workers.h
     transform_feedback.cpp
@@ -290,6 +337,8 @@ if (ENABLE_LSFG)
         frame_gen/lsfg_translate.h
         renderer_vulkan/present/frame_gen.cpp
         renderer_vulkan/present/frame_gen.h
+        renderer_vulkan/present/fsr3_frame_gen.cpp
+        renderer_vulkan/present/fsr3_frame_gen.h
         renderer_vulkan/present/frame_gen_pacer.cpp
         renderer_vulkan/present/frame_gen_pacer.h
         renderer_vulkan/present/lsfg_alpha.cpp
@@ -418,6 +467,9 @@ if (ENABLE_OPENGL)
 endif()
 
 target_link_libraries(video_core PUBLIC common core)
+if(WIN32)
+    target_link_libraries(video_core PRIVATE advapi32)
+endif()
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
 if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)
@@ -436,6 +488,13 @@ add_dependencies(video_core host_shaders)
 target_include_directories(video_core PRIVATE ${HOST_SHADERS_INCLUDE})
 
 target_link_libraries(video_core PRIVATE sirit::sirit)
+
+include(JinraShaderCache)
+jinra_shader_cache_fingerprint(JINRA_SHADER_CACHE_FINGERPRINT)
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/jinra_shader_cache_fingerprint.h"
+    CONTENT "#pragma once\n\ninline constexpr char JinraShaderCacheFingerprint[] = \"@JINRA_SHADER_CACHE_FINGERPRINT@\";\n"
+    @ONLY)
+target_include_directories(video_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 # Header-only stuff needed by all dependent targets
 target_link_libraries(video_core PUBLIC Vulkan::Headers Vulkan::UtilityHeaders GPUOpen::VulkanMemoryAllocator)
@@ -492,6 +551,33 @@ endif()
 
 if (ANDROID AND ARCHITECTURE_arm64)
     target_link_libraries(video_core PRIVATE adrenotools)
+endif()
+
+# NVIDIA DLSS through NVIDIA Streamline, in place of a game's DLSS (before FSR 3.1) when the
+# setting is on. Only Streamline's MIT-licensed headers are compiled in and nothing of NVIDIA's is
+# linked or copied: sl.interposer.dll and the DLSS plugins are loaded at run time from the user's PC.
+cmake_dependent_option(ENABLE_NVIDIA_DLSS "Enable NVIDIA DLSS through NVIDIA Streamline" ON
+                       "MSVC AND ARCHITECTURE_x86_64" OFF)
+set(EGLANTINE_STREAMLINE_SDK "" CACHE PATH
+    "NVIDIA Streamline SDK directory for its headers (empty: download them)")
+if (ENABLE_NVIDIA_DLSS)
+    if (EGLANTINE_STREAMLINE_SDK)
+        set(STREAMLINE_INCLUDE_DIR "${EGLANTINE_STREAMLINE_SDK}/include")
+    else()
+        AddJsonPackage(NAME streamline DOWNLOAD_ONLY)
+        set(STREAMLINE_INCLUDE_DIR "${streamline_SOURCE_DIR}/include")
+    endif()
+    target_sources(video_core PRIVATE
+        renderer_vulkan/vk_streamline_dlss.cpp
+        renderer_vulkan/vk_streamline_dlss.h
+        vulkan_common/streamline.cpp
+        vulkan_common/streamline.h
+        vulkan_common/streamline_api.h
+    )
+    target_include_directories(video_core PRIVATE "${STREAMLINE_INCLUDE_DIR}")
+    target_link_libraries(video_core PRIVATE version wintrust crypt32)
+    target_compile_definitions(video_core PUBLIC EGLANTINE_STREAMLINE)
+    message(STATUS "NVIDIA DLSS through Streamline: ${STREAMLINE_INCLUDE_DIR}")
 endif()
 
 create_target_directory_groups(video_core)

@@ -78,10 +78,6 @@ constexpr int default_mouse_update_timeout = 5;
 class RenderWidget : public QWidget {
 public:
     explicit RenderWidget(GRenderWindow* parent) : QWidget(parent) {
-        if (qEnvironmentVariableIsSet("EDEN_BACKGROUND_TEST")) {
-            setAttribute(Qt::WA_DontShowOnScreen);
-            setAttribute(Qt::WA_ShowWithoutActivating);
-        }
         setAttribute(Qt::WA_NativeWindow);
         setAttribute(Qt::WA_PaintOnScreen);
         if (QtCommon::GetWindowSystemType() == Core::Frontend::WindowSystemType::Wayland) {
@@ -122,11 +118,7 @@ struct NullRenderWidget : public RenderWidget {
 GRenderWindow::GRenderWindow(MainWindow* parent,
                              std::shared_ptr<InputCommon::InputSubsystem> input_subsystem_)
     : QWidget(parent), input_subsystem{std::move(input_subsystem_)} {
-    if (qEnvironmentVariableIsSet("EDEN_BACKGROUND_TEST")) {
-        setAttribute(Qt::WA_DontShowOnScreen);
-        setAttribute(Qt::WA_ShowWithoutActivating);
-    }
-    setWindowTitle(QStringLiteral("Eden %1 | %2-%3")
+    setWindowTitle(QStringLiteral("Jinra %1 | %2-%3")
                        .arg(QString::fromUtf8(Common::g_build_name),
                             QString::fromUtf8(Common::g_scm_branch),
                             QString::fromUtf8(Common::g_scm_desc)));
@@ -772,12 +764,15 @@ bool GRenderWindow::InitRenderTarget() {
     // Update the Window System information with the new render target
     window_info = QtCommon::GetWindowSystemInfo(child_widget->windowHandle());
 
-    child_widget->resize(Layout::ScreenUndocked::Width, Layout::ScreenUndocked::Height);
+    const auto target_width = Settings::IsDockedMode() ? Layout::ScreenDocked::Width : Layout::ScreenUndocked::Width;
+    const auto target_height = Settings::IsDockedMode() ? Layout::ScreenDocked::Height : Layout::ScreenUndocked::Height;
+
+    child_widget->resize(target_width, target_height);
     layout()->addWidget(child_widget);
     // Reset minimum required size to avoid resizing issues on the main window after restarting.
     setMinimumSize(1, 1);
 
-    resize(Layout::ScreenUndocked::Width, Layout::ScreenUndocked::Height);
+    resize(target_width, target_height);
 
     OnMinimalClientAreaChangeRequest(GetActiveConfig().min_client_area_size);
     OnFramebufferSizeChanged();
@@ -868,7 +863,7 @@ bool GRenderWindow::InitializeOpenGL() {
     return true;
 #else
     QMessageBox::warning(this, tr("OpenGL not available!"),
-                         tr("Eden has not been compiled with OpenGL support."));
+                         tr("Jinra has not been compiled with OpenGL support."));
     return false;
 #endif
 }

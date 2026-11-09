@@ -5,17 +5,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <atomic>
 #include <array>
 #include <cstring>
 #include <cstdlib>
 #include <span>
-#include <stdexcept>
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
-#include "shader_recompiler/exception.h"
+#include "video_core/nx2_perf.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vertex_repack.h"
 
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -25,31 +25,18 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/texture_cache/util.h"
-#include "video_core/nx2.h"
 
 namespace Vulkan {
 namespace {
-bool NativeUsageRangeCacheEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NATIVE_USAGE_RANGE_CACHE");
-        return value && value[0] == '1';
-    }();
-    if (!enabled || !Tegra::g_native_channels.load(std::memory_order_relaxed)) {
-        return false;
-    }
-    static const bool activated = [] {
-        LOG_INFO(HW_GPU, "Native usage range cache enabled");
-        return true;
-    }();
-    return activated;
-}
-
-bool NativeMappedReadbackEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NATIVE_MAPPED_READBACK");
-        return value && value[0] == '1';
-    }();
-    return enabled && Tegra::g_native_channels.load(std::memory_order_relaxed);
+void HostReadBarrier(vk::CommandBuffer cmdbuf) {
+    const VkMemoryBarrier barrier{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                           barrier);
 }
 
 VkBufferCopy MakeBufferCopy(const VideoCommon::BufferCopy& copy) {
@@ -111,57 +98,13 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
-    if (NativeMappedReadbackEnabled()) {
-        if (auto mapped = memory_allocator.TryCreateMappedDeviceBuffer(buffer_ci, sparse_alignment)) {
-            static u32 logs{};
-            if (logs++ < 3) LOG_INFO(Render_Vulkan, "Native mapped device buffer: bytes={} type={}",
-                                   size, mapped.Location().memory_type);
-            return mapped;
-        }
-    }
     if (sparse_alignment > 1) {
         return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal, sparse_alignment);
     }
-    return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
+    return memory_allocator.CreateBuffer(
+        buffer_ci, device.IsMoltenVK() ? MemoryUsage::Stream : MemoryUsage::DeviceLocal);
 }
 } // Anonymous namespace
-
-VideoCore::Surface::PixelFormat ResolveTextureBufferFormat(
-    const Shader::TextureBufferDescriptor& descriptor, VideoCore::Surface::PixelFormat format,
-    GPUVAddr address, u32 size) {
-    using VideoCore::Surface::PixelFormat;
-    using Shader::TextureBufferNumericType;
-    if (address == 0 || size == 0) {
-        static std::atomic<u32> reports{};
-        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
-            LOG_INFO(Render_Vulkan,
-                     "Typed null texel buffer: c{}[{:#x}] numeric={} supplied_format={} address={:#x} size={}",
-                     descriptor.cbuf_index, descriptor.cbuf_offset,
-                     static_cast<u32>(descriptor.numeric_type), static_cast<u32>(format), address, size);
-        }
-        switch (descriptor.numeric_type) {
-        case TextureBufferNumericType::Uint:
-            return PixelFormat::R32_UINT;
-        case TextureBufferNumericType::Sint:
-            return PixelFormat::R32_SINT;
-        default:
-            return PixelFormat::R32_FLOAT;
-        }
-    }
-    const auto actual_type = Shader::TextureBufferType(static_cast<Shader::TexturePixelFormat>(format));
-    if (actual_type != descriptor.numeric_type) {
-        static std::atomic<u32> reports{};
-        if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
-            LOG_ERROR(Render_Vulkan,
-                      "Texel buffer numeric type changed: c{}[{:#x}] expected={} actual={} format={} address={:#x} size={}",
-                      descriptor.cbuf_index, descriptor.cbuf_offset,
-                      static_cast<u32>(descriptor.numeric_type), static_cast<u32>(actual_type),
-                      static_cast<u32>(format), address, size);
-        }
-        throw Shader::RuntimeError("Texture buffer numeric type changed after shader compilation");
-    }
-    return format;
-}
 
 Buffer::Buffer(BufferCacheRuntime& runtime, VideoCommon::NullBufferParams null_params)
     : VideoCommon::BufferBase(null_params), scheduler{&runtime.scheduler}, tracker{4096} {
@@ -182,7 +125,7 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
       scheduler{&runtime.scheduler},
       buffer{CreateBuffer(*device, runtime.memory_allocator, SizeBytes(),
                           runtime.SparseAlignmentFor(sparse_compatible_))},
-      tracker{SizeBytes(), NativeUsageRangeCacheEnabled()} {
+      tracker{SizeBytes()} {
     sparse_compatible = sparse_compatible_;
     if (runtime.device.HasDebuggingToolAttached()) {
         buffer.SetObjectNameEXT(fmt::format("Buffer {:#x}", CpuAddr()).c_str());
@@ -204,7 +147,7 @@ VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat 
     } else if (is_null) {
         // Null buffer not supported, adjust offset and size
         offset = 0;
-        size = 16;
+        size = 0;
     }
     const auto it{std::ranges::find_if(views, [offset, size, format](const BufferView& view) {
         return offset == view.offset && size == view.size && format == view.format;
@@ -239,13 +182,21 @@ public:
     virtual ~QuadIndexBuffer() = default;
 
     void UpdateBuffer(u32 num_indices_) {
+        while (!retired_buffers.empty() && scheduler.IsFree(retired_buffers.front().first)) {
+            retired_buffers.erase(retired_buffers.begin());
+        }
         if (num_indices_ <= num_indices) {
             return;
         }
 
-        scheduler.Finish();
+        // Commands recorded so far may still use the old buffer: it stays until the GPU is past
+        // them. Waiting for the GPU here stalled the thread ~150 ms in the middle of a load.
+        if (buffer) {
+            retired_buffers.emplace_back(scheduler.CurrentTick(), std::move(buffer));
+        }
 
-        num_indices = num_indices_;
+        // Grown by at least half, so that a draw count creeping up doesn't redo this every time.
+        num_indices = (std::max)(num_indices_, num_indices + num_indices / 2);
         index_type = IndexTypeFromNumElements(device, num_indices);
 
         const u32 num_quads = GetQuadsNum(num_indices);
@@ -336,6 +287,7 @@ protected:
     StagingBufferPool& staging_pool;
 
     vk::Buffer buffer{};
+    std::vector<std::pair<u64, vk::Buffer>> retired_buffers; ///< GPU tick that frees each one
     MemoryCommit memory_commit{};
     VkIndexType index_type{};
     u32 num_indices = 0;
@@ -432,6 +384,18 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                       compute_pass_descriptor_queue),
       multi_range_buffers(device_) {
     const VkDriverIdKHR driver_id = device.GetDriverID();
+    const bool enable_vertex_repack = VertexRepackEnabled();
+    LOG_INFO(Render_Vulkan, "69-byte vertex layout repacking {} ({})",
+             enable_vertex_repack ? "enabled" : "disabled",
+             "portable Vulkan layout fallback");
+    static_vertex_repack =
+        StaticVertexRepackEnabled(device.GetMinVertexInputBindingStrideAlignment());
+    LOG_INFO(Render_Vulkan, "Vertex repacking without dynamic vertex input {}",
+             static_vertex_repack ? "enabled" : "disabled");
+    if (enable_vertex_repack) {
+        vertex_repack_pass = std::make_unique<VertexRepackPass>(
+            device, scheduler, descriptor_pool, staging_pool, compute_pass_descriptor_queue);
+    }
     limit_dynamic_storage_buffers = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
                                     driver_id == VK_DRIVER_ID_ARM_PROPRIETARY;
     if (limit_dynamic_storage_buffers) {
@@ -445,6 +409,18 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                                                                      scheduler_, staging_pool_);
     quad_strip_index_buffer = std::make_shared<QuadStripIndexBuffer>(device_, memory_allocator_,
                                                                      scheduler_, staging_pool_);
+}
+
+u32 BufferCacheRuntime::SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs,
+                                            bool dynamic_input) {
+    const u32 old_mask = vertex_repack_mask;
+    const bool input_supported = VertexRepackInputSupported(dynamic_input, static_vertex_repack);
+    vertex_repack_mask = vertex_repack_pass && input_supported ? VertexRepackMask(regs) : 0;
+    if (vertex_repack_mask != old_mask) {
+        LOG_DEBUG(Render_Vulkan, "Vertex repack selection: mask={:#x}, dynamic_input={}",
+                  vertex_repack_mask, dynamic_input);
+    }
+    return old_mask ^ vertex_repack_mask;
 }
 
 StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) {
@@ -483,7 +459,12 @@ u32 BufferCacheRuntime::GetStorageBufferAlignment() const {
     return static_cast<u32>(device.GetStorageBufferAlignment());
 }
 
+u64 BufferCacheRuntime::GetMaxStorageBufferRange() const {
+    return device.GetMaxStorageBufferRange();
+}
+
 void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept {
+    multi_range_buffers.TickFrame(scheduler);
     for (auto it = slot_buffers.begin(); it != slot_buffers.end(); it++) {
         if (scheduler.IsFree(it->LastUsageTick())) {
             it->ResetUsageTracking();
@@ -503,58 +484,34 @@ void BufferCacheRuntime::Wait(u64 tick) {
     scheduler.Wait(tick);
 }
 
+void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
+    auto& master = scheduler.GetMasterSemaphore();
+    if (master.IsFree(tick)) {
+        return;
+    }
+    // The copy's submission may be deferred (Scheduler::DeferFlush): the split's front asks the
+    // back for it rather than waiting for the back's next submission. If the back has stopped,
+    // nothing else uses the scheduler and Wait submits it.
+    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
+        !VideoCommon::GpuSplit::OnBackThread()) {
+        VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ListSubmitWait};
+        if (!scheduler.WaitSubmitted(tick)) {
+            scheduler.Wait(tick);
+            return;
+        }
+    }
+    VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ListGpuWait};
+    master.Wait(tick);
+}
+
 void BufferCacheRuntime::Finish() {
     scheduler.Finish();
 }
 
-std::span<const u8> BufferCacheRuntime::ReadMappedBuffer(
-    Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies) {
-    if (!NativeMappedReadbackEnabled()) return {};
-    const auto mapped = buffer.MappedReadback();
-    if (mapped.empty()) return {};
-    for (const auto& copy : copies) {
-        if (copy.src_offset > mapped.size() || copy.size > mapped.size() - copy.src_offset) return {};
-    }
+void BufferCacheRuntime::FinishForHostRead() {
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([](vk::CommandBuffer cmdbuf) {
-        const VkMemoryBarrier barrier{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-        };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-                               0, barrier);
-    });
-    // The cache lock prevents later guest commands from overwriting these bytes.
-    // Host-coherent memory still needs the device barrier and completed submission.
+    scheduler.Record(HostReadBarrier);
     scheduler.Finish();
-    static const bool verify = [] {
-        const char* value = std::getenv("EDEN_NATIVE_MAPPED_READBACK_VERIFY");
-        return value && value[0] == '1';
-    }();
-    if (verify) {
-        u64 size{};
-        std::vector<VideoCommon::BufferCopy> reference_copies;
-        for (const auto& copy : copies) {
-            reference_copies.push_back({copy.src_offset, size, copy.size});
-            size += Common::AlignUp(copy.size, u64{64});
-        }
-        auto staging = DownloadStagingBuffer(size);
-        for (auto& copy : reference_copies) copy.dst_offset += staging.offset;
-        CopyBuffer(staging.buffer, buffer, reference_copies, true);
-        scheduler.Finish();
-        for (const auto& copy : reference_copies) {
-            const bool same = std::memcmp(mapped.data() + copy.src_offset,
-                staging.mapped_span.data() + copy.dst_offset - staging.offset, copy.size) == 0;
-            ASSERT_MSG(same, "Mapped native readback differs from staged readback");
-            if (!same) throw std::runtime_error("Mapped native readback differs from staged readback");
-        }
-    }
-    static u64 reads{};
-    if ((reads++ & 1023) == 0) {
-        LOG_INFO(Render_Vulkan, "Native mapped readbacks: completed={} verify={}", reads, verify);
-    }
-    return mapped;
 }
 
 bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
@@ -668,81 +625,7 @@ void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t si
     });
 }
 
-void BufferCacheRuntime::FlushStorageWrites() {
-    const auto active = storage_batch.Active();
-    const bool scatter = std::any_of(active.begin(), active.end(),
-        [](const auto& entry) { return entry.written && !entry.ref.sparse; });
-    if (scatter) {
-        PreCopyBarrier();
-        for (const auto& entry : active) {
-            if (!entry.written || entry.ref.sparse) continue;
-            VkDeviceSize source_offset = 0;
-            for (const auto& source : entry.sources) {
-                const std::array<VideoCommon::BufferCopy, 1> copy{{{
-                    .src_offset = static_cast<u64>(source_offset),
-                    .dst_offset = static_cast<u64>(source.offset),
-                    .size = static_cast<size_t>(source.size),
-                }}};
-                CopyBuffer(source.handle, entry.ref.handle, copy, false);
-                source_offset += source.size;
-            }
-            multi_range_buffers.Invalidate(entry.key);
-        }
-        PostCopyBarrier();
-    }
-    storage_batch.Reset(retain_storage_batch);
-}
-
-bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written, u32 offset, u32 size) {
-    if (grouped_storage) {
-        if (multi_range_sources.empty() || !multi_range_total ||
-            offset % GetStorageBufferAlignment() || u64{offset} + size > multi_range_total)
-            throw Shader::RuntimeError("Invalid grouped storage view");
-        const auto active = storage_batch.Active();
-        auto found = std::find_if(active.begin(), active.end(),
-            [&](const auto& candidate) { return candidate.key == key; });
-        StorageBatchEntry* entry = found == active.end() ? nullptr : &*found;
-        if (!entry) {
-            const MultiRangeRef ref = multi_range_buffers.Get(device, scheduler, memory_allocator,
-                key, multi_range_sources, multi_range_total);
-            if (ref.handle == VK_NULL_HANDLE) throw Shader::RuntimeError("Grouped storage allocation failed");
-            entry = &storage_batch.Append();
-            entry->key = key;
-            entry->ref = ref;
-            entry->sources.assign(multi_range_sources.begin(), multi_range_sources.end());
-            entry->written = is_written;
-            static const bool statistics = std::getenv("EDEN_NATIVE_GATHER_STATS") != nullptr;
-            if (statistics) {
-                static u64 groups{}, sparse{}, readonly{}, regions{}, bytes{};
-                ++groups; sparse += ref.sparse; readonly += !is_written;
-                regions += multi_range_sources.size();
-                if (!ref.sparse) bytes += multi_range_total;
-                if (groups == 1 || groups == 1024 || (groups & 65535) == 0) {
-                    LOG_INFO(HW_GPU, "Storage group counts: total={} sparse={} readonly={} regions={} gathered_bytes={}", groups, sparse, readonly, regions, bytes);
-                }
-            }
-            if (!ref.sparse) {
-                PreCopyBarrier();
-                VkDeviceSize destination_offset = 0;
-                for (const auto& source : entry->sources) {
-                    const std::array<VideoCommon::BufferCopy, 1> copy{{{
-                        .src_offset = static_cast<u64>(source.offset),
-                        .dst_offset = static_cast<u64>(destination_offset),
-                        .size = static_cast<size_t>(source.size),
-                    }}};
-                    CopyBuffer(ref.handle, source.handle, copy, false);
-                    destination_offset += source.size;
-                }
-                PostCopyBarrier();
-                multi_range_buffers.MarkGathered(key);
-            }
-        } else {
-            entry->written |= is_written;
-        }
-        guest_descriptor_queue.AddBuffer(entry->ref.handle, entry->ref.address, offset, size);
-        return true;
-    }
-
+bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
     if (multi_range_sources.empty() || multi_range_total == 0) {
         return false;
     }
@@ -799,12 +682,37 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
         ReserveNullBuffer();
         vk_buffer = *null_buffer;
     }
+    // The same index buffer is still bound in this command buffer (PR #161): skip the rebind.
+    if (!VideoCommon::Nx2Perf::Verify()) {
+        const u64 epoch = scheduler.RecordingEpoch();
+        if (bound_index_valid && vk_buffer == bound_index_buffer &&
+            vk_offset == bound_index_offset && vk_index_type == bound_index_type &&
+            epoch == bound_index_epoch) {
+            return;
+        }
+        bound_index_valid = true;
+        bound_index_buffer = vk_buffer;
+        bound_index_offset = vk_offset;
+        bound_index_type = vk_index_type;
+        bound_index_epoch = epoch;
+    }
     scheduler.Record([vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
         cmdbuf.BindIndexBuffer(vk_buffer, vk_offset, vk_index_type);
     });
 }
 
+void BufferCacheRuntime::BindHostUint8IndexBuffer(std::span<const u8> indices) {
+    bound_index_valid = false;
+    const auto staging = staging_pool.Request(indices.size() * sizeof(u16), MemoryUsage::Upload);
+    u16* const widened = reinterpret_cast<u16*>(staging.mapped_span.data());
+    std::ranges::transform(indices, widened, [](u8 index) -> u16 { return index == 0xff ? 0xffff : index; });
+    scheduler.Record([buffer = staging.buffer, offset = staging.offset](vk::CommandBuffer cmdbuf) {
+        cmdbuf.BindIndexBuffer(buffer, offset, VK_INDEX_TYPE_UINT16);
+    });
+}
+
 void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count) {
+    bound_index_valid = false;
     if (count == 0) {
         ReserveNullBuffer();
         scheduler.Record([this](vk::CommandBuffer cmdbuf) {
@@ -825,6 +733,17 @@ void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 fir
 void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset, u32 size, u32 stride) {
     if (index >= device.GetMaxVertexInputBindings()) {
         return;
+    }
+    if (buffer != VK_NULL_HANDLE && size != 0 && IsVertexRepacked(index)) {
+        const auto repacked =
+            vertex_repack_pass->Assemble(buffer, offset, size, u64{offset} + size);
+        if (!repacked) {
+            return;
+        }
+        buffer = repacked->first;
+        offset = static_cast<u32>(repacked->second);
+        size = static_cast<u32>((u64{size} + 68) / 69 * 72);
+        stride = 72;
     }
     if (device.IsExtExtendedDynamicStateSupported()) {
         scheduler.Record([index, buffer, offset, size, stride](vk::CommandBuffer cmdbuf) {
@@ -858,6 +777,25 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
             }
         }
         buffer_handles[i] = handle;
+        const u32 binding = bindings.min_index + i;
+        if (handle != VK_NULL_HANDLE && IsVertexRepacked(binding) && bindings.strides[i] == 69 &&
+            bindings.sizes[i] > 0) {
+            const auto repacked = vertex_repack_pass->Assemble(
+                handle, static_cast<u32>(bindings.offsets[i]), static_cast<u32>(bindings.sizes[i]),
+                bindings.buffers[i]->SizeBytes());
+            if (!repacked) {
+                continue;
+            }
+            buffer_handles[i] = repacked->first;
+            bindings.offsets[i] = repacked->second;
+            bindings.sizes[i] = (bindings.sizes[i] + 68) / 69 * 72;
+            bindings.strides[i] = 72;
+            static bool reported = false;
+            if (!reported) {
+                LOG_INFO(Render_Vulkan, "GPU vertex repacking active: 69 -> 72 bytes");
+                reported = true;
+            }
+        }
     }
     const u32 device_max = device.GetMaxVertexInputBindings();
     const u32 min_binding = (std::min)(bindings.min_index, device_max);
@@ -930,10 +868,9 @@ vk::Buffer BufferCacheRuntime::CreateNullBuffer() {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .size = 16,
+        .size = 4,
         .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                 VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT,
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,

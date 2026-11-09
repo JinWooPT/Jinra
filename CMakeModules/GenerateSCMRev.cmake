@@ -14,7 +14,10 @@ endfunction()
 
 get_timestamp(BUILD_DATE)
 
-if (DEFINED GIT_RELEASE)
+if (JINRA_BUILD_TAG MATCHES "^build-[0-9]+$")
+    set(BUILD_VERSION "${JINRA_BUILD_TAG}")
+    set(IS_DEV_BUILD false)
+elseif (DEFINED GIT_RELEASE)
     set(BUILD_VERSION "${GIT_TAG}")
     set(GIT_REFSPEC "${GIT_RELEASE}")
     set(IS_DEV_BUILD false)
@@ -34,22 +37,15 @@ set(GIT_DESC ${BUILD_VERSION})
 
 # Generate cpp with Git revision from template
 
-# TODO(crueter): Stable releases feed.
-set(BUILD_AUTO_UPDATE_STABLE_REPO "eden-emu/eden")
-set(BUILD_AUTO_UPDATE_STABLE_API "git.eden-emu.dev")
-set(BUILD_AUTO_UPDATE_STABLE_API_PATH "/api/v1/repos/")
-
-set(BUILD_AUTO_UPDATE_API_PATH "/latest/release.json")
+set(BUILD_AUTO_UPDATE_STABLE_REPO "")
+set(BUILD_AUTO_UPDATE_STABLE_API "")
+set(BUILD_AUTO_UPDATE_API_PATH "")
+set(BUILD_AUTO_UPDATE_WEBSITE "")
+set(BUILD_AUTO_UPDATE_REPO "")
 if (NIGHTLY_BUILD)
-    set(BUILD_AUTO_UPDATE_WEBSITE "https://git.eden-emu.dev")
-    set(BUILD_AUTO_UPDATE_API "nightly.eden-emu.dev")
-    set(BUILD_AUTO_UPDATE_REPO "eden-ci/nightly")
-    set(REPO_NAME "Eden Nightly")
+    set(REPO_NAME "Jinra Nightly")
 else()
-    set(BUILD_AUTO_UPDATE_WEBSITE "https://git.eden-emu.dev")
-    set(BUILD_AUTO_UPDATE_API "stable.eden-emu.dev")
-    set(BUILD_AUTO_UPDATE_REPO "eden-emu/eden")
-    set(REPO_NAME "Eden")
+    set(REPO_NAME "Jinra")
 endif()
 
 set(BUILD_ID ${GIT_REFSPEC})

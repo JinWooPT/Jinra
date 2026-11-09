@@ -13,7 +13,6 @@
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_server_session.h"
 #include "core/hle/kernel/k_session.h"
-#include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
 
@@ -31,7 +30,11 @@ Result SendSyncRequestImpl(KernelCore& kernel, uintptr_t message, size_t buffer_
     ASSERT(parent.IsNotNull());
 
     // Send the request.
-    R_RETURN(session->SendSyncRequest(kernel, message, buffer_size));
+    const Result result = session->SendSyncRequest(kernel, message, buffer_size);
+    if (R_SUCCEEDED(result)) {
+        GetCurrentThread(kernel).WaitForStartupThreads(kernel);
+    }
+    R_RETURN(result);
 }
 
 Result ReplyAndReceiveImpl(KernelCore& kernel, int32_t* out_index, uintptr_t message,
@@ -143,23 +146,7 @@ Result ReplyAndReceiveImpl(KernelCore& kernel, int32_t* out_index, uintptr_t mes
 
 /// Makes a blocking IPC call to a service.
 Result SendSyncRequest(Core::System& system, Handle session_handle) {
-    auto& process = GetCurrentProcess(system.Kernel());
-    if (!process.UsesPAuthReturns()) {
-        R_RETURN(SendSyncRequestImpl(system.Kernel(), 0, 0, session_handle));
-    }
-    const auto tls = GetCurrentThread(system.Kernel()).GetTlsAddress();
-    const u64 header = process.GetMemory().Read64(tls);
-    const bool trace_tipc = (header & 0xffff) >= 16;
-    if (trace_tipc) {
-        LOG_DEBUG(Kernel_SVC, "TIPC send handle={:#x}, header={:#x}, special={:#x}",
-                  session_handle, header, process.GetMemory().Read64(tls + 8));
-    }
-    const auto result = SendSyncRequestImpl(system.Kernel(), 0, 0, session_handle);
-    if (trace_tipc) {
-        LOG_DEBUG(Kernel_SVC, "TIPC receive result={:#x}, header={:#x}, data={:#x}",
-                  result.raw, process.GetMemory().Read64(tls), process.GetMemory().Read64(tls + 8));
-    }
-    R_RETURN(result);
+    R_RETURN(SendSyncRequestImpl(system.Kernel(), 0, 0, session_handle));
 }
 
 Result SendSyncRequestWithUserBuffer(Core::System& system, uint64_t message, uint64_t buffer_size,

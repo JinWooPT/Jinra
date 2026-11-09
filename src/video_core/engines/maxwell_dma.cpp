@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <atomic>
 #include <cstdlib>
 #include "common/algorithm.h"
 #include "common/assert.h"
@@ -14,10 +13,8 @@
 #include "core/core.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
-#include "video_core/gpu_write_watch.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
-#include "video_core/native_query_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/textures/decoders.h"
 
@@ -66,28 +63,7 @@ void MaxwellDMA::CallMultiMethod(Core::System& system, u32 method, const u32* ba
 }
 
 void MaxwellDMA::Launch() {
-    if (memory_manager.UsesNativeTiling()) {
-        const GPUVAddr destination = regs.offset_out;
-        VideoCommon::TraceNativeQuery(10, memory_manager.GetID(), destination,
-            memory_manager.GpuToCpuAddress(destination).value_or(0),
-            regs.line_count, static_cast<GPUVAddr>(regs.offset_in), regs.line_length_in);
-    }
     LOG_TRACE(Render_OpenGL, "DMA copy {:#x} -> {:#x}", static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out));
-    if (regs.launch_dma.src_type == LaunchDMA::Type::PHYSICAL ||
-        regs.launch_dma.dst_type == LaunchDMA::Type::PHYSICAL) {
-        // Physical addressing is not implemented: the addresses are used as GPU virtual addresses.
-        static std::atomic<u64> physical_copies{};
-        const u64 count = ++physical_copies;
-        if (count <= 16 || count % 256 == 0)
-            LOG_WARNING(HW_GPU, "DMA copy with physical addressing (src={}, dst={}): {:#x} -> {:#x}, length={:#x}, lines={}, total={}",
-                        static_cast<u32>(regs.launch_dma.src_type.Value()),
-                        static_cast<u32>(regs.launch_dma.dst_type.Value()), static_cast<GPUVAddr>(regs.offset_in),
-                        static_cast<GPUVAddr>(regs.offset_out), regs.line_length_in, regs.line_count, count);
-    }
-    GPU_WRITE_WATCH("DMA copy", GPUVAddr(regs.offset_out),
-                    u64{regs.line_length_in} * std::max<u32>(regs.line_count, 1),
-                    ", source={:#x}, lines={}, pitch_in={:#x}, pitch_out={:#x}", static_cast<GPUVAddr>(regs.offset_in),
-                    regs.line_count, regs.pitch_in, regs.pitch_out);
     // EDEN_NX2_TRACE_DST=<hex>: also log copies writing within 32 MiB above that GPU address.
     static const u64 trace_destination = [] {
         const char* value = std::getenv("EDEN_NX2_TRACE_DST");

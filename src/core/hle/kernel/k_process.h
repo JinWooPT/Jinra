@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 
 #include "core/arm/arm_interface.h"
@@ -119,6 +120,7 @@ private:
     u64 m_process_id{};
 
     std::atomic<s64> m_cpu_time{};
+    std::atomic_bool m_mkw_dynamic_fps_patch_applied{};
     std::atomic<s64> m_num_process_switches{};
     std::atomic<s64> m_num_thread_switches{};
     std::atomic<s64> m_num_fpu_switches{};
@@ -135,7 +137,6 @@ private:
     bool m_is_signaled : 1 = false;
     bool m_is_initialized : 1 = false;
     bool m_is_application : 1 = false;
-    bool m_uses_pauth_returns : 1 = false;
     bool m_is_switch2 : 1 = false;
     bool m_is_default_application_system_resource : 1 = false;
     bool m_is_suspended : 1 = false;
@@ -181,6 +182,14 @@ public:
 
     u64 GetProgramId() const {
         return m_program_id;
+    }
+
+    bool IsMkwDynamicFpsPatchApplied() const {
+        return m_mkw_dynamic_fps_patch_applied.load(std::memory_order_relaxed);
+    }
+
+    void SetMkwDynamicFpsPatchApplied(bool applied) {
+        m_mkw_dynamic_fps_patch_applied.store(applied, std::memory_order_relaxed);
     }
 
     u64 GetProcessId() const {
@@ -250,9 +259,6 @@ public:
         return m_is_application;
     }
 
-    bool UsesPAuthReturns() const {
-        return m_uses_pauth_returns;
-    }
     bool IsSwitch2() const {
         return m_is_switch2;
     }

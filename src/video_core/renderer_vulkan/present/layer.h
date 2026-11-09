@@ -13,6 +13,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/renderer_vulkan/present/fsr.h"
+#include "video_core/renderer_vulkan/present/fsr3.h"
 #include "video_core/renderer_vulkan/present/sgsr.h"
 #include "video_core/renderer_vulkan/present/fxaa.h"
 #ifdef HAS_RESHADE
@@ -61,8 +62,6 @@ public:
                        const Tegra::FramebufferConfig& framebuffer,
                        const Layout::FramebufferLayout& layout);
 
-    void MarkPresentUse(size_t image_index);
-
 private:
     void CreateDescriptorPool(const Device& device);
     void CreateDescriptorSets(const Device& device, VkDescriptorSetLayout layout);
@@ -70,7 +69,7 @@ private:
     void CreateRawImages(const Device& device, const Tegra::FramebufferConfig& framebuffer);
 
     void RefreshResources(const Device& device, const Tegra::FramebufferConfig& framebuffer);
-    void SetAntiAliasPass(const Device& device, VkExtent2D render_area);
+    void SetAntiAliasPass(const Device& device);
 #ifdef HAS_RESHADE
     void SetPostProcessPass(const Device& device, bool is_applet);
 #endif
@@ -101,9 +100,8 @@ private:
     Service::android::PixelFormat pixel_format{};
 
     Settings::AntiAliasing anti_alias_setting{};
-    VkExtent2D anti_alias_extent{};
     std::variant<std::monostate, FXAA, SMAA> anti_alias{};
-    std::variant<std::monostate, SGSR, FSR> sr_filter{};
+    std::variant<std::monostate, SGSR, FSR, FSR3> sr_filter{};
 #ifdef HAS_RESHADE
     std::optional<PostProcessChain> post_process{};
     u64 post_process_generation{};

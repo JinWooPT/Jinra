@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <filesystem>
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -100,6 +101,13 @@ void Config::SetUpIni() {
     config->SetUnicode(true);
     config->SetSpaces(false);
 
+#ifndef __ANDROID__
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(FS::ToU8String(config_loc), error);
+    const bool new_global_config = global && status.type() == std::filesystem::file_type::not_found &&
+                                   (!error || error == std::errc::no_such_file_or_directory);
+#endif
+
     FILE* fp = nullptr;
 #ifdef _WIN32
     _wfopen_s(&fp, Common::UTF8ToUTF16W(config_loc).data(), L"rb, ccs=UTF-8");
@@ -118,10 +126,50 @@ void Config::SetUpIni() {
         return;
     }
 
-    if (SI_Error rc = config->LoadFile(fp); rc < 0) {
-        LOG_ERROR(Frontend, "Config file could not be loaded!");
-    }
+    const SI_Error rc = config->LoadFile(fp);
     fclose(fp);
+    if (rc < 0) {
+        LOG_ERROR(Frontend, "Config file could not be loaded!");
+        return;
+    }
+
+#ifndef __ANDROID__
+    if (new_global_config) {
+        const auto seed = [this](const Settings::BasicSetting& setting, const std::string& value) {
+            WriteStringSetting(setting.GetLabel(), value);
+            WriteBooleanSetting(setting.GetLabel() + "\\default", false);
+        };
+
+#ifdef _WIN32
+        BeginGroup(Settings::TranslateCategory(Settings::Category::Core));
+        seed(Settings::values.memory_layout_mode, ToString(u32(Settings::MemoryLayout::Memory_8Gb)));
+        seed(Settings::values.sync_core_speed, ToString(true));
+        EndGroup();
+
+        BeginGroup(Settings::TranslateCategory(Settings::Category::System));
+        seed(Settings::values.use_docked_mode, ToString(u32(Settings::ConsoleMode::Docked)));
+        EndGroup();
+#endif
+
+        BeginGroup(Settings::TranslateCategory(Settings::Category::Renderer));
+#ifdef _WIN32
+        seed(Settings::values.vram_usage_mode, ToString(u32(Settings::VramUsageMode::Aggressive)));
+        seed(Settings::values.max_anisotropy, ToString(u32(Settings::AnisotropyMode::X16)));
+        seed(Settings::values.astc_recompression,
+             ToString(u32(Settings::AstcRecompression::Uncompressed)));
+        seed(Settings::values.frame_gen, ToString(true));
+        seed(Settings::values.game_dlss_network, ToString(true));
+        seed(Settings::values.nvidia_dlss, ToString(true));
+#else
+        seed(Settings::values.scaling_filter, ToString(u32(Settings::ScalingFilter::Fsr3)));
+#endif
+        seed(Settings::values.gpu_accuracy, ToString(u32(Settings::GpuAccuracy::Low)));
+        seed(Settings::values.nvdec_emulation, ToString(u32(Settings::NvdecEmulation::Gpu)));
+        seed(Settings::values.async_presentation, ToString(true));
+        seed(Settings::values.use_asynchronous_shaders, ToString(true));
+        EndGroup();
+    }
+#endif
 }
 
 bool Config::IsCustomConfig() const {
@@ -1079,7 +1127,9 @@ void Config::SetArrayIndex(const int index) {
     const int array_index = index + 1;
 
     // You can't exceed the known max size of the array by more than 1
-    ASSERT(array_stack.front().size + 1 >= array_index);
+    // sergio: check the innermost array, not the outermost (nested arrays such as
+    // DisabledAddOns/<n>/disabled asserted on every entry past the outer size).
+    ASSERT(array_stack.back().size + 1 >= array_index);
 
     // Change the config array size to the current index since you may want
     // to reduce the number of elements that you read back from the config

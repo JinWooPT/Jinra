@@ -5,7 +5,8 @@
 
 namespace Jinra {
 
-std::optional<UpdateRelease> FindUpdate(const QJsonArray& releases, const VersionNumber& current) {
+std::optional<UpdateRelease> FindUpdate(const QJsonArray& releases, const VersionNumber& current,
+                                       bool pgo_build) {
     std::optional<UpdateRelease> best;
     const QRegularExpression digest_pattern(QStringLiteral("^sha256:([0-9a-fA-F]{64})$"));
     for (const auto& entry : releases) {
@@ -17,7 +18,8 @@ std::optional<UpdateRelease> FindUpdate(const QJsonArray& releases, const Versio
         if (!version || *version <= current || (best && *version <= best->version))
             continue;
         const auto plain_version = tag.startsWith(QLatin1Char('v')) ? tag.mid(1) : tag;
-        const auto filename = QStringLiteral("Jinra-Setup-%1-x64.exe").arg(plain_version);
+        const auto filename = QStringLiteral("Jinra-Setup-%1-x64%2.exe")
+                                  .arg(plain_version, pgo_build ? QStringLiteral("-pgo") : QString{});
         const QUrl expected_page(QStringLiteral("https://github.com/JinWooPT/Jinra/releases/tag/") +
                                  tag);
         if (QUrl(object.value(QStringLiteral("html_url")).toString()) != expected_page)

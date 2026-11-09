@@ -8,6 +8,7 @@
 
 #include <array>
 #include <exception>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -178,6 +179,8 @@ struct InstanceDispatch {
     PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties{};
     PFN_vkEnumeratePhysicalDevices vkEnumeratePhysicalDevices{};
     PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr{};
+    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
+        vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR{};
     PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2{};
     PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties{};
     PFN_vkGetPhysicalDeviceFormatProperties2 vkGetPhysicalDeviceFormatProperties2{};
@@ -244,6 +247,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdPushConstants vkCmdPushConstants{};
     PFN_vkCmdPushDescriptorSetWithTemplateKHR vkCmdPushDescriptorSetWithTemplateKHR{};
     PFN_vkCmdResetQueryPool vkCmdResetQueryPool{};
+    PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp{};
     PFN_vkCmdResolveImage vkCmdResolveImage{};
     PFN_vkCmdSetBlendConstants vkCmdSetBlendConstants{};
     PFN_vkCmdSetCullModeEXT vkCmdSetCullModeEXT{};
@@ -336,12 +340,19 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkGetEventStatus vkGetEventStatus{};
     PFN_vkGetFenceStatus vkGetFenceStatus{};
     PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements{};
+    PFN_vkGetImageSparseMemoryRequirements vkGetImageSparseMemoryRequirements{};
     PFN_vkGetPipelineCacheData vkGetPipelineCacheData{};
     PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR{};
 #ifdef _WIN32
     PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR{};
 #endif
+    PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT{};
     PFN_vkGetPipelineExecutablePropertiesKHR vkGetPipelineExecutablePropertiesKHR{};
+    PFN_vkGetPipelineKeyKHR vkGetPipelineKeyKHR{};
+    PFN_vkCreatePipelineBinariesKHR vkCreatePipelineBinariesKHR{};
+    PFN_vkDestroyPipelineBinaryKHR vkDestroyPipelineBinaryKHR{};
+    PFN_vkGetPipelineBinaryDataKHR vkGetPipelineBinaryDataKHR{};
+    PFN_vkReleaseCapturedPipelineDataKHR vkReleaseCapturedPipelineDataKHR{};
     PFN_vkGetPipelineExecutableStatisticsKHR vkGetPipelineExecutableStatisticsKHR{};
     PFN_vkGetQueryPoolResults vkGetQueryPoolResults{};
     PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue{};
@@ -736,6 +747,18 @@ public:
         return usage;
     }
 
+    /// Where the image's memory lies: the block (0 when the image has no memory or a block of
+    /// its own), the block's size and the image's part of it.
+    struct MemoryBlock {
+        u64 block;
+        u64 block_size;
+        u64 size;
+    };
+    [[nodiscard]] MemoryBlock GetMemoryBlock() const noexcept;
+
+    /// True when the image's memory is device local (not placed in host memory over budget).
+    [[nodiscard]] bool IsDeviceLocal() const noexcept;
+
 private:
     void Release() const noexcept;
 
@@ -1047,6 +1070,12 @@ public:
 };
 
 class Device : public Handle<VkDevice, NoOwner, DeviceDispatch> {
+public:
+    /// Saves and reuses the driver's compiled pipelines in this file (VK_KHR_pipeline_binary).
+    bool EnablePipelineBinaryCache(const std::filesystem::path& file) const;
+    /// Stops it; later pipelines are compiled normally.
+    void DisablePipelineBinaryCache() const;
+
     using Handle<VkDevice, NoOwner, DeviceDispatch>::Handle;
 
 public:
@@ -1111,6 +1140,9 @@ public:
                                                      void* pnext = nullptr) const noexcept;
 
     VkMemoryRequirements GetImageMemoryRequirements(VkImage image) const noexcept;
+
+    std::vector<VkSparseImageMemoryRequirements> GetImageSparseMemoryRequirements(
+        VkImage image) const;
 
     std::vector<VkPipelineExecutablePropertiesKHR> GetPipelineExecutablePropertiesKHR(
         VkPipeline pipeline) const;
@@ -1206,6 +1238,9 @@ public:
 
     std::vector<VkPhysicalDeviceToolProperties> GetPhysicalDeviceToolProperties() const;
 
+    /// Matrix shapes and types of VK_KHR_cooperative_matrix; empty when the driver lacks it.
+    std::vector<VkCooperativeMatrixPropertiesKHR> GetCooperativeMatrixPropertiesKHR() const;
+
     bool GetSurfaceSupportKHR(u32 queue_family_index, VkSurfaceKHR) const;
 
     VkSurfaceCapabilitiesKHR GetSurfaceCapabilitiesKHR(VkSurfaceKHR) const;
@@ -1263,6 +1298,11 @@ public:
 
     void ResetQueryPool(VkQueryPool query_pool, u32 first, u32 count) const noexcept {
         dld->vkCmdResetQueryPool(handle, query_pool, first, count);
+    }
+
+    void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
+                        u32 query) const noexcept {
+        dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
     }
 
     void BindDescriptorSets(VkPipelineBindPoint bind_point, VkPipelineLayout layout, u32 first,

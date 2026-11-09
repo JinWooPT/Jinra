@@ -10,8 +10,10 @@
 #include <optional>
 
 #include <filesystem>
+#include <QElapsedTimer>
 #include <QMainWindow>
 #include <QMessageBox>
+#include <QFutureWatcher>
 #include <QPushButton>
 #include <QTimer>
 #include <QTranslator>
@@ -19,6 +21,7 @@
 
 #include "common/common_types.h"
 #include "common/settings_enums.h"
+#include "core/file_sys/nup_writer.h"
 #include "frontend_common/content_manager.h"
 #include "input_common/drivers/tas_input.h"
 #include "qt_common/config/qt_config.h"
@@ -37,7 +40,7 @@
 #ifdef ENABLE_UPDATE_CHECKER
 #include <QFuture>
 #include <QFutureWatcher>
-#include "common/net/net.h"
+#include "frontend_common/update_checker.h"
 #endif
 
 class QtConfig;
@@ -53,6 +56,7 @@ class QLabel;
 class MultiplayerState;
 class QPushButton;
 class QProgressDialog;
+class NupProgressDialog;
 class QSlider;
 class QHBoxLayout;
 class WaitTreeWidget;
@@ -71,6 +75,7 @@ class QtSoftwareKeyboardDialog;
 class QtNXWebEngineView;
 
 namespace VideoCore {
+enum class FrameGenState : u8;
 class ShaderNotify;
 }
 namespace Core {
@@ -276,6 +281,7 @@ private:
                   StartGameType with_config = StartGameType::Normal);
     void BootGameFromList(const QString& filename, StartGameType with_config);
     void ShutdownGame();
+    void TerminateEmulationThread();
 
     void SetDiscordEnabled(bool state);
     void LoadAmiibo(const QString& filename);
@@ -353,6 +359,9 @@ private slots:
     void OnGameListSetPlayTime(u64 program_id);
     void OnGameListDumpRomFS(u64 program_id, const std::string& game_path, DumpRomFSTarget target);
     void OnGameListVerifyIntegrity(const std::string& game_path);
+    void OnGameListConvertToNup(const std::string& game_path);
+    void OnGameListExtractNup(const std::string& game_path);
+    void OnGameListEditNupMetadata(const std::string& game_path);
     void OnGameListCopyTID(u64 program_id);
     void OnGameListCreateShortcut(u64 program_id, const std::string& game_path,
                                   const QtCommon::Game::ShortcutTarget target);
@@ -422,7 +431,8 @@ private slots:
     void OnCreateHomeMenuDesktopShortcut();
     void OnCreateHomeMenuApplicationMenuShortcut();
     void OnCaptureScreenshot();
-    void OnCheckFirmwareDecryption();
+    /// Checks for decryption keys; `prompt` asks to install them when they are missing.
+    void OnCheckFirmwareDecryption(bool prompt = true);
 #ifdef __unix__
     void OnCheckGraphicsBackend();
 #endif
@@ -432,6 +442,7 @@ private slots:
     void OnShutdownBeginDialog();
     void OnEmulationStopped();
     void OnEmulationStopTimeExpired();
+    void OnEmulationStopTimeout();
 
 #ifdef ENABLE_UPDATE_CHECKER
     void OnEmulatorUpdateAvailable();
@@ -450,6 +461,7 @@ private:
     void UpdateFilterText();
     void UpdateAAText();
     void UpdatePostShaderText();
+    void UpdateFrameGenButton();
     void UpdateVolumeUI();
     void UpdateStatusBar();
     void UpdateGPUAccuracyButton();
@@ -491,16 +503,19 @@ private:
     std::shared_ptr<InputCommon::InputSubsystem> input_subsystem;
 
 #ifdef ENABLE_UPDATE_CHECKER
-    QFuture<std::optional<Common::Net::Release>> update_future;
-    QFutureWatcher<std::optional<Common::Net::Release>> update_watcher;
+    QFuture<UpdateChecker::CheckResult> update_future;
+    QFutureWatcher<UpdateChecker::CheckResult> update_watcher;
 #endif
 
     MultiplayerState* multiplayer_state = nullptr;
+    bool use_recommended_mkw_settings = false;
+    bool asked_recommended_mkw_settings = false;
 
     GRenderWindow* render_window = nullptr;
     GameList* game_list = nullptr;
     LoadingScreen* loading_screen = nullptr;
     QTimer shutdown_timer;
+    QTimer emu_terminate_timer;
     OverlayDialog* shutdown_dialog{};
     PerformanceOverlay* perf_overlay = nullptr;
 #ifdef HAS_RESHADE
@@ -529,6 +544,10 @@ private:
     QPushButton* filter_status_button = nullptr;
     QPushButton* aa_status_button = nullptr;
     QPushButton* post_shader_status_button = nullptr;
+    QPushButton* frame_gen_status_button = nullptr;
+    VideoCore::FrameGenState frame_gen_state{};
+    u64 frame_gen_frames = 0;
+    bool frame_gen_generating = false;
     VolumeButton* volume_button = nullptr;
     QWidget* volume_popup = nullptr;
     QSlider* volume_slider = nullptr;
@@ -542,6 +561,9 @@ private:
 
     // Whether emulation is currently running in yuzu.
     bool emulation_running = false;
+    bool boot_in_progress = false;
+    bool shader_sync_active = false;
+    bool close_pending = false;
     // The path to the game currently running
     QString current_game_path;
     // Whether a user was set on the command line (skips UserSelector if it's forced to show up)
@@ -549,6 +571,9 @@ private:
 
     bool auto_paused = false;
     bool auto_muted = false;
+#ifdef __APPLE__
+    u32 sleep_assertion_id = 0;
+#endif
     QTimer mouse_hide_timer;
     QTimer update_input_timer;
 
@@ -570,6 +595,11 @@ private:
 
     // Install progress dialog
     QProgressDialog* install_progress = nullptr;
+    NupProgressDialog* nup_progress = nullptr;
+    QFutureWatcher<FileSys::Nup::PackResult> nup_watcher;
+    std::shared_ptr<std::atomic_bool> nup_cancel;
+    bool nup_running{};
+    std::string nup_source_path;
 
     // Last game booted, used for multi-process apps
     QString last_filename_booted;

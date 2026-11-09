@@ -22,7 +22,6 @@
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
-#include "shader_recompiler/ir_opt/conditional_phi.h"
 
 namespace Shader::Maxwell {
 namespace {
@@ -91,7 +90,7 @@ void CollectInterpolationInfo(Environment& env, IR::Program& program) {
     }
 }
 
-void AddNVNStorageBuffers(IR::Program& program) {
+void AddNVNStorageBuffers(IR::Program& program, const HostTranslateInfo& host_info) {
     if (!program.info.uses_global_memory) {
         return;
     }
@@ -124,10 +123,17 @@ void AddNVNStorageBuffers(IR::Program& program) {
             continue;
         }
         const u32 offset{base + index * descriptor_size};
-        const auto it{std::ranges::find(descs, offset, &StorageBufferDescriptor::cbuf_offset)};
+        const auto it{std::ranges::find_if(descs, [=](const StorageBufferDescriptor& desc) {
+            return desc.cbuf_index == driver_cbuf && desc.cbuf_offset == offset;
+        })};
         if (it != descs.end()) {
             it->is_written |= program.info.stores_global_memory;
             continue;
+        }
+        if (descs.size() >= Optimization::StorageBufferLimit(host_info)) {
+            throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                          descs.size() + 1,
+                                          Optimization::StorageBufferLimit(host_info));
         }
         descs.push_back({
             .cbuf_index = driver_cbuf,
@@ -410,8 +416,10 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         const u32 threads{program.stage == Stage::Task ? init & 0x3f : (shader_b >> 20) & 0x3f};
         program.workgroup_size = {(std::max)(threads, 1U), 1, 1};
         if (program.stage == Stage::Mesh) {
-            if (program.mesh.topology != 4) {
-                throw NotImplementedException("Mesh output topology {}", program.mesh.topology);
+            if (program.mesh.topology != 0 && program.mesh.topology != 1 &&
+                program.mesh.topology != 4) {
+                throw NotImplementedException("Mesh output topology {} (SET_MESH_SHADER_A {:#010x})",
+                                              program.mesh.topology, shader_a);
             }
             AddMeshLines(env.SPH(), program.mesh.vertex_lines);
             AddMeshLines(env.MeshPrimitiveHeader(), program.mesh.primitive_lines);
@@ -437,11 +445,11 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         Optimization::ConditionalBarrierPass(program);
     }
     Optimization::SsaRewritePass(program);
-    Optimization::ConditionalPhi::Fold(program);
 
     Optimization::ConstantPropagationPass(env, program);
 
     Optimization::PositionPass(env, program);
+    Optimization::BlitConstantsPass(env, program);
 
     Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
     Optimization::GeometryCompactionPass(program, normalized_host_info);
@@ -472,12 +480,13 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     Optimization::VendorWorkaroundPass(program);
 
     CollectInterpolationInfo(env, program);
-    AddNVNStorageBuffers(program);
+    AddNVNStorageBuffers(program, normalized_host_info);
+    Optimization::LimitSampledTextureArrays(program, normalized_host_info);
     return program;
 }
 
 IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b,
-                                    Environment& env_vertex_b) {
+                                    Environment& env_vertex_b, const HostTranslateInfo& host_info) {
     IR::Program result{};
     Optimization::VertexATransformPass(vertex_a);
     Optimization::VertexBTransformPass(vertex_b);
@@ -500,7 +509,9 @@ IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b
     result.info.stores.mask |= vertex_b.info.stores.mask;
 
     Optimization::JoinTextureInfo(result.info, vertex_b.info);
-    Optimization::JoinStorageInfo(result.info, vertex_b.info);
+    // The two halves are one stage: their storage buffers share its limit.
+    Optimization::JoinStorageInfo(result.info, vertex_b.info,
+                                  Optimization::StorageBufferLimit(host_info));
     Optimization::DeadCodeEliminationPass(result);
     if (Settings::values.renderer_debug) {
         Optimization::VerificationPass(result);
@@ -606,7 +617,6 @@ IR::Program GenerateGeometryPassthrough(ObjectPool<IR::Inst>& inst_pool,
     program.blocks = GenerateBlocks(program.syntax_list);
     program.post_order_blocks = PostOrder(program.syntax_list.front());
     Optimization::SsaRewritePass(program);
-    Optimization::ConditionalPhi::Fold(program);
 
     return program;
 }

@@ -5,38 +5,47 @@
 // SPDX-FileCopyrightText: 2021 Skyline Team and Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <utility>
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "core/core.h"
-#include "core/hle/kernel/k_process.h"
-#include "core/hle/service/nvdrv/devices/gpu_address_space_layout.h"
 #include "core/hle/service/nvdrv/core/container.h"
+#include "core/hle/service/nvdrv/core/heap_mapper.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
 #include "core/hle/service/nvdrv/devices/ioctl_serialization.h"
 #include "core/hle/service/nvdrv/devices/nvhost_as_gpu.h"
-#include "core/hle/service/nvdrv/devices/native_gpu_kind.h"
 #include "core/hle/service/nvdrv/devices/nvhost_gpu.h"
+#include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu.h"
+#include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Service::Nvidia::Devices {
 
 nvhost_as_gpu::nvhost_as_gpu(Core::System& system_, Module& module_, NvCore::Container& core)
-    : nvdevice{system_, Type::GpuAddressSpace}, module{module_}, container{core}, nvmap{core.GetNvMapFile()}, vm{},
+    : nvdevice{system_}, module{module_}, container{core}, nvmap{core.GetNvMapFile()}, vm{},
       gmmu{} {}
 
 nvhost_as_gpu::~nvhost_as_gpu() {
-    for (const auto& [handle, address] : native_sparse_pins) nvmap.UnpinHandle(handle);
-    if (m_owner_process) { m_owner_process->Close(system.Kernel()); }
+    Nx2GpuMemoryRegistry::Get().RemoveListener(this);
+    // Leave shared ranges to the process's other address spaces; like this address space's own
+    // ranges, one nobody else maps stays allocated.
+    for (const auto& [key, range] : nx2_device_ranges) {
+        if (range.shared) {
+            Nx2GpuMemoryRegistry::Get().ReleaseDeviceRange(range.asid, key.first, key.second);
+        }
+    }
 }
 
 NvResult nvhost_as_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> input,
@@ -56,15 +65,33 @@ NvResult nvhost_as_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> i
             return WrapFixed(this, &nvhost_as_gpu::MapBufferEx, input, output);
         case 0x8:
             return WrapFixed(this, &nvhost_as_gpu::GetVARegions1, input, output);
-        case 0x9:
-            return WrapFixed(this, &nvhost_as_gpu::AllocAsEx, input, output);
+        case 0x9: {
+            const auto result = WrapFixed(this, &nvhost_as_gpu::AllocAsEx, input, output);
+            if (result == NvResult::Success && g_nx2_driver) {
+                Nx2GpuMemoryRegistry::Get().AddListener(
+                    this,
+                    [this](u64 gpu_address, u64 cpu_address, u64 size) {
+                        Nx2Map(gpu_address, cpu_address, size);
+                    },
+                    [this](u64 gpu_address, u64 size) { Nx2Unmap(gpu_address, size); },
+                    [this](u64 cpu_address, u64 size) { Nx2Release(cpu_address, size); },
+                    [this](u64 gpu_address, u64 size, bool create) {
+                        Nx2Sparse(gpu_address, size, create);
+                    },
+                    [this](u64 gpu_address, u64 cpu_address, u64 size) {
+                        Nx2BackSparse(gpu_address, cpu_address, size);
+                    },
+                    [this](u64 gpu_address, u64 cpu_address, u64 size) {
+                        Nx2SparseTile(gpu_address, cpu_address, size);
+                    });
+            }
+            return result;
+        }
         case 0xb:
-            return WrapFixed(this, &nvhost_as_gpu::GetSyncpointShimInfo, input, output);
-        case 0xc:
-            return WrapFixed(this, &nvhost_as_gpu::ModifyKind, input, output);
-        case 0xd:
-            if (!m_extended_abi) return NvResult::NotImplemented;
-            return WrapVariable(this, &nvhost_as_gpu::NativeRemap, input, output);
+            if (g_nx2_driver) {
+                return WrapFixed(this, &nvhost_as_gpu::Nx2GetSyncpointShimInfo, input, output);
+            }
+            break;
         case 0x14:
             return WrapVariable(this, &nvhost_as_gpu::Remap, input, output);
         default:
@@ -105,143 +132,210 @@ NvResult nvhost_as_gpu::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8> i
 }
 
 void nvhost_as_gpu::OnOpen(NvCore::SessionId session_id, DeviceFD fd) {
-    m_fd = fd;
-    if (const auto* session = container.GetSession(session_id)) {
-        m_owner_process = session->process;
-        m_owner_process->Open(system.Kernel());
-        m_extended_abi = m_owner_process->UsesPAuthReturns();
-    }
+    nx2_session = session_id;
 }
+
+void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
+    std::scoped_lock lock(mutex);
+    auto* session = container.GetSession(nx2_session);
+    if (!gmmu || session == nullptr) {
+        LOG_ERROR(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x}: no address space or session",
+                  gpu_address, size);
+        return;
+    }
+    // The same CPU range is often mapped twice (at its own address and in a sparse region), so
+    // reuse its SMMU mapping.
+    Nx2DeviceRange range{};
+    if (const auto it = nx2_device_ranges.find({cpu_address, size}); it != nx2_device_ranges.end()) {
+        range = it->second;
+    } else if (session->has_preallocated_area && session->mapper->IsInBounds(cpu_address, size)) {
+        range = {session->mapper->Map(cpu_address, size), true};
+    } else {
+        const auto allocate = [&]() -> u64 {
+            auto& smmu = system.Host1x().MemoryManager();
+            const DAddr address = smmu.Allocate(Common::AlignUp(size, 0x20000));
+            if (address != 0) {
+                smmu.Map(address, cpu_address, size, session->asid, true);
+            }
+            return address;
+        };
+        // EDEN_NX2_PRIVATE_DEVICE_RANGES=1 (A/B aid): a range per address space.
+        static const bool private_ranges = std::getenv("EDEN_NX2_PRIVATE_DEVICE_RANGES") != nullptr;
+        if (private_ranges) {
+            range = {allocate(), false};
+        } else {
+            range = {Nx2GpuMemoryRegistry::Get().AcquireDeviceRange(session->asid.id, cpu_address,
+                                                                    size, allocate),
+                     false, true, session->asid.id};
+        }
+        if (range.address == 0) {
+            LOG_CRITICAL(Service_NVDRV, "Switch 2 GPU memory {:#x}+{:#x}: out of SMMU space",
+                         cpu_address, size);
+            return;
+        }
+    }
+    const DAddr device_address = range.address;
+    nx2_device_ranges[{cpu_address, size}] = range;
+    Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
+    // On the GPU thread, like unmaps: a GMMU map takes the texture cache lock, and the callers hold
+    // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
+    system.GPU().MapInOrder(
+        gpu_address, size, [gmmu = gmmu.get(), gpu_address, device_address, size] {
+            gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+        });
+    LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
+              cpu_address);
+}
+
+void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
+    std::scoped_lock lock(mutex);
+    if (!gmmu) {
+        return;
+    }
+    // The GPU thread may still be running command lists that use the range.
+    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size] { gmmu->Unmap(gpu_address, size); });
+    LOG_DEBUG(Service_NVDRV, "Switch 2 GPU unmapping {:#x}+{:#x}", gpu_address, size);
+}
+
+void nvhost_as_gpu::Nx2Release(u64 cpu_address, u64 size) {
+    std::scoped_lock lock(mutex);
+    const auto it = nx2_device_ranges.find({cpu_address, size});
+    if (it == nx2_device_ranges.end()) {
+        return;
+    }
+    const Nx2DeviceRange range = it->second;
+    nx2_device_ranges.erase(it);
+    if (range.shared &&
+        !Nx2GpuMemoryRegistry::Get().ReleaseDeviceRange(range.asid, cpu_address, size)) {
+        return; // another address space of the process still maps it
+    }
+    auto* session = container.GetSession(nx2_session);
+    auto* const mapper = range.heap && session != nullptr ? session->mapper.get() : nullptr;
+    auto& smmu = system.Host1x().MemoryManager();
+    // Queued after the GPU unmaps of the range, so the GPU thread is done with it.
+    system.GPU().RunInOrder([&smmu, mapper, range, cpu_address, size] {
+        if (range.heap) {
+            if (mapper != nullptr) {
+                mapper->Unmap(cpu_address, size);
+            }
+            return;
+        }
+        smmu.Unmap(range.address, size);
+        smmu.Free(range.address, Common::AlignUp(size, 0x20000));
+    });
+    LOG_DEBUG(Service_NVDRV, "Switch 2 released backing {:#x}+{:#x}", cpu_address, size);
+}
+
+void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
+    std::scoped_lock lock(mutex);
+    if (!gmmu) {
+        return;
+    }
+    auto& smmu = system.Host1x().MemoryManager();
+    const u64 device_size = Common::AlignUp(size, 0x20000);
+    if (!create) {
+        const auto it = nx2_sparse_ranges.find(gpu_address);
+        if (it == nx2_sparse_ranges.end()) {
+            return;
+        }
+        const DAddr device_address = it->second.second;
+        nx2_sparse_ranges.erase(it);
+        // After the command lists that may still use it.
+        system.GPU().RunInOrder([gmmu = gmmu.get(), &smmu, gpu_address, size, device_address,
+                                 device_size] {
+            gmmu->Unmap(gpu_address, size);
+            smmu.Unmap(device_address, size);
+            smmu.Free(device_address, device_size);
+        });
+        return;
+    }
+    const DAddr device_address = smmu.Allocate(device_size);
+    if (device_address == 0) {
+        LOG_CRITICAL(Service_NVDRV, "Switch 2 sparse region {:#x}+{:#x}: out of SMMU space",
+                     gpu_address, size);
+        return;
+    }
+    nx2_sparse_ranges[gpu_address] = {size, device_address};
+    // On the GPU thread, as in Nx2Map.
+    system.GPU().MapInOrder(
+        gpu_address, size, [gmmu = gmmu.get(), gpu_address, device_address, size] {
+            gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+        });
+    LOG_DEBUG(Service_NVDRV, "Switch 2 sparse region {:#x}+{:#x} -> device {:#x}", gpu_address,
+              size, device_address);
+}
+
+void nvhost_as_gpu::Nx2BackSparse(u64 gpu_address, u64 cpu_address, u64 size) {
+    std::scoped_lock lock(mutex);
+    auto it = nx2_sparse_ranges.upper_bound(gpu_address);
+    auto* session = container.GetSession(nx2_session);
+    if (it == nx2_sparse_ranges.begin() || session == nullptr) {
+        return;
+    }
+    --it;
+    const auto& [start, range] = *it;
+    const auto& [region_size, device_address] = range;
+    if (size > region_size || gpu_address - start > region_size - size) {
+        return;
+    }
+    system.Host1x().MemoryManager().Map(device_address + (gpu_address - start), cpu_address, size,
+                                        session->asid, true);
+}
+
+void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
+    std::scoped_lock lock(mutex);
+    auto it = nx2_sparse_ranges.upper_bound(gpu_address);
+    auto* session = container.GetSession(nx2_session);
+    if (it == nx2_sparse_ranges.begin() || session == nullptr) {
+        return;
+    }
+    --it;
+    const auto& [start, range] = *it;
+    const auto& [region_size, device_address] = range;
+    if (size > region_size || gpu_address - start > region_size - size) {
+        return;
+    }
+    // In GPU-thread order: command lists submitted before the request still see the old tile.
+    // Unmapping first keeps the SMMU's reverse map right and invalidates the caches over the tile,
+    // whose contents are now what the game's memory holds there.
+    const DAddr device = device_address + (gpu_address - start);
+    auto& smmu = system.Host1x().MemoryManager();
+    system.GPU().MapInOrder(
+        gpu_address, size, [&smmu, device, cpu_address, size, asid = session->asid] {
+            smmu.Unmap(device, size);
+            if (cpu_address != 0) {
+                smmu.Map(device, cpu_address, size, asid, true);
+            }
+        });
+}
+
 void nvhost_as_gpu::OnClose(DeviceFD fd) {}
 
-NvResult nvhost_as_gpu::MapNative4K(u32 handle_id, u64 address, u64 buffer_offset, u64 size, u8 kind) {
-    if (!m_extended_abi || !size || !Common::IsAligned(address, VM::YUZU_PAGESIZE) ||
-        !Common::IsAligned(size, VM::YUZU_PAGESIZE) ||
-        !Common::IsAligned(buffer_offset, VM::YUZU_PAGESIZE)) {
-        return NvResult::BadParameter;
+// Switch 2 NvRm (with characteristics flag 26) asks for the read-only syncpoint shim: a GPU page
+// whose u32 at id * stride reads as that syncpoint's value; NVN waits on syncpoints through it and
+// asserts without one. Same scheme as changes.patch, placed on the last page of the VA range.
+NvResult nvhost_as_gpu::Nx2GetSyncpointShimInfo(IoctlNx2SyncpointShimInfo& params) {
+    std::scoped_lock lock(mutex);
+    if (!vm.initialised || !gmmu) {
+        return NvResult::NotSupported;
     }
-    const auto handle = nvmap.GetHandle(handle_id);
-    if (!handle || buffer_offset > handle->orig_size || size > handle->orig_size - buffer_offset) {
-        return NvResult::BadParameter;
+    const u64 address = vm.va_range_end - VM::YUZU_PAGESIZE;
+    if (!nx2_syncpoint_shim) {
+        nx2_syncpoint_shim = true;
+        gmmu->SetNativeSyncpointShim(address);
     }
-    {
-        const std::scoped_lock lock{mutex};
-        if (!vm.initialised || address < vm.va_range_start || address >= vm.va_range_split ||
-            size > vm.va_range_split - address) {
-            return NvResult::BadParameter;
-        }
-        const auto next = allocation_map.lower_bound(address);
-        if ((next != allocation_map.end() && next->first < address + size) ||
-            (next != allocation_map.begin() &&
-             std::prev(next)->first + std::prev(next)->second.size > address)) {
-            return NvResult::BadParameter;
-        }
-    }
-    IoctlAllocSpace reservation{};
-    reservation.pages = static_cast<u32>(size >> VM::PAGE_SIZE_BITS);
-    reservation.page_size = VM::YUZU_PAGESIZE;
-    reservation.flags = MappingFlags::Fixed;
-    reservation.offset = address;
-    const auto reserved = AllocateSpace(reservation);
-    if (reserved != NvResult::Success) { return reserved; }
-    IoctlMapBufferEx mapping{};
-    mapping.flags = MappingFlags::Fixed;
-    mapping.kind = kind;
-    mapping.handle = handle_id;
-    mapping.page_size = VM::YUZU_PAGESIZE;
-    mapping.buffer_offset = static_cast<s64>(buffer_offset);
-    mapping.mapping_size = size;
-    mapping.offset = static_cast<s64>(address);
-    const auto result = MapBufferEx(mapping);
-    if (result != NvResult::Success) {
-        nvmap.UnpinHandle(handle_id);
-        IoctlFreeSpace release{};
-        release.offset = address;
-        release.pages = reservation.pages;
-        release.page_size = VM::YUZU_PAGESIZE;
-        FreeSpace(release);
-    }
-    return result;
+    params.address = address;
+    params.stride = sizeof(u32);
+    params.count = Tegra::MemoryManager::NumShimSyncpoints;
+    LOG_INFO(Service_NVDRV, "Switch 2 syncpoint shim at {:#x} ({} syncpoints)", address,
+             params.count);
+    return NvResult::Success;
 }
 
-NvResult nvhost_as_gpu::ReserveNativeSparse4K(u64 address, u64 size) {
-    if (!m_extended_abi || !size || !Common::IsAligned(address, VM::YUZU_PAGESIZE) ||
-        !Common::IsAligned(size, VM::YUZU_PAGESIZE) ||
-        (size >> VM::PAGE_SIZE_BITS) > std::numeric_limits<u32>::max()) {
-        return NvResult::BadParameter;
-    }
-    {
-        const std::scoped_lock lock{mutex};
-        if (!vm.initialised || address < vm.va_range_start || address >= vm.va_range_split ||
-            size > vm.va_range_split - address) {
-            return NvResult::BadParameter;
-        }
-        const auto next = allocation_map.lower_bound(address);
-        if ((next != allocation_map.end() && next->first < address + size) ||
-            (next != allocation_map.begin() &&
-             std::prev(next)->first + std::prev(next)->second.size > address)) {
-            return NvResult::BadParameter;
-        }
-    }
-    IoctlAllocSpace reservation{};
-    reservation.pages = static_cast<u32>(size >> VM::PAGE_SIZE_BITS);
-    reservation.page_size = VM::YUZU_PAGESIZE;
-    reservation.flags = MappingFlags::Fixed | MappingFlags::Sparse;
-    reservation.offset = address;
-    return AllocateSpace(reservation);
-}
-
-NvResult nvhost_as_gpu::MapNativeImage(u32 handle_id, u64 buffer_offset, u64 size, u64& address) {
-    const auto handle = nvmap.GetHandle(handle_id);
-    if (!m_extended_abi || !handle || !handle->allocated || !size ||
-        !Common::IsAligned(size, VM::YUZU_PAGESIZE) ||
-        !Common::IsAligned(buffer_offset, VM::YUZU_PAGESIZE) ||
-        buffer_offset > handle->orig_size || size > handle->orig_size - buffer_offset) {
-        return NvResult::BadParameter;
-    }
-    IoctlAllocSpace reservation{};
-    reservation.pages = static_cast<u32>(size >> VM::PAGE_SIZE_BITS);
-    reservation.page_size = VM::YUZU_PAGESIZE;
-    const auto reserved = AllocateSpace(reservation);
-    if (reserved != NvResult::Success) return reserved;
-    IoctlMapBufferEx mapping{};
-    mapping.flags = MappingFlags::Fixed;
-    mapping.handle = handle_id;
-    mapping.page_size = VM::YUZU_PAGESIZE;
-    mapping.buffer_offset = static_cast<s64>(buffer_offset);
-    mapping.mapping_size = size;
-    mapping.offset = static_cast<s64>(reservation.offset);
-    const auto result = MapBufferEx(mapping);
-    if (result == NvResult::Success) {
-        address = reservation.offset;
-    } else {
-        nvmap.UnpinHandle(handle_id);
-        IoctlFreeSpace release{};
-        release.offset = reservation.offset;
-        release.pages = reservation.pages;
-        release.page_size = reservation.page_size;
-        FreeSpace(release);
-    }
-    return result;
-}
-
-NvResult nvhost_as_gpu::UnmapNative4K(u64 address, u64 size) {
-    if (!m_extended_abi || !size || !Common::IsAligned(address, VM::YUZU_PAGESIZE) ||
-        !Common::IsAligned(size, VM::YUZU_PAGESIZE)) {
-        return NvResult::BadParameter;
-    }
-    IoctlFreeSpace release{};
-    release.offset = address;
-    release.pages = static_cast<u32>(size >> VM::PAGE_SIZE_BITS);
-    release.page_size = VM::YUZU_PAGESIZE;
-    return FreeSpace(release);
-}
-
-
+/// Creates the GPU address space. Switch 2 page tables cover the VA given to NVN,
+/// which can extend past the va_range_end NvRm passed in.
 NvResult nvhost_as_gpu::AllocAsEx(IoctlAllocAsEx& params) {
-    LOG_DEBUG(Service_NVDRV, "called, flags={:#x}, as_fd={}, big_page_size={:#x}, reserved={:#x}, VA={:#x}/{:#x}/{:#x}",
-              params.flags, params.as_fd, params.big_page_size, params.reserved,
-              params.va_range_start, params.va_range_split, params.va_range_end);
+    LOG_DEBUG(Service_NVDRV, "called, flags={:#x} big_page_size={:#x} va_range_start={:#x} va_range_end={:#x} va_range_split={:#x}", params.flags, params.big_page_size, params.va_range_start, params.va_range_end, params.va_range_split);
 
     std::scoped_lock lock(mutex);
 
@@ -250,44 +344,21 @@ NvResult nvhost_as_gpu::AllocAsEx(IoctlAllocAsEx& params) {
         return NvResult::InvalidState;
     }
 
-    std::shared_ptr<nvhost_as_gpu> shared_parent;
-    if (m_extended_abi && params.as_fd != 0) {
-        if (params.as_fd == m_fd) { return NvResult::BadParameter; }
-        const auto device = module.GetDevice<nvdevice>(params.as_fd);
-        if (!device || device->GetType() != Type::GpuAddressSpace) { return NvResult::BadParameter; }
-        shared_parent = std::static_pointer_cast<nvhost_as_gpu>(device);
-        if (!shared_parent->m_extended_abi || !shared_parent->vm.initialised ||
-            shared_parent->m_owner_process != m_owner_process ||
-            !IsSupportedNativeAddressSpaceView(
-                params.flags, params.big_page_size, params.reserved,
-                {params.va_range_start, params.va_range_split, params.va_range_end},
-                {shared_parent->vm.va_range_start, shared_parent->vm.va_range_split,
-                 shared_parent->vm.va_range_end})) { return NvResult::BadParameter; }
-    }
-
-    const u32 big_page_size = GetGpuAddressSpaceBigPageSize(m_extended_abi, params.big_page_size);
-    if (big_page_size) {
-        if (!std::has_single_bit(big_page_size)) {
-            LOG_ERROR(Service_NVDRV, "Non power-of-2 big page size: {:#x}!", big_page_size);
+    if (params.big_page_size) {
+        if (!std::has_single_bit(params.big_page_size)) {
+            LOG_ERROR(Service_NVDRV, "Non power-of-2 big page size: {:#x}!", params.big_page_size);
             return NvResult::BadValue;
         }
 
-        if ((big_page_size & VM::SUPPORTED_BIG_PAGE_SIZES) == 0) {
-            LOG_ERROR(Service_NVDRV, "Unsupported big page size: {:#x}!", big_page_size);
+        if ((params.big_page_size & VM::SUPPORTED_BIG_PAGE_SIZES) == 0) {
+            LOG_ERROR(Service_NVDRV, "Unsupported big page size: {:#x}!", params.big_page_size);
             return NvResult::BadValue;
         }
 
-        vm.big_page_size = big_page_size;
-        vm.big_page_size_bits = static_cast<u32>(std::countr_zero(big_page_size));
+        vm.big_page_size = params.big_page_size;
+        vm.big_page_size_bits = static_cast<u32>(std::countr_zero(params.big_page_size));
 
-        vm.va_range_start = big_page_size << VM::VA_START_SHIFT;
-    }
-
-    if (m_extended_abi && !params.va_range_start) {
-        const auto layout = GetGpuAddressSpaceLayout(true);
-        vm.va_range_start = layout.start;
-        vm.va_range_split = layout.split;
-        vm.va_range_end = layout.end;
+        vm.va_range_start = params.big_page_size << VM::VA_START_SHIFT;
     }
 
     // If this is unspecified then default values should be used
@@ -295,34 +366,41 @@ NvResult nvhost_as_gpu::AllocAsEx(IoctlAllocAsEx& params) {
         vm.va_range_start = params.va_range_start;
         vm.va_range_split = params.va_range_split;
         vm.va_range_end = params.va_range_end;
+        if (vm.va_range_split == 0) {
+            // Switch 2 NvRm (flags 5, no big page size) asks for small pages over the whole range
+            // and then reserves 4 KiB VA up to 512 GiB. Keep a small big-page region past the end
+            // so both allocators stay valid.
+            vm.va_range_split = vm.va_range_end;
+            vm.va_range_end += 4ULL << 30;
+            vm.absolute_big_page_limit = true;
+            LOG_WARNING(Service_NVDRV, "No VA split given; small pages up to {:#x}", vm.va_range_split);
+        }
     }
 
-    if (shared_parent) {
-        // Both native small-page views reserve within the parent's region.
-        // GPU mappings must resolve through the same page table.
-        vm.va_range_split = params.va_range_end;
-    }
-
-    const u64 max_big_page_bits = Common::Log2Ceil(vm.va_range_end);
+    // NVN allocates from the range nx2:gpu reports, which extends past NvRm's va_range_end.
+    // Size the page tables for the wider range, or a map such as 0x2109ec0000 (Nintendo
+    // GameCube - Nintendo Classics) indexes off the end of entries[].
+    const u64 covered_end = g_nx2_driver ? std::max(vm.va_range_end, Tegra::Nx2GpuVaEnd)
+                                         : vm.va_range_end;
+    const u64 max_big_page_bits = Common::Log2Ceil(covered_end);
 
     const auto start_pages{static_cast<u32>(vm.va_range_start >> VM::PAGE_SIZE_BITS)};
     const auto end_pages{static_cast<u32>(vm.va_range_split >> VM::PAGE_SIZE_BITS)};
     vm.small_page_allocator.emplace(start_pages, end_pages);
 
     const auto start_big_pages{static_cast<u32>(vm.va_range_split >> vm.big_page_size_bits)};
-    const auto end_big_pages{
-        static_cast<u32>(vm.va_range_end >> vm.big_page_size_bits)};
+    // The Switch 1 layout passes the big-page region length as the limit (so the limit stays above
+    // the start there); a split past the region length needs the absolute end instead.
+    const auto end_big_pages{static_cast<u32>(
+        (vm.absolute_big_page_limit ? vm.va_range_end : vm.va_range_end - vm.va_range_split) >>
+        vm.big_page_size_bits)};
     vm.big_page_allocator.emplace(start_big_pages, end_big_pages);
 
-    if (shared_parent) {
-        m_shared_parent = std::move(shared_parent);
-        gmmu = m_shared_parent->gmmu;
-        LOG_DEBUG(Service_NVDRV, "native AS view fd={} shares page table with fd={}", m_fd, params.as_fd);
-    } else {
-        gmmu = std::make_shared<Tegra::MemoryManager>(system, max_big_page_bits, vm.va_range_split, vm.big_page_size_bits, VM::PAGE_SIZE_BITS);
-        system.GPU().InitAddressSpace(*gmmu);
-    }
+    gmmu = std::make_unique<Tegra::MemoryManager>(system, max_big_page_bits, vm.va_range_split, vm.big_page_size_bits, VM::PAGE_SIZE_BITS);
+    system.GPU().InitAddressSpace(*gmmu);
     vm.initialised = true;
+    LOG_INFO(Service_NVDRV, "GPU address space {} created: VA [{:#x}, {:#x}), big pages from {:#x}",
+             gmmu->GetID(), vm.va_range_start, vm.va_range_end, vm.va_range_split);
 
     return NvResult::Success;
 }
@@ -342,8 +420,7 @@ NvResult nvhost_as_gpu::AllocateSpace(IoctlAllocSpace& params) {
     }
 
     if (params.page_size != vm.big_page_size &&
-        ((params.flags & MappingFlags::Sparse) != MappingFlags::None) &&
-        !(m_extended_abi && params.page_size == VM::YUZU_PAGESIZE)) {
+        ((params.flags & MappingFlags::Sparse) != MappingFlags::None)) {
         UNIMPLEMENTED_MSG("Sparse small pages are not implemented!");
         return NvResult::NotImplemented;
     }
@@ -367,7 +444,7 @@ NvResult nvhost_as_gpu::AllocateSpace(IoctlAllocSpace& params) {
     u64 size{static_cast<u64>(params.pages) * params.page_size};
 
     if ((params.flags & MappingFlags::Sparse) != MappingFlags::None) {
-        gmmu->MapSparse(params.offset, size, params.page_size != VM::YUZU_PAGESIZE);
+        gmmu->MapSparse(params.offset, size);
     }
 
     allocation_map[params.offset] = {
@@ -400,7 +477,6 @@ bool nvhost_as_gpu::FreeMappingLocked(u64 offset) noexcept {
             gmmu->Unmap(offset, mapping.size);
         }
         mapping_map.erase(offset);
-        map_buffer_offsets.erase(static_cast<s64>(offset));
         return true;
     }
     return false;
@@ -422,17 +498,8 @@ NvResult nvhost_as_gpu::FreeSpace(IoctlFreeSpace& params) {
                 return NvResult::BadValue;
 
         // Unset sparse flag if required
-        if (allocation.sparse) {
+        if (allocation.sparse)
             gmmu->Unmap(params.offset, allocation.size);
-            native_sparse_mappings.Replace({params.offset, allocation.size, 0, 0});
-            const auto retained = native_sparse_mappings.ReferencedHandles();
-            for (auto pin = native_sparse_pins.begin(); pin != native_sparse_pins.end();) {
-                if (!retained.contains(pin->first)) {
-                    nvmap.UnpinHandle(pin->first);
-                    pin = native_sparse_pins.erase(pin);
-                } else ++pin;
-            }
-        }
 
         auto& allocator{params.page_size == VM::YUZU_PAGESIZE ? *vm.small_page_allocator : *vm.big_page_allocator};
         u32 page_size_bits{params.page_size == VM::YUZU_PAGESIZE ? VM::PAGE_SIZE_BITS : vm.big_page_size_bits};
@@ -442,152 +509,6 @@ NvResult nvhost_as_gpu::FreeSpace(IoctlFreeSpace& params) {
         return NvResult::Success;
     }
     return NvResult::BadValue;
-}
-
-NvResult nvhost_as_gpu::GetNativeSyncpointShim(u64& address, u32& stride, u32& count) {
-    if (!m_extended_abi || !vm.initialised) { return NvResult::NotSupported; }
-    address = vm.va_range_split - VM::YUZU_PAGESIZE;
-    if (!m_syncpoint_shim_reserved) {
-        IoctlAllocSpace allocation{};
-        allocation.pages = 1;
-        allocation.page_size = VM::YUZU_PAGESIZE;
-        allocation.flags = MappingFlags::Fixed;
-        allocation.offset = address;
-        const auto result = AllocateSpace(allocation);
-        if (result != NvResult::Success) { return result; }
-        m_syncpoint_shim_reserved = true;
-        gmmu->SetNativeSyncpointShim(address);
-    }
-    stride = sizeof(u32);
-    count = 192;
-    return NvResult::Success;
-}
-
-NvResult nvhost_as_gpu::GetSyncpointShimInfo(IoctlSyncpointShimInfo& params) {
-    u64 address{};
-    u32 stride{}, count{};
-    const auto result = GetNativeSyncpointShim(address, stride, count);
-    params.address = address;
-    params.stride = stride;
-    params.count = count;
-    LOG_DEBUG(Service_NVDRV, "native syncpoint shim address={:#x}, stride={}, count={}, result={}",
-              address, stride, count, static_cast<u32>(result));
-    return result;
-}
-
-NvResult nvhost_as_gpu::ModifyNativeKind(u64 address, u64 size, u8 requested, u8 fallback) {
-    IoctlModifyKind params{};
-    params.compressed_kind = requested;
-    params.uncompressed_kind = fallback;
-    params.mapping_base = address;
-    params.size = size;
-    return ModifyKind(params);
-}
-
-NvResult nvhost_as_gpu::ModifyKind(IoctlModifyKind& params) {
-    const u32 requested = params.compressed_kind;
-    const u32 fallback = params.uncompressed_kind;
-    const u64 base = params.mapping_base;
-    const u64 offset = params.buffer_offset;
-    const u64 size = params.size;
-    LOG_DEBUG(Service_NVDRV, "native modify kind base={:#x}, offset={:#x}, size={:#x}, kinds={:#x}/{:#x}",
-              base, offset, size, requested, fallback);
-    if (!m_extended_abi || params.reserved != 0 || fallback > 255 ||
-        (requested > 255 && requested != 0xffff) || !size ||
-        offset > std::numeric_limits<u64>::max() - base ||
-        !Common::IsAligned(base + offset, VM::YUZU_PAGESIZE) ||
-        !Common::IsAligned(size, VM::YUZU_PAGESIZE)) {
-        return NvResult::BadParameter;
-    }
-    const auto kind = SelectNativeMemoryKind(static_cast<u8>(requested == 0xffff ? fallback : requested),
-                                             static_cast<u8>(fallback));
-    if (!kind) { return NvResult::NotSupported; }
-    const std::scoped_lock lock{mutex};
-    const u64 address = base + offset;
-    auto it = mapping_map.upper_bound(address);
-    if (!vm.initialised || it == mapping_map.begin()) { return NvResult::BadParameter; }
-    --it;
-    const auto& mapping = it->second;
-    const u64 delta = address - it->first;
-    if (delta >= mapping.size || size > mapping.size - delta) { return NvResult::BadParameter; }
-    gmmu->Map(address, mapping.ptr + delta, size, static_cast<Tegra::PTEKind>(kind->backend),
-              mapping.big_page);
-    return NvResult::Success;
-}
-
-NvResult nvhost_as_gpu::NativeRemap(std::span<NativeSparseRemapEntry> entries) {
-    const std::scoped_lock lock{mutex};
-    if (!m_extended_abi || !vm.initialised || entries.empty() || entries.size() > 256) {
-        return NvResult::BadParameter;
-    }
-    std::vector<NativeSparseRange> ranges;
-    std::vector<NativeMemoryKind> kinds;
-    auto updated = native_sparse_mappings;
-    for (const auto& entry : entries) {
-        LOG_DEBUG(Service_NVDRV, "Native remap request flags={:#x}, kinds={:#x}/{:#x}, memory={}, source_pages={:#x}, destination_pages={:#x}, pages={:#x}",
-                  u32{entry.flags}, u16{entry.kind}, u16{entry.fallback_kind}, u32{entry.handle},
-                  u64{entry.source_pages}, u64{entry.destination_pages}, u64{entry.pages});
-        const auto range = DecodeNativeSparseRemap(entry);
-        if (!range) return NvResult::BadParameter;
-        auto allocation = allocation_map.upper_bound(range->address);
-        if (allocation == allocation_map.begin()) return NvResult::BadParameter;
-        --allocation;
-        const auto& reservation = allocation->second;
-        if (!reservation.sparse || reservation.big_pages || range->address < allocation->first ||
-            range->address - allocation->first > reservation.size ||
-            range->size > reservation.size - (range->address - allocation->first)) {
-            return NvResult::BadParameter;
-        }
-        NativeMemoryKind kind{};
-        if (range->handle) {
-            const auto handle = nvmap.GetHandle(range->handle);
-            const auto* session = handle ? container.GetSession(handle->session_id) : nullptr;
-            if (!handle || !handle->allocated || !session || session->process != m_owner_process ||
-                range->source_offset > handle->orig_size ||
-                range->size > handle->orig_size - range->source_offset) {
-                return NvResult::BadParameter;
-            }
-            const u16 requested = entry.kind == 0xffff ? u16{entry.fallback_kind} : u16{entry.kind};
-            const u16 fallback = entry.fallback_kind == 0xffff ? requested : u16{entry.fallback_kind};
-            if (requested > 255 || fallback > 255) return NvResult::NotImplemented;
-            const auto selected = SelectNativeMemoryKind(static_cast<u8>(requested), static_cast<u8>(fallback));
-            if (!selected) return NvResult::NotImplemented;
-            kind = *selected;
-        }
-        updated.Replace(*range);
-        ranges.push_back(*range);
-        kinds.push_back(kind);
-    }
-    if (updated.Ranges().size() > 65536) return NvResult::InsufficientMemory;
-    const auto retained = updated.ReferencedHandles();
-    auto needed = retained;
-    for (const auto& range : ranges) if (range.handle) needed.insert(range.handle);
-    for (const auto handle : needed) {
-        if (!native_sparse_pins.contains(handle)) {
-            native_sparse_pins.emplace(handle, nvmap.PinHandle(handle, false));
-        }
-    }
-    for (size_t i = 0; i < ranges.size(); ++i) {
-        const auto& range = ranges[i];
-        if (range.handle) {
-            gmmu->Map(range.address, native_sparse_pins.at(range.handle) + range.source_offset,
-                      range.size, static_cast<Tegra::PTEKind>(kinds[i].backend), false);
-            if (u16{entries[i].kind} != kinds[i].selected) entries[i].kind = 0xffff;
-            entries[i].fallback_kind = kinds[i].selected;
-        } else {
-            gmmu->MapSparse(range.address, range.size, false);
-        }
-        LOG_DEBUG(Service_NVDRV, "Native sparse remap VA={:#x}, size={:#x}, memory={}, offset={:#x}, kind={:#x}",
-                  range.address, range.size, range.handle, range.source_offset, kinds[i].selected);
-    }
-    native_sparse_mappings = std::move(updated);
-    for (auto it = native_sparse_pins.begin(); it != native_sparse_pins.end();) {
-        if (!retained.contains(it->first)) {
-            nvmap.UnpinHandle(it->first);
-            it = native_sparse_pins.erase(it);
-        } else ++it;
-    }
-    return NvResult::Success;
 }
 
 NvResult nvhost_as_gpu::Remap(std::span<IoctlRemapEntry> entries) {
@@ -753,14 +674,10 @@ NvResult nvhost_as_gpu::UnmapBuffer(IoctlUnmapBuffer& params) {
 NvResult nvhost_as_gpu::BindChannel(IoctlBindChannel& params) {
     LOG_DEBUG(Service_NVDRV, "called, fd={:X}", params.fd);
 
-    const auto device = module.GetDevice<nvdevice>(params.fd);
-    if (!device || device->GetType() != nvdevice::Type::GpuChannel) { return NvResult::BadParameter; }
-    const auto gpu_channel_device = std::static_pointer_cast<nvhost_gpu>(device);
-    if (!vm.initialised || !gmmu || (gpu_channel_device->channel_state->initialized &&
-        gpu_channel_device->channel_state->memory_manager != gmmu.get())) { return NvResult::InvalidState; }
-    gpu_channel_device->channel_state->memory_manager_owner =
-        std::shared_ptr<Tegra::MemoryManager>(module.GetDevice<nvhost_as_gpu>(m_fd), gmmu.get());
+    auto gpu_channel_device = module.GetDevice<nvhost_gpu>(params.fd);
     gpu_channel_device->channel_state->memory_manager = gmmu.get();
+    LOG_INFO(Service_NVDRV, "Channel fd {} bound to GPU address space {}", static_cast<s32>(params.fd),
+             gmmu ? static_cast<s64>(gmmu->GetID()) : s64{-1});
     return NvResult::Success;
 }
 
@@ -769,22 +686,18 @@ void nvhost_as_gpu::GetVARegionsImpl(IoctlGetVaRegions& params) {
 
     params.regions = std::array<VaRegion, 2>{
         VaRegion{
-            .offset = GpuPageAddress(vm.small_page_allocator->GetVAStart(), VM::PAGE_SIZE_BITS),
+            .offset = vm.small_page_allocator->GetVAStart() << VM::PAGE_SIZE_BITS,
             .page_size = VM::YUZU_PAGESIZE,
             ._pad0_{},
             .pages = vm.small_page_allocator->GetVALimit() - vm.small_page_allocator->GetVAStart(),
         },
         VaRegion{
-            .offset = GpuPageAddress(vm.big_page_allocator->GetVAStart(), vm.big_page_size_bits),
+            .offset = vm.big_page_allocator->GetVAStart() << vm.big_page_size_bits,
             .page_size = vm.big_page_size,
             ._pad0_{},
             .pages = vm.big_page_allocator->GetVALimit() - vm.big_page_allocator->GetVAStart(),
         },
     };
-    if (m_extended_abi && params.regions[1].pages == 0) {
-        params.regions[1] = {};
-        params.buf_size = sizeof(VaRegion);
-    }
 }
 
 NvResult nvhost_as_gpu::GetVARegions1(IoctlGetVaRegions& params) {
@@ -813,8 +726,7 @@ NvResult nvhost_as_gpu::GetVARegions3(IoctlGetVaRegions& params, std::span<VaReg
 
     GetVARegionsImpl(params);
 
-    const size_t num_regions = (std::min)(static_cast<size_t>(params.buf_size) / sizeof(VaRegion),
-                                        regions.size());
+    const size_t num_regions = (std::min)(params.regions.size(), regions.size());
     for (size_t i = 0; i < num_regions; i++) {
         regions[i] = params.regions[i];
     }

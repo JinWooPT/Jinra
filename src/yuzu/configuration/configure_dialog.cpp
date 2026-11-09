@@ -68,7 +68,7 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
 
     ui->setupUi(this);
     setWindowTitle(QStringLiteral("Jinra — Settings"));
-    setWindowIcon(QIcon(QStringLiteral(":/img/eden.ico")));
+    setWindowIcon(QIcon(QStringLiteral(":/img/jinra.ico")));
     ui->selectorList->setMinimumWidth(140);
     ui->selectorList->setMaximumWidth(160);
 

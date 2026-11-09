@@ -7,11 +7,13 @@
 #pragma once
 
 #include <array>
+#include <optional>
+#include <span>
+#include <vector>
 #include <bitset>
 #include <map>
 
 #include "common/common_types.h"
-#include "shader_recompiler/buffer_texture_index.h"
 #include "shader_recompiler/frontend/ir/type.h"
 #include "shader_recompiler/varying_state.h"
 
@@ -173,46 +175,14 @@ struct StorageBufferDescriptor {
     u32 cbuf_offset;
     u32 count;
     bool is_written;
+    /// When set, the buffer pointer is read from memory at this offset from the constant buffer
+    /// pointer, which is bound as its own descriptor.
+    u32 indirect_offset{~0U};
 
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
 
-enum class TextureBufferNumericType : u8 {
-    Float,
-    Uint,
-    Sint,
-};
-
-[[nodiscard]] constexpr TextureBufferNumericType TextureBufferType(TexturePixelFormat format) {
-    switch (format) {
-    case TexturePixelFormat::A8B8G8R8_UINT:
-    case TexturePixelFormat::A2B10G10R10_UINT:
-    case TexturePixelFormat::R8_UINT:
-    case TexturePixelFormat::R16G16B16A16_UINT:
-    case TexturePixelFormat::R32G32B32A32_UINT:
-    case TexturePixelFormat::R16_UINT:
-    case TexturePixelFormat::R16G16_UINT:
-    case TexturePixelFormat::R8G8_UINT:
-    case TexturePixelFormat::R32G32_UINT:
-    case TexturePixelFormat::R32_UINT:
-        return TextureBufferNumericType::Uint;
-    case TexturePixelFormat::A8B8G8R8_SINT:
-    case TexturePixelFormat::R8_SINT:
-    case TexturePixelFormat::R16G16B16A16_SINT:
-    case TexturePixelFormat::R32G32B32A32_SINT:
-    case TexturePixelFormat::R32G32_SINT:
-    case TexturePixelFormat::R16_SINT:
-    case TexturePixelFormat::R16G16_SINT:
-    case TexturePixelFormat::R8G8_SINT:
-    case TexturePixelFormat::R32_SINT:
-        return TextureBufferNumericType::Sint;
-    default:
-        return TextureBufferNumericType::Float;
-    }
-}
-
 struct TextureBufferDescriptor {
-    TextureBufferNumericType numeric_type{TextureBufferNumericType::Float};
     bool has_secondary;
     u32 cbuf_index;
     u32 cbuf_offset;
@@ -222,6 +192,9 @@ struct TextureBufferDescriptor {
     u32 secondary_shift_left;
     u32 count;
     u32 size_shift;
+    /// Index in Info::handle_programs when the handle is computed at draw time (read from a
+    /// storage buffer), ~0 when it is the constant buffer word.
+    u32 handle_program{~0U};
 
     auto operator<=>(const TextureBufferDescriptor&) const = default;
 };
@@ -236,32 +209,13 @@ struct ImageBufferDescriptor {
     u32 cbuf_offset;
     u32 count;
     u32 size_shift;
+    /// Index in Info::handle_programs when the handle is computed at draw time (read from a
+    /// storage buffer), ~0 when it is the constant buffer word.
+    u32 handle_program{~0U};
 
     auto operator<=>(const ImageBufferDescriptor&) const = default;
 };
 using ImageBufferDescriptors = boost::container::small_vector<ImageBufferDescriptor, 2>;
-
-struct BufferTextureExclusion {
-    u32 offset{};
-    u32 mask{};
-    u32 value{};
-    bool not_equal{};
-
-    bool Matches(u32 word) const { return mask && (((word & mask) != value) == not_equal); }
-    auto operator<=>(const BufferTextureExclusion&) const = default;
-};
-
-struct BufferTextureSource {
-    u32 offset{};
-    u32 stride{};
-    u32 size{};
-    bool enabled{};
-    bool width_query{};
-    std::array<BufferTextureExclusion, 4> exclusions{};
-    TextureIndexProgram uniform_index;
-
-    auto operator<=>(const BufferTextureSource&) const = default;
-};
 
 struct TextureDescriptor {
     TextureType type;
@@ -277,8 +231,9 @@ struct TextureDescriptor {
     u32 secondary_shift_left;
     u32 count;
     u32 size_shift;
-
-    BufferTextureSource buffer_source{};
+    /// Index in Info::handle_programs when the handle is computed at draw time (read from a
+    /// storage buffer), ~0 when it is the constant buffer word above.
+    u32 handle_program{~0U};
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };
@@ -294,27 +249,42 @@ struct ImageDescriptor {
     u32 cbuf_offset;
     u32 count;
     u32 size_shift;
+    bool is_byte_addressed{};
+    /// Index in Info::handle_programs when the handle is computed at draw time (read from a
+    /// storage buffer), ~0 when it is the constant buffer word.
+    u32 handle_program{~0U};
 
     auto operator<=>(const ImageDescriptor&) const = default;
 };
 using ImageDescriptors = boost::container::small_vector<ImageDescriptor, 4>;
 
+/// Switch 2 (NVN) task and mesh programs: the sizes their mesh registers set and, for mesh
+/// programs, the attribute (IR::Attribute index) held by each 128-byte line of a 32-element group
+/// in the emulated stage buffer: per-vertex lines from the program's output map, per-primitive
+/// lines from the pass-through geometry header bound with it, in attribute order.
 struct MeshInfo {
-    u32 payload_words{};
+    u32 payload_words{}; ///< Task output region / mesh input region, in 32-bit words
     u32 max_vertices{};
     u32 max_primitives{};
-    u32 topology{};
+    u32 topology{}; ///< SET_MESH_SHADER_A output topology (0 = points, 1 = lines, 4 = triangles)
     boost::container::static_vector<u32, 136> vertex_lines;
     boost::container::static_vector<u32, 136> primitive_lines;
+
+    /// Vertex indices per primitive, which is also its byte count in the map region.
+    [[nodiscard]] u32 PrimitiveVertices() const noexcept {
+        return topology == 0 ? 1 : topology == 1 ? 2 : 3;
+    }
 };
 
 struct Info {
-    bool is_task{};
-    bool is_mesh{};
     static constexpr size_t MAX_INDIRECT_CBUFS{14};
-    static constexpr size_t MAX_CBUFS{32};
-    static constexpr size_t MAX_SSBOS{32};
+    static constexpr size_t MAX_CBUFS{18};
+    /// Native (Switch 2) programs take their storage buffers from raw pointers, as many as they
+    /// read: Ocarina of Time's foliage culling binds 37 for its lists and per-type instance tables.
+    static constexpr size_t MAX_SSBOS{64};
 
+    bool is_task{}; ///< Switch 2 task program (Stage::Task)
+    bool is_mesh{}; ///< Switch 2 mesh program (Stage::Mesh)
     bool uses_workgroup_id{};
     bool uses_local_invocation_id{};
     bool uses_invocation_id{};
@@ -336,6 +306,8 @@ struct Info {
     bool loads_indexed_attributes{};
 
     std::array<bool, 8> stores_frag_color{};
+    /// Components (bit 0 = R ... bit 3 = A) of each render target the fragment shader writes
+    std::array<u8, 8> frag_color_components{};
     bool stores_sample_mask{};
     bool stores_frag_depth{};
 
@@ -382,8 +354,13 @@ struct Info {
     bool uses_atomic_s32_max{};
     bool uses_int64_bit_atomics{};
     bool uses_global_memory{};
-    bool uses_global_atomics{};
-    bool uses_global_subword_write{};
+    bool requires_coherent_global_memory{};
+    bool requires_coherent_image_memory{};
+    /// Set by the SPIR-V backend when HMMA runs on cooperative matrices, which need full subgroups
+    bool uses_cooperative_matrix{};
+    /// Native global accesses whose pointer is chosen at run time: every storage buffer descriptor
+    /// is a candidate and its bound length (not an NVN size word) limits the range.
+    bool native_global_bounds{};
     bool uses_atomic_image_u32{};
     bool uses_shadow_lod{};
     bool uses_rescaling_uniform{};
@@ -398,8 +375,6 @@ struct Info {
     std::array<u32, MAX_CBUFS> constant_buffer_used_sizes{};
     u32 nvn_buffer_base{};
     std::bitset<16> nvn_buffer_used{};
-    u32 native_indirect_reset_cbuf{~0U};
-    u32 native_indirect_reset_offset{};
 
     bool requires_layer_emulation{};
     IR::Attribute emulated_layer{};
@@ -412,6 +387,9 @@ struct Info {
     TextureBufferDescriptors texture_buffer_descriptors;
     ImageBufferDescriptors image_buffer_descriptors;
     TextureDescriptors texture_descriptors;
+    /// Texture handles the shader reads from storage buffers, as programs over constant buffer
+    /// and storage buffer words (see EvaluateHandleProgram), evaluated for each draw.
+    std::vector<std::vector<u32>> handle_programs;
     ImageDescriptors image_descriptors;
 };
 
@@ -422,6 +400,113 @@ u32 NumDescriptors(const Descriptors& descriptors) {
         num += desc.count;
     }
     return num;
+}
+
+
+/// Operations of a handle program, a stack machine over 32-bit words. Operands follow the
+/// operation code in the program; values are popped right operand first.
+enum class HandleOp : u32 {
+    Immediate,     ///< value
+    Cbuf,          ///< index, offset: the constant buffer word
+    CbufDynamic,   ///< index: the word at the popped byte offset
+    Storage,       ///< binding: the storage buffer word at the popped byte offset
+    Add, Sub, Mul, And, Or, Xor, Shl, Shr, Sar, Neg, Not,
+    UMin, UMax, SMin, SMax,
+    SLt, SLe, SGt, SGe, ULt, ULe, UGt, UGe, Eq, Ne,
+    LAnd, LOr, LXor, LNot,
+    Select, ///< condition, true value, false value
+    Tee,    ///< slot: keeps the top value in the slot (shared subexpressions)
+    Load,   ///< slot: the value kept there
+};
+
+/// Runs a handle program; read_cbuf(index, offset) and read_storage(binding, offset) return the
+/// words it reads. Returns nothing for a malformed program.
+template <typename ReadCbuf, typename ReadStorage>
+std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& read_cbuf,
+                                         ReadStorage&& read_storage) {
+    std::array<u32, 64> stack{};
+    std::array<u32, 256> slots{};
+    size_t size = 0;
+    const auto pop = [&]() -> u32 { return size > 0 ? stack[--size] : 0; };
+    const auto push = [&](u32 value) {
+        if (size < stack.size()) stack[size++] = value;
+    };
+    for (size_t pc = 0; pc < code.size();) {
+        const HandleOp op = static_cast<HandleOp>(code[pc++]);
+        const auto operand = [&]() -> u32 { return pc < code.size() ? code[pc++] : 0; };
+        if (op == HandleOp::Immediate) {
+            push(operand());
+            continue;
+        }
+        if (op == HandleOp::Cbuf) {
+            const u32 index = operand();
+            push(read_cbuf(index, operand()));
+            continue;
+        }
+        if (op == HandleOp::CbufDynamic) {
+            const u32 index = operand();
+            push(read_cbuf(index, pop()));
+            continue;
+        }
+        if (op == HandleOp::Storage) {
+            const u32 binding = operand();
+            push(read_storage(binding, pop()));
+            continue;
+        }
+        if (op == HandleOp::Neg || op == HandleOp::Not || op == HandleOp::LNot) {
+            const u32 a = pop();
+            push(op == HandleOp::Neg ? 0U - a : op == HandleOp::Not ? ~a : (a == 0 ? 1U : 0U));
+            continue;
+        }
+        if (op == HandleOp::Tee) {
+            const u32 slot = operand();
+            if (slot < slots.size() && size > 0) slots[slot] = stack[size - 1];
+            continue;
+        }
+        if (op == HandleOp::Load) {
+            const u32 slot = operand();
+            push(slot < slots.size() ? slots[slot] : 0U);
+            continue;
+        }
+        if (op == HandleOp::Select) {
+            const u32 false_value = pop(), true_value = pop(), condition = pop();
+            push(condition != 0 ? true_value : false_value);
+            continue;
+        }
+        const u32 b = pop(), a = pop();
+        const s32 sa = static_cast<s32>(a), sb = static_cast<s32>(b);
+        switch (op) {
+        case HandleOp::Add: push(a + b); break;
+        case HandleOp::Sub: push(a - b); break;
+        case HandleOp::Mul: push(a * b); break;
+        case HandleOp::And: push(a & b); break;
+        case HandleOp::Or: push(a | b); break;
+        case HandleOp::Xor: push(a ^ b); break;
+        case HandleOp::Shl: push(b >= 32 ? 0U : a << b); break;
+        case HandleOp::Shr: push(b >= 32 ? 0U : a >> b); break;
+        case HandleOp::Sar: push(static_cast<u32>(sa >> (b >= 32 ? 31 : b))); break;
+        case HandleOp::UMin: push(a < b ? a : b); break;
+        case HandleOp::UMax: push(a > b ? a : b); break;
+        case HandleOp::SMin: push(static_cast<u32>(sa < sb ? sa : sb)); break;
+        case HandleOp::SMax: push(static_cast<u32>(sa > sb ? sa : sb)); break;
+        case HandleOp::SLt: push(sa < sb); break;
+        case HandleOp::SLe: push(sa <= sb); break;
+        case HandleOp::SGt: push(sa > sb); break;
+        case HandleOp::SGe: push(sa >= sb); break;
+        case HandleOp::ULt: push(a < b); break;
+        case HandleOp::ULe: push(a <= b); break;
+        case HandleOp::UGt: push(a > b); break;
+        case HandleOp::UGe: push(a >= b); break;
+        case HandleOp::Eq: push(a == b); break;
+        case HandleOp::Ne: push(a != b); break;
+        case HandleOp::LAnd: push(a != 0 && b != 0); break;
+        case HandleOp::LOr: push(a != 0 || b != 0); break;
+        case HandleOp::LXor: push((a != 0) != (b != 0)); break;
+        default: return std::nullopt;
+        }
+    }
+    if (size != 1) return std::nullopt;
+    return stack[0];
 }
 
 } // namespace Shader

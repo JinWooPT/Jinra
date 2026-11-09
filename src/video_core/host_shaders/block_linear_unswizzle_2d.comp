@@ -125,7 +125,9 @@ void main() {
     offset += (pos.x >> GOB_SIZE_X_SHIFT) << x_shift;
     offset += swizzle;
 
-    const uvec4 texel = ReadTexel(offset);
     const ivec3 coord = ivec3(gl_GlobalInvocationID) + destination;
-    imageStore(output_image, coord, texel);
+    if (any(lessThan(coord, ivec3(0))) || any(greaterThanEqual(coord, imageSize(output_image)))) {
+        return;
+    }
+    imageStore(output_image, coord, ReadTexel(offset));
 }

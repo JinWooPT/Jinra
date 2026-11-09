@@ -1,9 +1,10 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
 #include <array>
-#include "common/alignment.h"
 
 #include "common/assert.h"
 #include "common/literals.h"
@@ -34,7 +35,8 @@ constexpr std::array<KAddressSpaceInfo, 13> AddressSpaceInfos{{
    { .bit_width = 39, .address = 128_MiB     , .size = 512_GiB - 128_MiB, .type = KAddressSpaceInfo::Type::Map39Bit, },
 #endif
    { .bit_width = 39, .address = Size_Invalid, .size = 64_GiB           , .type = KAddressSpaceInfo::Type::MapSmall  },
-   { .bit_width = 39, .address = Size_Invalid, .size = 8_GiB            , .type = KAddressSpaceInfo::Type::Heap,     },
+   // Switch 2 titles size their heap from up to 12 GiB of memory, which doesn't fit Switch 1's 8 GiB.
+   { .bit_width = 39, .address = Size_Invalid, .size = 16_GiB           , .type = KAddressSpaceInfo::Type::Heap,     },
    { .bit_width = 39, .address = Size_Invalid, .size = 64_GiB           , .type = KAddressSpaceInfo::Type::Alias,    },
    { .bit_width = 39, .address = Size_Invalid, .size = 2_GiB            , .type = KAddressSpaceInfo::Type::Stack,    },
 }};
@@ -55,14 +57,7 @@ std::size_t KAddressSpaceInfo::GetAddressSpaceStart(size_t width, KAddressSpaceI
     return GetAddressSpaceInfo(width, type).address;
 }
 
-std::size_t KAddressSpaceInfo::GetAddressSpaceSize(size_t width, KAddressSpaceInfo::Type type,
-                                                  size_t physical_memory_size) {
-    if (width == 39 && (type == Type::Heap || type == Type::Alias)) {
-        const size_t heap_size = std::clamp(
-            Common::AlignUp(std::min(physical_memory_size, size_t{32_GiB}), size_t{1_GiB}),
-            size_t{8_GiB}, size_t{32_GiB});
-        return type == Type::Heap ? heap_size : std::min(heap_size * 8, size_t{128_GiB});
-    }
+std::size_t KAddressSpaceInfo::GetAddressSpaceSize(size_t width, KAddressSpaceInfo::Type type) {
     return GetAddressSpaceInfo(width, type).size;
 }
 

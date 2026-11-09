@@ -6,7 +6,6 @@
 
 #include "common/assert.h"
 #include <ranges>
-#include <utility>
 #include <vulkan/vulkan_core.h>
 #include "video_core/renderer_vulkan/present/util.h"
 
@@ -50,25 +49,13 @@ vk::Image CreateWrappedImage(MemoryAllocator& allocator, VkExtent2D dimensions, 
 
 void TransitionImageLayout(vk::CommandBuffer& cmdbuf, VkImage image, VkImageLayout target_layout,
                            VkImageLayout source_layout) {
-    const auto scope = [](VkImageLayout layout) -> std::pair<VkPipelineStageFlags, VkAccessFlags> {
-        switch (layout) {
-        case VK_IMAGE_LAYOUT_UNDEFINED:
-            return {VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0};
-        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-            return {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
-        default:
-            return {vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
-                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
-        }
-    };
-    const auto [source_stages, source_access] = scope(source_layout);
-    const auto [target_stages, target_access] = scope(target_layout);
+    constexpr VkFlags flags{VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
     const VkImageMemoryBarrier barrier{
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .pNext = nullptr,
-        .srcAccessMask = source_access,
-        .dstAccessMask = target_access,
+        .srcAccessMask = flags,
+        .dstAccessMask = flags,
         .oldLayout = source_layout,
         .newLayout = target_layout,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -82,7 +69,8 @@ void TransitionImageLayout(vk::CommandBuffer& cmdbuf, VkImage image, VkImageLayo
             .layerCount = 1,
         },
     };
-    cmdbuf.PipelineBarrier(source_stages, target_stages, 0, barrier);
+    cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
+                           0, barrier);
 }
 
 void UploadImage(const Device& device, MemoryAllocator& allocator, Scheduler& scheduler,
@@ -208,13 +196,12 @@ vk::ImageView CreateWrappedImageView(const Device& device, vk::Image& image, VkF
 }
 
 vk::RenderPass CreateWrappedRenderPass(const Device& device, VkFormat format,
-                                       VkImageLayout initial_layout, bool clear) {
+                                       VkImageLayout initial_layout) {
     const VkAttachmentDescription attachment{
         .flags = VK_ATTACHMENT_DESCRIPTION_MAY_ALIAS_BIT,
         .format = format,
         .samples = VK_SAMPLE_COUNT_1_BIT,
-        .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR :
-                  initial_layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+        .loadOp = initial_layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
                                                               : VK_ATTACHMENT_LOAD_OP_LOAD,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
         .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
@@ -708,16 +695,12 @@ void ClearColorImage(vk::CommandBuffer& cmdbuf, VkImage image) {
         .baseArrayLayer = 0,
         .layerCount = 1,
     }}};
-    TransitionImageLayout(cmdbuf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                          VK_IMAGE_LAYOUT_UNDEFINED);
-    cmdbuf.ClearColorImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, {}, subresources);
-    TransitionImageLayout(cmdbuf, image, VK_IMAGE_LAYOUT_GENERAL,
-                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    TransitionImageLayout(cmdbuf, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_UNDEFINED);
+    cmdbuf.ClearColorImage(image, VK_IMAGE_LAYOUT_GENERAL, {}, subresources);
 }
 
 void BeginRenderPass(vk::CommandBuffer& cmdbuf, VkRenderPass render_pass, VkFramebuffer framebuffer,
                      VkExtent2D extent) {
-    const VkClearValue clear{};
     const VkRenderPassBeginInfo renderpass_bi{
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .pNext = nullptr,
@@ -727,8 +710,8 @@ void BeginRenderPass(vk::CommandBuffer& cmdbuf, VkRenderPass render_pass, VkFram
             .offset{},
             .extent = extent,
         },
-        .clearValueCount = 1,
-        .pClearValues = &clear,
+        .clearValueCount = 0,
+        .pClearValues = nullptr,
     };
     cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
 

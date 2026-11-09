@@ -23,6 +23,13 @@ public:
         return std::construct_at(Memory(), std::forward<Args>(args)...);
     }
 
+    /// Destroys the objects and returns their memory; ReleaseContents keeps it for reuse
+    void Free() {
+        chunks.clear();
+        chunks.shrink_to_fit();
+        node = &chunks.emplace_back(new_chunk_size);
+    }
+
     void ReleaseContents() {
         if (chunks.empty()) {
             return;
@@ -75,6 +82,9 @@ private:
             Release();
         }
 
+        // Destroys the objects themselves: Storage's destructor is empty on purpose (the union
+        // also holds unused slots), so destroying the Storage elements would skip T's
+        // destructor and leak what the objects own (e.g. an IR::Inst's phi operand list).
         void Release() {
             for (size_t index = 0; index < used_objects; ++index) {
                 std::destroy_at(&storage[index].object);

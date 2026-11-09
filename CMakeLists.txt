@@ -10,7 +10,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/find")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/externals/cmake-modules")
 
-set(CPM_SOURCE_CACHE ${CMAKE_SOURCE_DIR}/.cache/cpm)
+set(CPM_SOURCE_CACHE "${CMAKE_SOURCE_DIR}/.cache/cpm" CACHE PATH "Dependency cache directory")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_SCAN_FOR_MODULES 0)
 
@@ -72,8 +72,10 @@ endif()
 
 # qt stuff
 option(ENABLE_QT "Enable the Qt frontend" ON)
-option(ENABLE_QT_TRANSLATION "Enable translations for the Qt frontend" ON)
+option(ENABLE_QT_TRANSLATION "Enable translations for the Qt frontend" OFF)
 option(ENABLE_UPDATE_CHECKER "Enable update checker (for Qt and Android)" OFF)
+set(JINRA_BUILD_TAG "" CACHE STRING "Published build-N release tag; empty for local builds")
+set(JINRA_BUILD_PLATFORM "" CACHE STRING "Release asset platform and variant, such as linux-x86_64-pgo")
 cmake_dependent_option(YUZU_USE_QT_MULTIMEDIA "Use QtMultimedia for Camera"  OFF "NOT YUZU_USE_BUNDLED_QT" OFF)
 cmake_dependent_option(YUZU_USE_QT_WEB_ENGINE "Use QtWebEngine for web applet implementation" OFF "NOT YUZU_USE_BUNDLED_QT" OFF)
 set(YUZU_QT_MIRROR "" CACHE STRING "What mirror to use for downloading the bundled Qt libraries")
@@ -82,8 +84,28 @@ cmake_dependent_option(YUZU_USE_BUNDLED_QT "Download bundled Qt binaries" "${MSV
 option(ENABLE_DEBUG_TOOLS "Enable debugging tools (maxwell disassembler, SPIRV translator, etc)" OFF)
 option(ENABLE_WERROR "Enable -Werror diagnostics" ON)
 
+# Handle specific -Werror downgrades safely across platforms
+if(ENABLE_WERROR)
+    if(CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        if(CMAKE_C_FLAGS MATCHES "-Werror=unused")
+            string(REPLACE "-Werror=unused" "-Wno-error=unused" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+        endif()
+        if(CMAKE_CXX_FLAGS MATCHES "-Werror=unused")
+            string(REPLACE "-Werror=unused" "-Wno-error=unused" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+        endif()
+
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-error=unused -Wno-error=unused-function")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=unused -Wno-error=unused-function")
+    elseif(MSVC)
+        # Windows Specifically
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /wd4100 /wd4101")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4100 /wd4101")
+    endif()
+endif()
+
+
 # Lossless Scaling frame generation. Only Android.
-cmake_dependent_option(ENABLE_LSFG "Enable Lossless Scaling frame generation" ON "ANDROID" OFF)
+option(ENABLE_LSFG "Enable frame generation (LSFG and FSR 3 Fluid Motion)" ON)
 
 option(ENABLE_RESHADE "Enable ReShade FX post-processing effects" ON)
 
@@ -293,7 +315,7 @@ if (ANDROID AND YUZU_DOWNLOAD_ANDROID_VVL)
 endif()
 
 if(EXISTS ${PROJECT_SOURCE_DIR}/hooks/pre-commit AND NOT EXISTS ${PROJECT_SOURCE_DIR}/.git/hooks/pre-commit)
-    if (EXISTS ${PROJECT_SOURCE_DIR}/.git/)
+    if (IS_DIRECTORY ${PROJECT_SOURCE_DIR}/.git)
         message(STATUS "Copying pre-commit hook")
         file(COPY hooks/pre-commit DESTINATION ${PROJECT_SOURCE_DIR}/.git/hooks)
     endif()
@@ -443,6 +465,9 @@ if (lz4_ADDED)
 endif()
 
 # zstd
+# Always bundled: NUP archives are only byte-identical across platforms when every build
+# compresses with the same zstd version.
+set(zstd_FORCE_BUNDLED ON)
 AddJsonPackage(zstd)
 
 if (zstd_ADDED)
@@ -706,6 +731,7 @@ endif()
 add_subdirectory(src)
 
 if (ENABLE_DEBUG_TOOLS)
+    add_subdirectory(tools/shader-sweep)
     add_subdirectory(tools/maxwell-disas)
     add_subdirectory(tools/maxwell-spirv)
     add_subdirectory(tools/maxwell-ir)
@@ -729,15 +755,15 @@ endif()
 
 # TODO: Icon/install handling n such should be put into dist/CMakeLists.txt
 if(ENABLE_QT AND UNIX AND NOT APPLE)
-    install(FILES "dist/dev.eden_emu.eden.desktop"
+    install(FILES "dist/io.github.JinWooPT.jinra.desktop"
         DESTINATION "share/applications")
-    install(FILES "dist/dev.eden_emu.eden.svg"
-        DESTINATION "share/icons/hicolor/scalable/apps")
+    install(FILES "dist/jinra.png"
+        DESTINATION "share/icons/hicolor/256x256/apps"
+        RENAME "io.github.JinWooPT.jinra.png")
 
-    # TODO: these files need to be updated.
-    install(FILES "dist/dev.eden_emu.eden.xml"
+    install(FILES "dist/io.github.JinWooPT.jinra.xml"
         DESTINATION "share/mime/packages")
-    install(FILES "dist/dev.eden_emu.eden.metainfo.xml"
+    install(FILES "dist/io.github.JinWooPT.jinra.metainfo.xml"
         DESTINATION "share/metainfo")
 endif()
 

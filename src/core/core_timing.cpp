@@ -16,6 +16,7 @@
 #include "common/windows/timer_resolution.h"
 #endif
 
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
 #include "core/hardware_properties.h"
@@ -64,6 +65,16 @@ struct CoreTiming::Event {
 CoreTiming::CoreTiming() = default;
 CoreTiming::~CoreTiming() {
     Reset();
+#ifdef _WIN32
+    Common::Windows::CloseWaitHandle(wake_handle);
+#endif
+}
+
+void CoreTiming::Wake() {
+    event.Set();
+#ifdef _WIN32
+    Common::Windows::SignalWakeEvent(wake_handle);
+#endif
 }
 
 void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
@@ -72,16 +83,27 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
     event_fifo_id = 0;
     cpu_ticks = 0;
     if (is_multicore) {
+#ifdef _WIN32
+        if (wake_handle == nullptr) {
+            wake_handle = Common::Windows::CreateWakeEvent();
+        }
+#endif
         timer_thread = std::jthread([this](std::stop_token stop_token) {
             Common::SetCurrentThreadName("HostTiming");
             Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
             Common::SetCurrentThreadToPerformanceCores();
             on_thread_init();
-            has_started = true;
 #ifdef _WIN32
-            const char* wait_mode = std::getenv("EDEN_HOST_TIMING_KERNEL_WAIT");
-            const bool kernel_wait = wait_mode && wait_mode[0] == '1';
+            // EDEN_HIRES_CLOCK=0 keeps the plain timed wait.
+            const char* const hires_switch = std::getenv("EDEN_HIRES_CLOCK");
+            void* const hires_timer = (hires_switch != nullptr && hires_switch[0] == '0')
+                                          ? nullptr
+                                          : Common::Windows::CreateHighResolutionTimer();
+            SCOPE_EXIT {
+                Common::Windows::CloseWaitHandle(hires_timer);
+            };
 #endif
+            has_started = true;
 
             // base frequency in MHz: 1ns (10^-9) = 1GHz (10^9)
             while (!stop_token.stop_requested()) {
@@ -92,12 +114,13 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                         auto const wait_time = *next_time - GetGlobalTimeNs().count();
                         if (wait_time > 0) {
 #ifdef _WIN32
-                            if (kernel_wait) {
-                                event.WaitUntil(std::chrono::steady_clock::now() +
-                                                std::chrono::nanoseconds(wait_time));
-                            } else
+                            // A high resolution timer keeps the guest's events (vsync among them)
+                            // on time even where Windows doesn't honour our timer resolution
+                            // request (Windows 11: players gained ~30% fps from making it global).
+                            if (!Common::Windows::WaitHighResolution(
+                                    hires_timer, wake_handle, std::chrono::nanoseconds(wait_time)))
 #endif
-                            event.WaitFor(std::chrono::nanoseconds(wait_time));
+                                event.WaitFor(std::chrono::nanoseconds(wait_time));
                         }
                     } else {
                         // Queue is empty, wait until another event is scheduled and signals us to
@@ -117,7 +140,7 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
 void CoreTiming::ClearPendingEvents() {
     std::scoped_lock lock{advance_lock, basic_lock};
     event_queue.clear();
-    event.Set();
+    Wake();
 }
 
 void CoreTiming::Pause(bool is_paused) {
@@ -139,7 +162,7 @@ void CoreTiming::SyncPause(bool is_paused) {
         if (!is_paused) {
             pause_event.Set();
         }
-        event.Set();
+        Wake();
         while (paused_set != is_paused)
             ;
     }
@@ -168,7 +191,7 @@ void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
         (*h).handle = h;
     }
 
-    event.Set();
+    Wake();
 }
 
 void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
@@ -184,7 +207,7 @@ void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
         (*h).handle = h;
     }
 
-    event.Set();
+    Wake();
 }
 
 void CoreTiming::UnscheduleEvent(const std::shared_ptr<EventType>& event_type,
@@ -235,7 +258,7 @@ void CoreTiming::ResetTicks() {
 }
 
 u64 CoreTiming::GetClockTicks() const {
-    u64 fres = is_multicore ? Common::g_wall_clock.GetCNTPCT() : Common::WallClock::CPUTickToCNTPCT(cpu_ticks);
+    u64 fres = is_multicore ? Common::g_wall_clock.GetCNTPCT() : Common::g_wall_clock.CPUTickToGuestCNTPCT(cpu_ticks);
     if (const u32 target = CpuClockTargetMhz(Settings::values.cpu_clock.GetValue());
         target != CPU_CLOCK_BASE_MHZ) {
         fres = fres * target / CPU_CLOCK_BASE_MHZ;
@@ -316,12 +339,13 @@ std::optional<s64> CoreTiming::Advance() {
 void CoreTiming::Reset() {
     paused = true;
     // Request the stop before waking the thread: woken first, it could take the wake-up, see no
-    // stop request yet and wait on pause_event again, and the join below would hang.
+    // stop request yet, and go back to waiting on pause_event for good (the join below then hung
+    // the frontend at boot).
     if (timer_thread.joinable()) {
         timer_thread.request_stop();
     }
     pause_event.Set();
-    event.Set();
+    Wake();
     if (timer_thread.joinable()) {
         timer_thread.join();
     }

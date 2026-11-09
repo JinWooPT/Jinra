@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <mutex>
@@ -19,6 +20,7 @@
 #include "common/common_types.h"
 #include "common/fiber.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/random.h"
 #include "core/core.h"
@@ -39,6 +41,7 @@
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/svc_types.h"
+#include "core/hle/kernel/thread_startup_policy.h"
 #include "core/hle/result.h"
 #include "core/memory.h"
 
@@ -122,7 +125,7 @@ namespace Kernel {
         ASSERT(0 <= virt_core && virt_core < static_cast<s32>(Common::BitSize<u64>()));
 
         // Convert the virtual core to a physical core.
-        const s32 phys_core = Core::Hardware::ConvertVirtualCoreToPhysical(virt_core);
+        const s32 phys_core = Core::Hardware::VirtualToPhysicalCoreMap[virt_core];
         ASSERT(0 <= phys_core && phys_core < static_cast<s32>(Core::Hardware::NUM_CPU_CORES));
 
         // First, clear the TLS address.
@@ -331,6 +334,11 @@ namespace Kernel {
     }
 
     void KThread::Finalize(KernelCore& kernel) {
+        for (KThread* thread : m_pending_started_threads) {
+            thread->Close(kernel);
+        }
+        m_pending_started_threads.clear();
+
         // If the thread has an owner process, unregister it.
         if (m_parent != nullptr) {
             m_parent->UnregisterThread(kernel, this);
@@ -642,14 +650,14 @@ namespace Kernel {
 
             // Translate the virtual core to a physical core.
             if (core_id >= 0) {
-                core_id = Core::Hardware::ConvertVirtualCoreToPhysical(core_id);
+                core_id = Core::Hardware::VirtualToPhysicalCoreMap[core_id];
             }
 
             // Translate the virtual affinity mask to a physical one.
             while (v_affinity_mask != 0) {
                 const u64 next = std::countr_zero(v_affinity_mask);
                 v_affinity_mask &= ~(1ULL << next);
-                p_affinity_mask |= (1ULL << Core::Hardware::ConvertVirtualCoreToPhysical(next));
+                p_affinity_mask |= (1ULL << Core::Hardware::VirtualToPhysicalCoreMap[next]);
             }
 
             // If we haven't disabled migration, perform an affinity change.
@@ -1283,6 +1291,55 @@ namespace Kernel {
         }
 
         return this->GetState();
+    }
+
+    void KThread::RecordStartupThread(KernelCore& kernel, KThread* thread) {
+        ASSERT(this == GetCurrentThreadPointer(kernel));
+        ASSERT(KScheduler::IsSchedulerLockedByCurrentThread(kernel));
+        thread->Open(kernel);
+        m_pending_started_threads.push_back(thread);
+    }
+
+    void KThread::WaitForStartupThreads(KernelCore& kernel) {
+        ASSERT(this == GetCurrentThreadPointer(kernel));
+        if (m_pending_started_threads.empty()) {
+            return;
+        }
+        SCOPE_EXIT {
+            for (KThread* thread : m_pending_started_threads) {
+                thread->Close(kernel);
+            }
+            m_pending_started_threads.clear();
+        };
+
+        // MTF passes stack-backed arguments to lower-priority workers. Near-instant HLE
+        // replies can preempt them before they consume those arguments. Give only this
+        // startup cohort guest sleep slices, with one shared host-time budget.
+        const auto start = std::chrono::steady_clock::now();
+        size_t sleeps = 0;
+        bool interrupted = false;
+        for (KThread* thread : m_pending_started_threads) {
+            while (!interrupted) {
+                bool wait;
+                {
+                    KScopedSchedulerLock sl{kernel};
+                    wait = ShouldWaitForStartup(
+                        thread->GetState() == ThreadState::Runnable,
+                        thread->GetWaitingLockInfo() != nullptr,
+                        IsTerminationRequested() || thread->IsTerminationRequested(),
+                        std::chrono::steady_clock::now() - start);
+                }
+                if (!wait) {
+                    break;
+                }
+                ++sleeps;
+                interrupted = R_FAILED(Sleep(
+                    kernel, kernel.HardwareTimer().GetTick() + StartupSleepNanoseconds));
+            }
+        }
+        LOG_INFO(Kernel, "MTF startup worker grace: workers={}, sleeps={}, budget_expired={}",
+                 m_pending_started_threads.size(), sleeps,
+                 std::chrono::steady_clock::now() - start >= StartupGraceLimit);
     }
 
     Result KThread::Sleep(KernelCore& kernel, s64 timeout) {

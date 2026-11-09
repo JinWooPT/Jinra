@@ -12,12 +12,14 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <source_location>
 #include <vector>
 #include <span>
 
 #include "common/common_types.h"
 #include "common/range_mutex.h"
 #include "common/scratch_buffer.h"
+#include "common/thread_worker.h"
 #include "common/sparse_large_vector.h"
 
 namespace Core {
@@ -53,16 +55,15 @@ public:
 
     void BindInterface(DeviceInterface* device_inter);
 
+    /// Marks the memory behind [address, address + size) cold (Common::HostMemory::HintCold),
+    /// from a low-priority thread: data the host GPU has its own copy of, e.g. uploaded textures.
+    void HintCold(DAddr address, size_t size);
+
     DAddr Allocate(size_t size);
     void AllocateFixed(DAddr start, size_t size);
     void Free(DAddr start, size_t size);
 
     void Map(DAddr address, VAddr virtual_address, size_t size, Asid asid, bool track = false);
-
-    /// Diagnostic: backing state of a device page. 0 = backed and current, 1 = never backed,
-    /// 2 = unbacked although its CPU page is backed now, 3 = backed by a page the CPU address no
-    /// longer maps to.
-    u32 ProbeBacking(DAddr address);
 
     void Unmap(DAddr address, size_t size);
 
@@ -94,6 +95,11 @@ public:
         }
     }
 
+    /// Whether p points into the emulated physical memory, the only memory with device addresses.
+    bool IsPhysicalPointer(const u8* p) const {
+        return (GetRawPhysicalAddr(p) >> page_bits) < compressed_device_addr.size();
+    }
+
     template <typename Func>
     void ApplyOpOnPointer(const u8* p, Common::ScratchBuffer<u32>& buffer, Func&& operation) {
         PAddr address = GetRawPhysicalAddr<u8>(p);
@@ -118,8 +124,10 @@ public:
     u8* GetSpan(const DAddr src_addr, const std::size_t size);
     const u8* GetSpan(const DAddr src_addr, const std::size_t size) const;
 
-    void ReadBlock(DAddr address, void* dest_pointer, size_t size);
-    void ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size);
+    void ReadBlock(DAddr address, void* dest_pointer, size_t size,
+                   std::source_location caller = std::source_location::current());
+    void ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size,
+                         std::source_location caller = std::source_location::current());
     void WriteBlock(DAddr address, const void* src_pointer, size_t size);
     void WriteBlockUnsafe(DAddr address, const void* src_pointer, size_t size);
 
@@ -131,9 +139,10 @@ public:
     // New batch API to update multiple ranges with a single lock acquisition.
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);
 
-private:
-    friend struct DeviceMemoryManagerTestAccess;
+    /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
+    void ArmReadTraps(DAddr addr, size_t size);
 
+private:
     struct TranslationEntry {
         DAddr guest_page{};
         u8* host_ptr{};
@@ -201,7 +210,9 @@ private:
     std::unique_ptr<DeviceMemoryManagerAllocator<Traits>> impl;
 
     const uintptr_t physical_base;
+    const DeviceMemory* device_memory_ptr;
     DeviceInterface* device_inter;
+    std::unique_ptr<Common::ThreadWorker> cold_hint_worker;
 
     struct TrackedEntry {
         VAddr cpu_backing_address;

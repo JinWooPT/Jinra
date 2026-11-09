@@ -49,8 +49,7 @@ Result WaitForAddress(Core::System& system, u64 address, ArbitrationType arb_typ
 
     // Validate input.
     R_UNLESS(!IsKernelAddress(address), ResultInvalidCurrentMemory);
-    const auto alignment =
-        arb_type == ArbitrationType::WaitIfEqual64 ? sizeof(s64) : sizeof(s32);
+    const size_t alignment = arb_type == ArbitrationType::WaitIfEqual64 ? sizeof(s64) : sizeof(s32);
     R_UNLESS(Common::IsAligned(address, alignment), ResultInvalidAddress);
     R_UNLESS(IsValidArbitrationType(arb_type), ResultInvalidEnumValue);
 
@@ -100,7 +99,7 @@ Result SignalToAddress64(Core::System& system, u64 address, SignalType signal_ty
 }
 
 Result WaitForAddress64From32(Core::System& system, u32 address, ArbitrationType arb_type,
-                              s64 value, s64 timeout_ns) {
+                              s32 value, s64 timeout_ns) {
     R_RETURN(WaitForAddress(system, address, arb_type, value, timeout_ns));
 }
 

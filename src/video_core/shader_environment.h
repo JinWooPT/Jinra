@@ -21,7 +21,7 @@
 #include "common/polyfill_thread.h"
 #include "common/unique_function.h"
 #include "shader_recompiler/environment.h"
-#include "shader_recompiler/frontend/ampere/trap_guards.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 #include "video_core/engines/maxwell_3d.h"
 
 namespace Tegra {
@@ -29,9 +29,21 @@ class Memorymanager;
 }
 
 namespace VideoCommon {
-std::optional<u32> ReadNativeGuardConstant(Tegra::Engines::KeplerCompute& compute,
-                                          Tegra::MemoryManager& memory, u32 bank, u32 offset);
 
+/// A native (Switch 2) program after capture and lowering to Maxwell code. The shader cache keeps
+/// it so the environments built for the program's pipelines don't capture and lower it again.
+struct LoweredNativeCode {
+    u64 native_program_key{};
+    /// Shader header, lowered instructions with Maxwell scheduling words, then the native
+    /// address map (what the environment's `code` used to be filled with).
+    std::vector<u64> code;
+    std::vector<Shader::Ampere::Instruction> trap_prefix;
+    /// Bytes of the native program that were read, header included.
+    size_t source_size{};
+    /// Constant buffer holding the texture handles if the program requires one, otherwise ~0U
+    /// (the engine's register value is used).
+    u32 texture_bound = ~0U;
+};
 
 class GenericEnvironment : public Shader::Environment {
 public:
@@ -51,11 +63,22 @@ public:
 
     [[nodiscard]] u64 ReadInstruction(u32 address) final;
 
-    [[nodiscard]] bool HasNativeRegisterCopies() const override;
+    [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+
+    [[nodiscard]] bool IsNativeProgram() const override;
 
     [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
 
-    [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+    [[nodiscard]] bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
+                                                          u32 indirect) override;
+
+    [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
+
+    [[nodiscard]] std::vector<u64> MappedStoragePointerKeys() const override;
+
+    /// Answers the classification of these keys (see MappedStoragePointerKeys) as storage buffer
+    /// pointers, whatever the slots hold now; called before the program is translated
+    void KeepStoragePointers(std::span<const u64> keys);
 
     [[nodiscard]] std::optional<u64> Analyze();
 
@@ -71,8 +94,8 @@ public:
         return native_source_size;
     }
 
-    [[nodiscard]] const std::vector<Shader::Ampere::Instruction>& NativeTrapPrefix() const noexcept {
-        return native_trap_prefix;
+    [[nodiscard]] const std::shared_ptr<const LoweredNativeCode>& LoweredNative() const noexcept {
+        return lowered_native;
     }
 
     [[nodiscard]] bool CanBeSerialized() const noexcept;
@@ -86,44 +109,19 @@ public:
     bool HasHLEMacroState() const override {
         return has_hle_engine_state;
     }
-
-    [[nodiscard]] bool IsNativeAmpere() const override {
-        return !ampere_program.empty();
-    }
-
-    [[nodiscard]] std::span<const Shader::Ampere::Instruction> NativeProgram() const override {
-        return ampere_program;
-    }
-
-    [[nodiscard]] std::span<const u32> NativeIndirectTargets() const override {
-        return ampere_indirect_targets;
-    }
-
-    [[nodiscard]] std::span<const u32> NativeIndirectTargetsAt(u32 index) const override {
-        for (const auto& [branch, targets] : native_indirect_tables) {
-            if (branch == index) return targets;
-        }
-        return NativeIndirectTargets();
-    }
-
-    [[nodiscard]] u32 NativeSourceBase() const override {
-        return native_source_header_size;
-    }
+    bool HasNativeInstructions() const override;
 
 protected:
     std::optional<u64> TryFindSize();
+    virtual std::optional<u32> ReadTrapGuardConstant(u32, u32) { return std::nullopt; }
 
-    void InitializeNativeCode(u32 source_header_size = 128,
-                              const Shader::Ampere::TrapGuardReader& guard_reader = {});
+    /// Adopts an already lowered native program, or captures and lowers it when there is none.
+    void InitializeNativeCode(std::shared_ptr<const LoweredNativeCode> lowered,
+                              u32 source_header_size = 128, bool geometry_stage = false);
+    std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size,
+                                                          bool geometry_stage);
     size_t native_source_size{};
-    u32 native_source_header_size{};
-    std::vector<Shader::Ampere::Instruction> native_trap_prefix;
-    // Set only when the program is translated by the native Ampere frontend.
-    std::vector<Shader::Ampere::Instruction> ampere_program;
-    std::vector<u32> ampere_indirect_targets; // BRX destinations, as instruction indices
-    // One table per BRX found by the capture: BRX instruction index -> destination instruction indices.
-    std::vector<std::pair<u32, std::vector<u32>>> native_indirect_tables;
-    size_t stage_index{}; // graphics stage of this environment (0 for compute), used for logging
+    std::shared_ptr<const LoweredNativeCode> lowered_native;
 
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
                                              bool via_header_index, u32 raw);
@@ -135,7 +133,7 @@ protected:
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     ::Common::unordered_map<u64, u32> cbuf_values;
-    ::Common::unordered_map<u64, u8> storage_pointer_types;
+    ::Common::unordered_map<u64, u8> storage_pointer_types; ///< IsCbufStorageBufferPointer answers
     ::Common::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
 
     u32 local_memory_size{};
@@ -162,7 +160,8 @@ public:
     explicit GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                  Tegra::MemoryManager& gpu_memory_,
                                  Tegra::Engines::Maxwell3D::Regs::ShaderType program,
-                                 GPUVAddr program_base_, u32 start_address_);
+                                 GPUVAddr program_base_, u32 start_address_,
+                                 std::shared_ptr<const LoweredNativeCode> lowered_native_ = {});
 
     ~GraphicsEnvironment() override = default;
 
@@ -180,6 +179,7 @@ public:
 
 private:
     Tegra::Engines::Maxwell3D* maxwell3d{};
+    size_t stage_index{};
 };
 
 class ComputeEnvironment final : public GenericEnvironment {
@@ -187,7 +187,8 @@ public:
     explicit ComputeEnvironment() = default;
     explicit ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                 Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
-                                u32 start_address_);
+                                u32 start_address_,
+                                std::shared_ptr<const LoweredNativeCode> lowered_native_ = {});
 
     ~ComputeEnvironment() override = default;
 
@@ -207,8 +208,12 @@ public:
     }
 
 private:
+    std::optional<u32> ReadTrapGuardConstant(u32 bank, u32 offset) override;
     Tegra::Engines::KeplerCompute* kepler_compute{};
 };
+
+std::optional<u32> ReadNativeGuardConstant(Tegra::Engines::KeplerCompute& compute,
+                                         Tegra::MemoryManager& memory, u32 bank, u32 offset);
 
 class FileEnvironment final : public Shader::Environment {
 public:
@@ -221,43 +226,31 @@ public:
     FileEnvironment& operator=(const FileEnvironment&) = delete;
     FileEnvironment(const FileEnvironment&) = delete;
 
-    void Deserialize(std::ifstream& file);
+    void Deserialize(std::istream& file);
+
+    [[nodiscard]] bool DeserializePrepared(std::istream& file, u64 size);
+
+    [[nodiscard]] bool AnswersHoldFor(Shader::Environment& live, u32 format_traits);
+    static constexpr u32 FormatTraitInteger = 1;
+    static constexpr u32 FormatTraitByteAddressed = 2 | 4;
+    static constexpr u32 FormatTraitSnorm = 8;
+
+    [[nodiscard]] size_t MemorySize() const;
 
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
-    [[nodiscard]] bool HasNativeRegisterCopies() const override;
+    [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+
+    [[nodiscard]] bool IsNativeProgram() const override;
 
     [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
 
-    [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+    [[nodiscard]] bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
+                                                          u32 indirect) override;
 
-    [[nodiscard]] bool IsNativeAmpere() const override {
-        return !ampere_program.empty();
-    }
+    [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
 
-    [[nodiscard]] std::span<const Shader::Ampere::Instruction> NativeProgram() const override {
-        return ampere_program;
-    }
-
-    [[nodiscard]] std::span<const u32> NativeIndirectTargets() const override {
-        return ampere_indirect_targets;
-    }
-
-    [[nodiscard]] std::span<const u32> NativeIndirectTargetsAt(u32 index) const override {
-        for (const auto& [branch, targets] : native_indirect_tables) {
-            if (branch == index) return targets;
-        }
-        return NativeIndirectTargets();
-    }
-
-    [[nodiscard]] u32 NativeSourceBase() const override {
-        return native_source_header_size;
-    }
-
-    /// True when a cached native program was written by a different translator version; it must not be used.
-    [[nodiscard]] bool IsStale() const noexcept {
-        return stale;
-    }
+    [[nodiscard]] std::vector<u64> MappedStoragePointerKeys() const override;
 
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
 
@@ -283,6 +276,7 @@ public:
     [[nodiscard]] bool HasHLEMacroState() const override {
         return cbuf_replacements.size() != 0;
     }
+    bool HasNativeInstructions() const override;
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
@@ -301,12 +295,6 @@ private:
     u32 read_highest{};
     u32 initial_offset{};
     u32 viewport_transform_state = 1;
-    // Natively translated programs keep their Ampere instructions instead of lowered Maxwell code.
-    std::vector<Shader::Ampere::Instruction> ampere_program;
-    std::vector<u32> ampere_indirect_targets;
-    std::vector<std::pair<u32, std::vector<u32>>> native_indirect_tables;
-    u32 native_source_header_size{};
-    bool stale{};
 };
 
 void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
@@ -321,6 +309,7 @@ void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::
 
 void LoadPipelines(std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
-    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics);
+    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics,
+    std::vector<std::pair<u64, u64>>* environment_locations = nullptr);
 
 } // namespace VideoCommon

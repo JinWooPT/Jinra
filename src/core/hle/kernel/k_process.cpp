@@ -1260,7 +1260,6 @@ Result KProcess::LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMeta
 
     // Assign remaining properties.
     m_ideal_core_id = metadata.GetMainThreadCore();
-    m_uses_pauth_returns = metadata.UsesExtendedAcid();
 
     // Switch 2 applications get more memory than a 64-bit heap region holds (nninitStartup sizes
     // its heap as total memory minus ~6.3 GiB), so count the alias region as well, bounded by the

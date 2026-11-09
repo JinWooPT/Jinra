@@ -48,6 +48,8 @@ KMemoryManager::KMemoryManager(Core::System& system)
       } {}
 
 void KMemoryManager::Initialize(KVirtualAddress management_region, size_t management_region_size) {
+    // Memory a previous kernel handed out may still hold its data.
+    m_system.DeviceMemory().buffer.ForgetContents();
 
     // Clear the management region to zero.
     const KVirtualAddress management_region_end = management_region + management_region_size;
@@ -143,6 +145,9 @@ void KMemoryManager::Initialize(KVirtualAddress management_region, size_t manage
 
                 // Open/reserve the ini memory.
                 manager.OpenFirst(ini_start, ini_size / PageSize);
+                // EDEN_NX2_SEC_RESERVE: in use without an allocation.
+                m_system.DeviceMemory().buffer.Commit(
+                    GetInteger(ini_start) - Core::DramMemoryMap::Base, ini_size);
                 reserved_sizes[it.GetAttributes()] += ini_size;
 
                 // Free memory after the ini to the heap.
@@ -242,8 +247,19 @@ KPhysicalAddress KMemoryManager::AllocateAndOpenContinuous(size_t num_pages, siz
 
     // Open the first reference to the pages.
     chosen_manager->OpenFirst(allocated_block, num_pages);
+    this->MarkUsed(allocated_block, num_pages);
 
     return allocated_block;
+}
+
+void KMemoryManager::MarkUsed(KPhysicalAddress address, size_t num_pages) {
+    m_system.DeviceMemory().buffer.MarkUsed(GetInteger(address) - Core::DramMemoryMap::Base,
+                                            num_pages * PageSize);
+}
+
+void KMemoryManager::MarkDirty(KPhysicalAddress address, size_t num_pages) {
+    m_system.DeviceMemory().buffer.MarkDirty(GetInteger(address) - Core::DramMemoryMap::Base,
+                                             num_pages * PageSize);
 }
 
 Result KMemoryManager::AllocatePageGroupImpl(KPageGroup* out, size_t num_pages, Pool pool,
@@ -296,6 +312,10 @@ Result KMemoryManager::AllocatePageGroupImpl(KPageGroup* out, size_t num_pages, 
 
     // Only succeed if we allocated as many pages as we wanted.
     R_UNLESS(num_pages == 0, ResultOutOfMemory);
+
+    for (const auto& block : *out) {
+        this->MarkUsed(block.GetAddress(), block.GetNumPages());
+    }
 
     // We succeeded!
     R_SUCCEED();
@@ -525,9 +545,10 @@ bool KMemoryManager::Impl::ProcessOptimizedAllocation(KernelCore& kernel, KPhysi
             // If not, it's new.
             any_new = true;
 
-            // Fill the page.
-            auto* ptr = device_memory.GetPointer<u8>(m_heap.GetAddress());
-            std::memset(ptr + offset * PageSize, fill_pattern, PageSize);
+            // Fill the page (a zero fill skips pages that are still zero).
+            device_memory.buffer.ClearBackingRegion(
+                GetInteger(m_heap.GetAddress()) + offset * PageSize - Core::DramMemoryMap::Base,
+                PageSize, fill_pattern);
         }
 
         offset++;

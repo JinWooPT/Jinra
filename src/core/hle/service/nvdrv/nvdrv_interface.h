@@ -17,13 +17,14 @@ namespace Service::Nvidia {
 class NVDRV final : public ServiceFramework<NVDRV> {
 public:
     explicit NVDRV(Core::System& system_, std::shared_ptr<Module> nvdrv_, const char* name);
-    explicit NVDRV(Core::System& system, std::shared_ptr<Module> module, const char* name,
-                   Kernel::KProcess* process, u64 aruid, u32 native_gpu_profile = 0);
     ~NVDRV() override;
 
     std::shared_ptr<Module> GetModule() const {
         return nvdrv;
     }
+
+    // For Switch 2 nvsrv sessions, which are set up through gsv instead of Initialize.
+    void InitializeForProcess(Kernel::KProcess* process);
 
 private:
     void Open(HLERequestContext& ctx);
@@ -43,7 +44,6 @@ private:
     std::shared_ptr<Module> nvdrv;
 
     u64 pid{};
-    u32 native_gpu_profile{};
     bool is_initialized{};
     NvCore::SessionId session_id{};
     Common::ScratchBuffer<u8> output_buffer;

@@ -21,6 +21,12 @@
 
 namespace ConfigurationShared {
 
+/**
+ * Builds the label and tooltip every settings widget shows, keyed by setting id.
+ *
+ * @param parent Object used for translation lookups.
+ * @return The translation map.
+ */
 std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     std::unique_ptr<TranslationMap> translations = std::make_unique<TranslationMap>();
     const auto& tr = [](const char* text) -> QString { return QCoreApplication::translate("ConfigurationShared", text); };
@@ -145,11 +151,32 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Higher resolutions require more VRAM and bandwidth.\n"
               "Options lower than 1X can cause artifacts."));
     INSERT(Settings, scaling_filter, tr("Window Adapting Filter:"), QString());
-    INSERT(Settings, fsr_sharpening_slider, tr("FSR Sharpness:"),
-           tr("Determines how sharpened the image will look using FSR's or SGSR's dynamic contrast."));
+    INSERT(Settings, game_dlss_network, tr("Use the game's own DLSS"),
+           tr("Runs a Switch 2 game's own DLSS (its upscaling network, translated for this GPU) "
+              "instead of AMD FSR 3.1 in its place.\nAMD FSR 3.1 still draws while the network is "
+              "checked, when it can't run on this GPU, with resolution scaling, and for the rest "
+              "of the session if its output fails Jinra's checks.\nTakes effect when a game "
+              "starts."));
+    INSERT(Settings, fsr_sharpening_slider, tr("RCAS Sharpness:"),
+           tr("Strength of RCAS (AMD's contrast-adaptive sharpening) on the upscaler used in place "
+              "of a game's DLSS (AMD FSR 3.1); 0% turns it off.\nAlso sets the sharpening "
+              "of the AMD FSR 1 and SGSR window adapting filters."));
+    INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS in place of a game's DLSS (experimental)"),
+           tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
+              "instead of AMD FSR 3.1.\nNeeds NVIDIA's Streamline loader, and NVIDIA DLSS unless "
+              "the NVIDIA app has downloaded it; Jinra does not ship NVIDIA's files. Use the "
+              "download button below.\nFire Emblem: Fortune's Weave also needs "
+              "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
+              "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
+              "upscaler at 1x resolution scale.\nTakes effect when a game starts."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
+    INSERT(Settings, oot_anti_aliasing, tr("Ocarina of Time anti-aliasing:"),
+           tr("The Legend of Zelda: Ocarina of Time only.\nGame: the game's own anti-aliasing "
+              "network, which sharpens heavily.\nNo sharpening: the image as the game renders it, "
+              "without the network (faster; pairs well with a higher resolution). Has no effect while "
+              "NVIDIA DLSS is on.\nTakes effect when the game starts."));
     INSERT(Settings, post_shader_chain, QString(), QString());
     INSERT(Settings, post_shader_preset, QString(), QString());
     INSERT(Settings, post_shader_enabled, tr("Enable post-processing effects"),
@@ -194,6 +221,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, skip_cpu_inner_invalidation, tr("Skip CPU Inner Invalidation"),
            tr("Skips certain cache invalidations during memory updates, reducing CPU usage and "
               "improving latency. This may cause soft-crashes."));
+    INSERT(Settings, fps_limit, tr("FPS Limit"),
+           tr("Caps how often the game presents, so the game itself runs at this rate. 0 leaves "
+              "the frame rate to the game and the display."));
     INSERT(Settings, vsync_mode, tr("VSync Mode:"),
            tr("FIFO (VSync) does not drop frames or exhibit tearing but is limited by the screen "
               "refresh rate.\nFIFO Relaxed allows tearing as it recovers from a slow down.\n"
@@ -203,6 +233,15 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, bg_red, QString(), QString());
     INSERT(Settings, bg_green, QString(), QString());
     INSERT(Settings, bg_blue, QString(), QString());
+
+    INSERT(Settings, frame_gen, tr("Enable Frame Generation"), QString());
+    INSERT(Settings, frame_gen_type, tr("Frame Generation Type"), QString());
+    INSERT(Settings, frame_gen_multiplier, tr("Frame Generation Multiplier"), QString());
+    INSERT(Settings, frame_gen_target_rate, tr("Target Frame Rate"), QString());
+    INSERT(Settings, frame_gen_flow_scale_auto, tr("Auto Flow Scale"), QString());
+    INSERT(Settings, frame_gen_flow_scale, tr("Flow Scale"), QString());
+    INSERT(Settings, frame_gen_queue_target, tr("Queue Target"), QString());
+    INSERT(Settings, frame_gen_dump_flow, tr("Dump Optical Flow"), QString());
 
     // Renderer (Advanced Graphics)
     INSERT(Settings, use_asynchronous_gpu_emulation, QString(), QString());
@@ -248,11 +287,28 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Determines the number of depth slices processed in a single dispatch.\n"
               "Increasing this can improve throughput on high-end GPUs but may cause TDR or driver "
               "timeouts on weaker hardware."));
+    INSERT(Settings, pin_gpu_threads, tr("Pin GPU threads to their own cores (experimental)"),
+           tr("Pins the emulator's GPU threads to dedicated physical CPU cores and keeps the "
+              "emulated CPU cores off them.\n"
+              "Can hurt performance on CPUs with few cores. Skipped on CPUs with fewer than 6 "
+              "physical performance cores.\n"
+              "Windows and Linux only. Takes effect when a game starts."));
 
     INSERT(Settings, use_vulkan_driver_pipeline_cache, tr("Use Vulkan pipeline cache"),
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
               "files internally."));
+    INSERT(Settings, native_async_draws, tr("Switch 2 draws with unbuilt pipelines:"),
+           tr("Only applies when asynchronous shader building is on. Decides what a Switch 2 draw "
+              "does when its graphics pipeline is still building.\n"
+              "Wait stalls the GPU until the pipeline is ready (no missing effects, but long "
+              "stalls on new content). Skip drops the draw, which can leave an effect missing for "
+              "a few frames. Bounded waits up to the time below per frame, then skips. The "
+              "EDEN_NX2_ASYNC_DISCARD=1 environment variable still forces Skip."));
+    INSERT(Settings, native_pipeline_wait_ms, tr("Pipeline wait per frame (ms):"),
+           tr("Used by the Bounded mode: the most time per frame that Switch 2 draws may wait in "
+              "total for pipelines that are still building. Once spent, the remaining unbuilt "
+              "draws of that frame are skipped."));
     INSERT(Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
            tr("Required by some games.\nThis setting only exists for Intel "
               "proprietary drivers and may crash if enabled.\nCompute pipelines are always enabled "
@@ -264,6 +320,13 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, use_video_framerate, tr("Sync to framerate of video playback"),
            tr("Run the game at normal speed during video playback, even when the framerate is "
               "unlocked."));
+    INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
+           tr("Forces the game to use its native 30 FPS mode at normal game speed. "
+              "Takes effect after restarting the game."));
+    INSERT(Settings, mkw_dynamic_fps, tr("Mario Kart World: dynamic FPS (experimental)"),
+           tr("Lets the game adjust between 30 and 60 FPS using whole-frame timing to maintain "
+              "normal game speed. Takes effect after restarting the game and takes precedence over "
+              "the 30 FPS mode."));
     INSERT(Settings, barrier_feedback_loops, tr("Barrier feedback loops"),
            tr("Improves rendering of transparency effects in specific games."));
     INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),
@@ -475,6 +538,11 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
              PAIR(ResolutionSetup, Res7X, tr("7X (5040p/7560p)")),
              PAIR(ResolutionSetup, Res8X, tr("8X (5760p/8640p)")),
          }});
+    translations->insert({Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+                          {
+                              PAIR(FrameGenType, Lsfg, tr("Lossless Scaling (LSFG)")),
+                              PAIR(FrameGenType, Fsr3, tr("Optical Flow Interpolation (built-in)")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
                           {
                               PAIR(ScalingFilter, NearestNeighbor, tr("Nearest Neighbor")),
@@ -483,7 +551,7 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(ScalingFilter, Gaussian, tr("Gaussian")),
                               PAIR(ScalingFilter, Lanczos, tr("Lanczos")),
                               PAIR(ScalingFilter, ScaleForce, tr("ScaleForce")),
-                              PAIR(ScalingFilter, Fsr, tr("AMD FidelityFX Super Resolution")),
+                              PAIR(ScalingFilter, Fsr, tr("AMD FidelityFX Super Resolution 1 (FSR 1)")),
                               PAIR(ScalingFilter, Area, tr("Area")),
                               PAIR(ScalingFilter, Mmpx, tr("MMPX")),
                               PAIR(ScalingFilter, ZeroTangent, tr("Zero-Tangent")),
@@ -492,12 +560,18 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(ScalingFilter, Spline1, tr("Spline-1")),
                               PAIR(ScalingFilter, Sgsr, tr("Snapdragon Game Super Resolution")),
                               PAIR(ScalingFilter, SgsrEdge, tr("Snapdragon Game Super Resolution EdgeDir")),
+                              PAIR(ScalingFilter, Fsr3, tr("AMD FidelityFX Super Resolution 1, softer sharpening")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AntiAliasing>::Index(),
                           {
                               PAIR(AntiAliasing, None, tr("None")),
                               PAIR(AntiAliasing, Fxaa, tr("FXAA")),
                               PAIR(AntiAliasing, Smaa, tr("SMAA")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::OotAntiAliasing>::Index(),
+                          {
+                              PAIR(OotAntiAliasing, Game, tr("Game")),
+                              PAIR(OotAntiAliasing, NoSharpening, tr("No sharpening")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {
@@ -623,6 +697,12 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                           {
                               PAIR(ConsoleMode, Docked, tr("Docked")),
                               PAIR(ConsoleMode, Handheld, tr("Handheld")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::NativeAsyncDraws>::Index(),
+                          {
+                              PAIR(NativeAsyncDraws, Wait, tr("Wait")),
+                              PAIR(NativeAsyncDraws, Bounded, tr("Bounded wait")),
+                              PAIR(NativeAsyncDraws, Skip, tr("Skip")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::CpuClock>::Index(),
                           {

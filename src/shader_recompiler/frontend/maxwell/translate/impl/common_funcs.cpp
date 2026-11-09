@@ -4,15 +4,6 @@
 #include "shader_recompiler/frontend/maxwell/translate/impl/common_funcs.h"
 
 namespace Shader::Maxwell {
-IR::U32 ConvertF32ToS32Saturated(IR::IREmitter& ir, const IR::F32& rounded) {
-    const IR::F32 number{ir.Select(ir.FPIsNan(rounded), ir.Imm32(0.0f), rounded)};
-    // INT_MAX rounds to 2^31 in f32. Use the previous representable float for the conversion.
-    const IR::F32 bounded{ir.FPClamp(number, ir.Imm32(-0x1p31f), ir.Imm32(0x1.fffffep30f))};
-    const IR::U32 converted{ir.ConvertFToI(32, true, bounded)};
-    return IR::U32{ir.Select(ir.FPGreaterThanEqual(number, ir.Imm32(0x1p31f)),
-                             ir.Imm32(0x7fff'ffffU), converted)};
-}
-
 IR::U1 IntegerCompare(IR::IREmitter& ir, const IR::U32& operand_1, const IR::U32& operand_2,
                       CompareOp compare_op, bool is_signed) {
     switch (compare_op) {

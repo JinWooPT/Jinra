@@ -1,27 +1,28 @@
-#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <thread>
+
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/thread_startup_policy.h"
 
 namespace Kernel::Svc {
 namespace {
 
-bool IsValidVirtualCoreId(const KProcess& process, int32_t core_id) {
-    // Extended processes use the kernel's existing virtual-core mapping; others see the Switch 1 core count.
-    const auto core_count = process.UsesPAuthReturns() ? Core::Hardware::NumVirtualCores
-                                                     : Core::Hardware::NUM_LEGACY_CPU_CORES;
-    return 0 <= core_id && core_id < static_cast<int32_t>(core_count);
+constexpr bool IsValidVirtualCoreId(int32_t core_id) {
+    return (0 <= core_id && core_id < static_cast<int32_t>(Core::Hardware::NUM_CPU_CORES));
 }
 
 // Switch 2 hardware has eight cores. Six are emulated (the most an application is given), so
@@ -55,7 +56,7 @@ Result CreateThread(Core::System& system, Handle* out_handle, u64 entry_point, u
     core_id = FoldExtraCoreId(core_id);
 
     // Validate arguments.
-    R_UNLESS(IsValidVirtualCoreId(process, core_id), ResultInvalidCoreId);
+    R_UNLESS(IsValidVirtualCoreId(core_id), ResultInvalidCoreId);
     R_UNLESS(((1ull << core_id) & process.GetCoreMask()) != 0, ResultInvalidCoreId);
 
     R_UNLESS(HighestThreadPriority <= priority && priority <= LowestThreadPriority,
@@ -110,6 +111,44 @@ Result StartThread(Core::System& system, Handle thread_handle) {
 
     // Try to start the thread.
     R_TRY(thread->Run(system.Kernel()));
+
+    if (GetCurrentProcess(system.Kernel()).GetProgramId() == MarioTennisFeverProgramId) {
+        KScopedSchedulerLock sl{system.Kernel()};
+        KThread& caller = GetCurrentThread(system.Kernel());
+        if (NeedsStartupGrace(MarioTennisFeverProgramId, caller.GetActiveCore(), caller.GetPriority(),
+                              thread->GetActiveCore(), thread->GetPriority())) {
+            caller.RecordStartupThread(system.Kernel(), thread.GetPointerUnsafe());
+        }
+    }
+
+    // On hardware a started thread that can run begins within microseconds. An emulated core takes
+    // longer (wake-up, JIT), so let the thread reach its first SVC before the caller carries on.
+    // Mario Tennis Fever's boot stub reuses the stack arguments it gave its threads right after
+    // starting them.
+    auto& kernel = system.Kernel();
+    const s32 core = thread->GetActiveCore();
+    if (core == GetCurrentCoreId(kernel) || !kernel.IsMulticore()) {
+        // Sleeping lets this core run the new thread; in single-core mode the idle core passes
+        // control to the next one.
+        for (int i = 0; i < 10 && !thread->HasEnteredKernel() && !thread->IsTerminationRequested();
+             ++i) {
+            const s64 timeout = kernel.HardwareTimer().GetTick() + 100'000 + 2;
+            static_cast<void>(GetCurrentThread(kernel).Sleep(kernel, timeout));
+        }
+    } else if (core >= 0 && core < static_cast<s32>(Core::Hardware::NUM_CPU_CORES)) {
+        const KThread* const running = kernel.Scheduler(core).GetSchedulerCurrentThread();
+        const bool preempts = running == nullptr || running == thread.GetPointerUnsafe() ||
+                              running == kernel.Scheduler(core).GetIdleThread() ||
+                              thread->GetPriority() < running->GetPriority();
+        if (preempts) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
+            while (!thread->HasEnteredKernel() && !thread->IsTerminationRequested() &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+        }
+    }
 
     R_SUCCEED();
 }
@@ -283,7 +322,7 @@ Result SetThreadCoreMask(Core::System& system, Handle thread_handle, s32 core_id
         core_id = FoldExtraCoreId(core_id);
 
         // Validate the core id.
-        if (IsValidVirtualCoreId(GetCurrentProcess(system.Kernel()), core_id)) {
+        if (IsValidVirtualCoreId(core_id)) {
             R_UNLESS(((1ULL << core_id) & affinity_mask) != 0, ResultInvalidCombination);
         } else {
             R_UNLESS(core_id == IdealCoreNoUpdate || core_id == IdealCoreDontCare,
@@ -313,12 +352,7 @@ Result GetThreadId(Core::System& system, u64* out_thread_id, Handle thread_handl
 
 Result CreateThread64(Core::System& system, Handle* out_handle, uint64_t func, uint64_t arg,
                       uint64_t stack_bottom, int32_t priority, int32_t core_id) {
-    const Result result = CreateThread(system, out_handle, func, arg, stack_bottom, priority, core_id);
-    static const bool trace = std::getenv("EDEN_THREAD_TRACE") != nullptr;
-    if (trace)
-        LOG_WARNING(Kernel_SVC, "Thread trace: create entry={:#x}, priority={}, core={}, result={:#x}", func,
-                    priority, core_id, result.raw);
-    R_RETURN(result);
+    R_RETURN(CreateThread(system, out_handle, func, arg, stack_bottom, priority, core_id));
 }
 
 Result StartThread64(Core::System& system, Handle thread_handle) {
@@ -348,12 +382,7 @@ Result GetThreadCoreMask64(Core::System& system, int32_t* out_core_id, uint64_t*
 
 Result SetThreadCoreMask64(Core::System& system, Handle thread_handle, int32_t core_id,
                            uint64_t affinity_mask) {
-    const Result result = SetThreadCoreMask(system, thread_handle, core_id, affinity_mask);
-    static const bool trace = std::getenv("EDEN_THREAD_TRACE") != nullptr;
-    if (trace)
-        LOG_WARNING(Kernel_SVC, "Thread trace: core mask handle={:#x}, core={}, mask={:#x}, result={:#x}",
-                    thread_handle, core_id, affinity_mask, result.raw);
-    R_RETURN(result);
+    R_RETURN(SetThreadCoreMask(system, thread_handle, core_id, affinity_mask));
 }
 
 Result GetThreadId64(Core::System& system, uint64_t* out_thread_id, Handle thread_handle) {

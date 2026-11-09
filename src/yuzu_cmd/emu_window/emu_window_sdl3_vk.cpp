@@ -31,6 +31,11 @@ EmuWindow_SDL3_VK::EmuWindow_SDL3_VK(InputCommon::InputSubsystem* input_subsyste
                          Layout::ScreenUndocked::Height,
                          SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | Nx2HiddenWindowFlags());
 
+    if (render_window == nullptr) {
+        LOG_CRITICAL(Frontend, "Failed to create SDL3 window! {}", SDL_GetError());
+        std::exit(EXIT_FAILURE);
+    }
+
     const SDL_PropertiesID window_props = SDL_GetWindowProperties(render_window);
 
     SetWindowIcon();
@@ -73,7 +78,7 @@ EmuWindow_SDL3_VK::EmuWindow_SDL3_VK(InputCommon::InputSubsystem* input_subsyste
     } else if (SDL_GetPointerProperty(window_props, SDL_PROP_WINDOW_COCOA_WINDOW_POINTER,
                                       nullptr) != nullptr) {
         window_info.type = Core::Frontend::WindowSystemType::Cocoa;
-        window_info.render_surface = SDL_Metal_CreateView(render_window);
+        window_info.render_surface = SDL_Metal_GetLayer(SDL_Metal_CreateView(render_window));
     } else if (void* android_window =
                    SDL_GetPointerProperty(window_props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER,
                                           nullptr);
@@ -85,9 +90,9 @@ EmuWindow_SDL3_VK::EmuWindow_SDL3_VK(InputCommon::InputSubsystem* input_subsyste
         std::exit(EXIT_FAILURE);
     }
 
-    OnResize();
     OnMinimalClientAreaChangeRequest(GetActiveConfig().min_client_area_size);
     SDL_PumpEvents();
+    OnResize();
     LOG_INFO(Frontend, "Eden Version: {} | {}-{} (Vulkan)", Common::g_build_name,
              Common::g_scm_branch, Common::g_scm_desc);
 }

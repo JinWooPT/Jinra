@@ -59,6 +59,8 @@ These options control executables and build flavors.
   - Not supported on Linux
   - Automatically set if `YUZU_USE_BUNDLED_QT` is on for non-Linux
 - `ENABLE_UPDATE_CHECKER` (OFF) Enable update checking functionality
+  - `JINRA_BUILD_TAG` (empty) Upstream build identifier recorded in the build metadata.
+  - `JINRA_BUILD_PLATFORM` (empty) Release asset platform and variant, such as `linux-x86_64-pgo`. Use the Windows packaging guide when configuring a release.
 - `YUZU_DISABLE_LLVM` (OFF) Do not attempt to link to the LLVM demangler
   - Really only useful for CI or distribution builds
 

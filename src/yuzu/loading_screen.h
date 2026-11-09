@@ -62,6 +62,7 @@ public:
 
 signals:
     void LoadProgress(VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total);
+    void PlayNowRequested();
     /// Signals that this widget is completely hidden now and should be replaced with the other
     /// widget
     void Hidden();
@@ -79,17 +80,9 @@ private:
     QGraphicsOpacityEffect* opacity_effect = nullptr;
     std::unique_ptr<QPropertyAnimation> fadeout_animation;
 
-    // Definitions for the differences in text and styling for each stage
-    ::Common::unordered_map<VideoCore::LoadCallbackStage, const char*> progressbar_style;
-    ::Common::unordered_map<VideoCore::LoadCallbackStage, QString> stage_translations;
-
-    // newly generated shaders are added to the end of the file, so when loading and compiling
-    // shaders, it will start quickly but end slow if new shaders were added since previous launch.
-    // These variables are used to detect the change in speed so we can generate an ETA
-    bool slow_shader_compile_start = false;
-    std::chrono::steady_clock::time_point slow_shader_start;
-    std::chrono::steady_clock::time_point previous_time;
-    std::size_t slow_shader_first_value = 0;
+    std::chrono::steady_clock::time_point stage_start;
+    std::size_t first_value = 0;
+    bool play_now_requested = false;
 };
 
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)

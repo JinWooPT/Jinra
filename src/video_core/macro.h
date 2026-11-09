@@ -7,8 +7,6 @@
 #pragma once
 
 #include <memory>
-#include "video_core/macro_turing.h"
-#include "video_core/native_qmd.h"
 #include "video_core/macro_memo.h"
 #include "video_core/macro_turing.h"
 
@@ -240,7 +238,7 @@ struct MacroEngine {
     }
     // Clear the code associated with a method.
     inline void ClearCode(u32 method) noexcept {
-        if (native_turing) { native_write_offset = method < 0x1000 ? method * 3 : static_cast<u32>(native_code.size()); return; }
+        if (native_turing) { native_write_offset = u64{method} * 3 < native_code.size() ? method * 3 : static_cast<u32>(native_code.size()); return; }
         macro_cache.erase(method);
         uploaded_macro_code.erase(method);
     }
@@ -257,7 +255,7 @@ struct MacroEngine {
     bool native_turing{};
     bool native_execution_failed{};
     u32 native_write_offset{};
-    std::array<u32, 0x3000> native_code{};
+    std::array<u32, 0x8000> native_code{};
     TuringMacroInterpreter native_interpreter;
     std::vector<u32> native_fifo;
     // Calls replayed instead of interpreted (macro_memo.h), and what the current call wrote.
@@ -271,11 +269,6 @@ struct MacroEngine {
 };
 
 struct NativeMacroContext {
-    // PCAS dependency signals can arrive through different channels of one TSG.
-    NativeQmdScheduler& GetQmdScheduler(u64 address_space) {
-        return qmd_schedulers[address_space];
-    }
-    std::unordered_map<u64, NativeQmdScheduler> qmd_schedulers;
     MacroEngine engine{true};
     std::array<u32, 0x80> positions{};
     MacroEngine compute_engine{true};

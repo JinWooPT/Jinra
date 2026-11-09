@@ -4,16 +4,18 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <limits>
 #include <QBuffer>
 #include <QByteArray>
 #include <QGraphicsOpacityEffect>
 #include <QIODevice>
 #include <QImage>
+#include <QLocale>
 #include <QPainter>
 #include <QPixmap>
 #include <QPropertyAnimation>
 #include <QStyleOption>
-#include "common/container/unordered_map.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "core/loader/loader.h"
 #include "ui_loading_screen.h"
@@ -26,43 +28,15 @@
 #include <QMovie>
 #endif
 
-constexpr char PROGRESSBAR_STYLE_PREPARE[] = R"(
-QProgressBar {}
-QProgressBar::chunk {})";
-
-constexpr char PROGRESSBAR_STYLE_BUILD[] = R"(
-QProgressBar {
-  background-color: black;
-  border: 2px solid white;
-  border-radius: 4px;
-  padding: 2px;
-}
-QProgressBar::chunk {
-  background-color: #ff3c28;
-  width: 1px;
-})";
-
-constexpr char PROGRESSBAR_STYLE_COMPLETE[] = R"(
-QProgressBar {
-  background-color: #0ab9e6;
-  border: 2px solid white;
-  border-radius: 4px;
-  padding: 2px;
-}
-QProgressBar::chunk {
-  background-color: #ff3c28;
-})";
-
 LoadingScreen::LoadingScreen(QWidget* parent)
     : QWidget(parent), ui(std::make_unique<Ui::LoadingScreen>()),
       previous_stage(VideoCore::LoadCallbackStage::Complete) {
     ui->setupUi(this);
     setMinimumSize(Layout::MinimumSize::Width, Layout::MinimumSize::Height);
+    const QPixmap icon{QStringLiteral(":/jinra/icon.png")};
+    ui->brandIcon->setPixmap(icon.scaled(44, 44, Qt::KeepAspectRatio, Qt::SmoothTransformation));
 
-    // Create a fade out effect to hide this loading screen widget.
-    // When fading opacity, it will fade to the parent widgets background color, which is why we
-    // create an internal widget named fade_widget that we use the effect on, while keeping the
-    // loading screen widget's background color black. This way we can create a fade to black effect
+    // Fade the content while retaining the loading screen's dark background.
     opacity_effect = new QGraphicsOpacityEffect(this);
     opacity_effect->setOpacity(1);
     ui->fade_parent->setGraphicsEffect(opacity_effect);
@@ -80,23 +54,23 @@ LoadingScreen::LoadingScreen(QWidget* parent)
     });
     connect(this, &LoadingScreen::LoadProgress, this, &LoadingScreen::OnLoadProgress,
             Qt::QueuedConnection);
+    connect(ui->playNow, &QPushButton::clicked, this, [this] {
+        play_now_requested = true;
+        ui->playNow->setEnabled(false);
+        ui->preparationNote->setText(
+            tr("Shaders will continue compiling in the background. You may notice brief stutters."));
+        emit PlayNowRequested();
+    });
     qRegisterMetaType<VideoCore::LoadCallbackStage>();
-
-    stage_translations = {
-        {VideoCore::LoadCallbackStage::Prepare, tr("Loading...")},
-        {VideoCore::LoadCallbackStage::Build, tr("Loading Shaders %1 / %2")},
-        {VideoCore::LoadCallbackStage::Complete, tr("Launching...")},
-    };
-    progressbar_style = {
-        {VideoCore::LoadCallbackStage::Prepare, PROGRESSBAR_STYLE_PREPARE},
-        {VideoCore::LoadCallbackStage::Build, PROGRESSBAR_STYLE_BUILD},
-        {VideoCore::LoadCallbackStage::Complete, PROGRESSBAR_STYLE_COMPLETE},
-    };
 }
 
 LoadingScreen::~LoadingScreen() = default;
 
 void LoadingScreen::Prepare(Loader::AppLoader& loader) {
+    play_now_requested = false;
+    ui->playNow->setEnabled(true);
+    ui->banner->clear();
+    ui->logo->clear();
     std::vector<u8> buffer;
     if (loader.ReadBanner(buffer) == Loader::ResultStatus::Success) {
 #ifdef YUZU_QT_MOVIE_MISSING
@@ -120,7 +94,6 @@ void LoadingScreen::Prepare(Loader::AppLoader& loader) {
         ui->logo->setPixmap(map);
     }
 
-    slow_shader_compile_start = false;
     OnLoadProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
 }
 
@@ -131,61 +104,64 @@ void LoadingScreen::OnLoadComplete() {
 void LoadingScreen::OnLoadProgress(VideoCore::LoadCallbackStage stage, std::size_t value,
                                    std::size_t total) {
     using namespace std::chrono;
+    using Stage = VideoCore::LoadCallbackStage;
     const auto now = steady_clock::now();
-    // reset the timer if the stage changes
-    if (stage != previous_stage) {
-        ui->progress_bar->setStyleSheet(QString::fromUtf8(progressbar_style[stage]));
-        // Hide the progress bar during the prepare stage
-        if (stage == VideoCore::LoadCallbackStage::Prepare) {
-            ui->progress_bar->hide();
-        } else {
-            ui->progress_bar->show();
-        }
+    if (stage != previous_stage || total != previous_total || value < first_value) {
+        stage_start = now;
+        first_value = value;
         previous_stage = stage;
-        // reset back to fast shader compiling since the stage changed
-        slow_shader_compile_start = false;
-    }
-    // update the max of the progress bar if the number of shaders change
-    if (total != previous_total) {
-        ui->progress_bar->setMaximum(static_cast<int>(total));
         previous_total = total;
     }
-    // Reset the progress bar ranges if compilation is done
-    if (stage == VideoCore::LoadCallbackStage::Complete) {
-        ui->progress_bar->setRange(0, 0);
+
+    switch (stage) {
+    case Stage::Prepare:
+        ui->stage->setText(tr("Loading game…"));
+        break;
+    case Stage::Build:
+        ui->stage->setText(tr("Loading shaders"));
+        break;
+    case Stage::Complete:
+        ui->stage->setText(tr("Launching game…"));
+        break;
+    case Stage::PrepareShaders:
+        ui->stage->setText(tr("Preparing shaders"));
+        break;
     }
+    if (!play_now_requested) {
+        ui->preparationNote->setText(tr("This happens once, so the game runs smoothly"));
+    }
+    ui->preparationNote->setVisible(stage == Stage::PrepareShaders || play_now_requested);
+    ui->playNow->setVisible(stage == Stage::PrepareShaders && value < total);
+
+    const bool show_progress = total > 0 && (stage == Stage::Build || stage == Stage::PrepareShaders);
+    ui->progressDetails->setVisible(show_progress);
+    if (!show_progress) {
+        return;
+    }
+
+    const auto done = std::min(value, total);
+    const double fraction = static_cast<double>(done) / total;
+    ui->progress_bar->setValue(static_cast<int>(fraction * ui->progress_bar->maximum()));
+    const QLocale locale;
+    ui->progressCount->setText(tr("%1 / %2")
+                                   .arg(locale.toString(static_cast<qulonglong>(done)),
+                                        locale.toString(static_cast<qulonglong>(total))));
+    ui->progressPercent->setText(locale.toString(static_cast<int>(fraction * 100)) + locale.percent());
 
     QString estimate;
-    // If there's a drastic slowdown in the rate, then display an estimate
-    if (now - previous_time > milliseconds{50} || slow_shader_compile_start) {
-        if (!slow_shader_compile_start) {
-            slow_shader_start = steady_clock::now();
-            slow_shader_compile_start = true;
-            slow_shader_first_value = value;
-        }
-        // only calculate an estimate time after a second has passed since stage change
-        const auto diff = duration_cast<milliseconds>(now - slow_shader_start);
-        if (diff > seconds{1}) {
-            const auto eta_mseconds =
-                static_cast<long>(static_cast<double>(total - slow_shader_first_value) /
-                                  (value - slow_shader_first_value) * diff.count());
-            estimate =
-                tr("Estimated Time %1")
-                    .arg(QTime(0, 0, 0, 0)
-                             .addMSecs(std::max<long>(eta_mseconds - diff.count() + 1000, 1000))
-                             .toString(QStringLiteral("mm:ss")));
-        }
-    }
-
-    // update labels and progress bar
-    if (stage == VideoCore::LoadCallbackStage::Build) {
-        ui->stage->setText(stage_translations[stage].arg(value).arg(total));
-    } else {
-        ui->stage->setText(stage_translations[stage]);
+    const auto elapsed = duration<double>(now - stage_start).count();
+    if (elapsed >= 2.0 && done > first_value && done < total) {
+        const double seconds_left = elapsed * (total - done) / (done - first_value);
+        const auto remaining = static_cast<qint64>(
+            std::clamp(seconds_left, 1.0, static_cast<double>(std::numeric_limits<int>::max())));
+        const auto hours = remaining / 3600;
+        const auto minutes = remaining / 60 % 60;
+        const auto seconds = remaining % 60;
+        const QString duration_text = hours > 0 ? tr("%1 h %2 min").arg(hours).arg(minutes)
+                                                : tr("%1 min %2 s").arg(minutes).arg(seconds);
+        estimate = tr("About %1 left").arg(duration_text);
     }
     ui->value->setText(estimate);
-    ui->progress_bar->setValue(static_cast<int>(value));
-    previous_time = now;
 }
 
 void LoadingScreen::paintEvent(QPaintEvent* event) {

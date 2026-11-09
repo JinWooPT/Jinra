@@ -6,12 +6,9 @@
 
 #include <limits>
 
-#include "shader_recompiler/shader_info.h"
-
 #include "common/common_types.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/maxwell/opcodes.h"
-#include "shader_recompiler/frontend/maxwell/translate/impl/common_funcs.h"
 #include "shader_recompiler/frontend/maxwell/translate/impl/impl.h"
 
 namespace Shader::Maxwell {
@@ -109,7 +106,7 @@ IR::F64 UnpackCbuf(TranslatorVisitor& v, u64 insn) {
         BitField<20, 14, s64> offset;
         BitField<34, 5, u64> binding;
     } const cbuf{insn};
-    if (cbuf.binding >= Info::MAX_CBUFS) {
+    if (cbuf.binding >= 18) {
         throw NotImplementedException("Out of bounds constant buffer binding {}", cbuf.binding);
     }
     if (cbuf.offset >= 0x4'000 || cbuf.offset < 0) {
@@ -128,9 +125,6 @@ IR::F64 UnpackCbuf(TranslatorVisitor& v, u64 insn) {
 void TranslateF2I(TranslatorVisitor& v, u64 insn, const IR::F16F32F64& src_a) {
     // F2I is used to convert from a floating point value to an integer
     const F2I f2i{insn};
-    if (f2i.cc != 0) {
-        throw NotImplementedException("F2I CC");
-    }
 
     const bool denorm_cares{f2i.src_format != SrcFormat::F16 && f2i.src_format != SrcFormat::F64 &&
                             f2i.dest_format != DestFormat::I64};
@@ -159,36 +153,46 @@ void TranslateF2I(TranslatorVisitor& v, u64 insn, const IR::F16F32F64& src_a) {
         }
     }()};
     const bool is_signed{f2i.is_signed != 0};
-    if (f2i.src_format == SrcFormat::F32 && f2i.dest_format == DestFormat::I32 && is_signed) {
-        v.X(f2i.dest_reg, ConvertF32ToS32Saturated(v.ir, IR::F32{rounded_value}));
-        return;
-    }
     const auto [max_bound, min_bound] = ClampBounds(f2i.dest_format, is_signed);
-    const bool unsigned_f32_i64 = f2i.dest_format == DestFormat::I64 &&
-                                  f2i.src_format == SrcFormat::F32 && !is_signed;
+    const bool unsigned_f32_i64{f2i.dest_format == DestFormat::I64 &&
+                                f2i.src_format == SrcFormat::F32 && !is_signed};
 
     IR::F16F32F64 intermediate;
     switch (f2i.src_format) {
     case SrcFormat::F16: {
         const IR::F16 max_val{v.ir.FPConvert(16, v.ir.Imm32(static_cast<f32>(max_bound)))};
         const IR::F16 min_val{v.ir.FPConvert(16, v.ir.Imm32(static_cast<f32>(min_bound)))};
-        intermediate = v.ir.FPClamp(rounded_value, min_val, max_val);
+        IR::F16 safe_value{rounded_value};
+        if (f2i.dest_format == DestFormat::I8) {
+            const IR::F32 widened{v.ir.FPConvert(32, safe_value)};
+            const IR::F32 selected{v.ir.Select(v.ir.FPIsNan(op_a),
+                                              v.ir.Imm32(static_cast<f32>(min_bound)), widened)};
+            safe_value = v.ir.FPConvert(16, selected);
+        }
+        intermediate = v.ir.FPClamp(safe_value, min_val, max_val);
         break;
     }
     case SrcFormat::F32: {
-        // The u64 maximum rounds to 2^64 in f32; keep the conversion in range.
-        const IR::F32 max_val{v.ir.Imm32(unsigned_f32_i64 ? 0x1.fffffep63f : static_cast<f32>(max_bound))};
+        const IR::F32 max_val{
+            v.ir.Imm32(unsigned_f32_i64 ? 0x1.fffffep63f : static_cast<f32>(max_bound))};
         const IR::F32 min_val{v.ir.Imm32(static_cast<f32>(min_bound))};
         IR::F32 safe_value{rounded_value};
-        if (unsigned_f32_i64)
-            safe_value = IR::F32{v.ir.Select(v.ir.FPIsNan(op_a), v.ir.Imm32(0.0f), safe_value)};
+        if (unsigned_f32_i64 || f2i.dest_format == DestFormat::I8) {
+            safe_value = IR::F32{v.ir.Select(v.ir.FPIsNan(op_a), min_val, safe_value)};
+        }
         intermediate = v.ir.FPClamp(safe_value, min_val, max_val);
         break;
     }
     case SrcFormat::F64: {
-        const IR::F64 max_val{v.ir.Imm64(max_bound)};
-        const IR::F64 min_val{v.ir.Imm64(min_bound)};
-        intermediate = v.ir.FPClamp(rounded_value, min_val, max_val);
+        if (f2i.dest_format == DestFormat::I8) {
+            const IR::F32 max_val{v.ir.Imm32(static_cast<f32>(max_bound))};
+            const IR::F32 min_val{v.ir.Imm32(static_cast<f32>(min_bound))};
+            const IR::F32 narrowed{v.ir.FPConvert(32, rounded_value)};
+            const IR::F32 safe_value{v.ir.Select(v.ir.FPIsNan(op_a), min_val, narrowed)};
+            intermediate = v.ir.FPClamp(safe_value, min_val, max_val);
+        } else {
+            intermediate = v.ir.FPClamp(rounded_value, v.ir.Imm64(min_bound), v.ir.Imm64(max_bound));
+        }
         break;
     }
     default:
@@ -199,7 +203,7 @@ void TranslateF2I(TranslatorVisitor& v, u64 insn, const IR::F16F32F64& src_a) {
     IR::U16U32U64 result{v.ir.ConvertFToI(bitsize, is_signed, intermediate)};
     if (unsigned_f32_i64) {
         result = IR::U64{v.ir.Select(v.ir.FPGreaterThanEqual(op_a, v.ir.Imm32(0x1p64f)),
-                                   v.ir.Imm64((std::numeric_limits<u64>::max)()), result)};
+                                     v.ir.Imm64((std::numeric_limits<u64>::max)()), result)};
     }
 
     bool handled_special_case = false;
@@ -228,6 +232,10 @@ void TranslateF2I(TranslatorVisitor& v, u64 insn, const IR::F16F32F64& src_a) {
         v.L(f2i.dest_reg, result);
     } else {
         v.X(f2i.dest_reg, result);
+    }
+
+    if (f2i.cc != 0) {
+        throw NotImplementedException("F2I CC");
     }
 }
 } // Anonymous namespace
