@@ -492,7 +492,7 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
     // The copy's submission may be deferred (Scheduler::DeferFlush): the split's front asks the
     // back for it rather than waiting for the back's next submission. If the back has stopped,
     // nothing else uses the scheduler and Wait submits it.
-    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
+    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().BackRunning() &&
         !VideoCommon::GpuSplit::OnBackThread()) {
         VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ListSubmitWait};
         if (!scheduler.WaitSubmitted(tick)) {
@@ -512,6 +512,47 @@ void BufferCacheRuntime::FinishForHostRead() {
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record(HostReadBarrier);
     scheduler.Finish();
+}
+
+u64 BufferCacheRuntime::SubmitForHostRead() {
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record(HostReadBarrier);
+    return scheduler.Flush();
+}
+
+u64 BufferCacheRuntime::QueueForHostRead() {
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record(HostReadBarrier);
+    const u64 tick = scheduler.CurrentTick();
+    if (!scheduler.DeferFlush()) {
+        scheduler.Flush();
+    }
+    return tick;
+}
+
+void BufferCacheRuntime::WaitForHostRead(u64 tick) {
+    if (scheduler.IsFree(tick)) {
+        return;
+    }
+    // A queued tick may not be submitted yet. Only the split's back submits: other threads ask it
+    // to, as for fences (InnerFence::Wait). On the back, and once it has stopped, Wait submits it.
+    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
+        !VideoCommon::GpuSplit::OnBackThread() && scheduler.WaitSubmitted(tick)) {
+        scheduler.GetMasterSemaphore().Wait(tick);
+        return;
+    }
+    scheduler.Wait(tick);
+}
+
+bool BufferCacheRuntime::IsFreeNow(u64 tick) {
+    if (scheduler.IsFree(tick)) {
+        return true;
+    }
+    if (!scheduler.IsSubmitted(tick)) {
+        return false;
+    }
+    scheduler.GetMasterSemaphore().Refresh();
+    return scheduler.IsFree(tick);
 }
 
 bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,

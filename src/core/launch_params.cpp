@@ -225,7 +225,7 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
     }
 
     if (lp.print_version) {
-        LOG_INFO(Frontend, "Eden {} {}", Common::g_scm_branch, Common::g_scm_desc);
+        LOG_INFO(Frontend, "Jinra Version: {} | {}", Common::g_build_version, Common::g_compiler_id);
     }
     if (lp.print_help) {
         LOG_INFO(Frontend,

@@ -9,6 +9,7 @@
 
 #include "common/logging.h"
 #include "video_core/dlss_evaluation.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #include "video_core/vulkan_common/streamline.h"
@@ -378,6 +379,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
         };
         sl::Result api_result = sl::Result::eOk;
+        VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::DlssEvaluate};
         const auto result = VideoCommon::RecordDlssEvaluation(
             [&] {
                 if (!options_changed) {

@@ -40,6 +40,9 @@
 #define RYUJINX_DIR "Ryujinx"
 
 // yuzu-specific files
-#define LOG_FILE "eden_log.txt"
+#define LOG_FILE "jinra_log.txt"
+#define LOG_PREVIOUS_FILE "jinra_log.old.txt"
+#define LEGACY_LOG_FILE "eden_log.txt"
+#define LEGACY_LOG_PREVIOUS_FILE "eden_log.txt.old.txt"
 #define LOSSLESS_DLL_FILE "Lossless.dll"
 #define LOSSLESS_CACHE_FILE "lsfg_spirv.cache"

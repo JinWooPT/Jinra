@@ -4,10 +4,12 @@
 #pragma once
 
 #include <QDir>
+#include <QMap>
 #include <QString>
-#include <quazip.h>
 #include <zlib.h>
 #include "qt_common/qt_common.h"
+
+class QuaZip;
 
 /** This is a modified version of JlCompress **/
 namespace QtCommon::Compress {
@@ -95,6 +97,9 @@ private:
  */
 bool compressDir(QString fileCompressed, QString dir, const Options& options = Options(),
                  QtCommon::QtProgressCallback callback = {});
+
+/// Atomically creates an archive from a map of archive entry names to local file paths.
+bool compressFiles(const QString& destination, const QMap<QString, QString>& files);
 
 // Internal //
 bool compressSubDir(QuaZip* zip, QString dir, QString origDir, const Options& options,

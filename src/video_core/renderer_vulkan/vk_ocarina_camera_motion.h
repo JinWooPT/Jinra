@@ -34,6 +34,8 @@ public:
                     ComputePassDescriptorQueue& queue, MemoryAllocator& allocator);
     ~OcarinaLiveDlss();
 
+    /// Run a private 1440p-to-4K evaluation before guest rendering starts.
+    bool WarmUp4k();
     [[nodiscard]] bool EvaluationFailed() const;
     /// Save the 1440p DLSS copy before the game adds its HUD.
     void SaveSceneReference(VkImageView color);

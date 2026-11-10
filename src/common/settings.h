@@ -444,7 +444,12 @@ struct Values {
                                                 true,
                                                 true};
 
-    SwitchableSetting<bool> frame_gen{linkage, false, "frame_gen", Category::Renderer,
+#ifdef _WIN32
+    static constexpr bool DefaultFrameGeneration = true;
+#else
+    static constexpr bool DefaultFrameGeneration = false;
+#endif
+    SwitchableSetting<bool> frame_gen{linkage, DefaultFrameGeneration, "frame_gen", Category::Renderer,
                                       Specialization::Default, true, false};
 
     SwitchableSetting<FrameGenType> frame_gen_type{linkage,

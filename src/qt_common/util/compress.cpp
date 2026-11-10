@@ -5,10 +5,33 @@
 #include "quazipfileinfo.h"
 
 #include <QDirIterator>
+#include <QSaveFile>
 #include <quazipfile.h>
 
 /** This is a modified version of JlCompress **/
 namespace QtCommon::Compress {
+
+bool compressFiles(const QString& destination, const QMap<QString, QString>& files) {
+    if (files.isEmpty()) {
+        return false;
+    }
+    QSaveFile output(destination);
+    QuaZip zip(&output);
+    zip.setAutoClose(false);
+    if (!zip.open(QuaZip::mdCreate)) {
+        return false;
+    }
+    const Options options{Options::Fastest};
+    std::size_t progress = 0;
+    for (auto it = files.cbegin(); it != files.cend(); ++it) {
+        if (!compressFile(&zip, it.value(), it.key(), options, 0, progress,
+                          [](std::size_t, std::size_t) { return true; })) {
+            return false;
+        }
+    }
+    zip.close();
+    return zip.getZipError() == ZIP_OK && output.commit();
+}
 
 bool compressDir(QString fileCompressed, QString dir, const Options& options,
                  QtCommon::QtProgressCallback callback) {

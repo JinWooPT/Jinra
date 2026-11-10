@@ -231,6 +231,9 @@ public:
     [[nodiscard]] bool DeserializePrepared(std::istream& file, u64 size);
 
     [[nodiscard]] bool AnswersHoldFor(Shader::Environment& live, u32 format_traits);
+    [[nodiscard]] bool LacksRecordedValue() const noexcept {
+        return lacks_recorded_value;
+    }
     static constexpr u32 FormatTraitInteger = 1;
     static constexpr u32 FormatTraitByteAddressed = 2 | 4;
     static constexpr u32 FormatTraitSnorm = 8;
@@ -281,6 +284,7 @@ public:
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
 private:
+    bool lacks_recorded_value{};
     std::vector<u64> code;
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;

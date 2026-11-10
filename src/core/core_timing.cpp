@@ -10,9 +10,9 @@
 #include <string>
 #include <tuple>
 #include "common/cpu_features.h"
-#include "common/cpu_features.h"
 
 #ifdef _WIN32
+#include "common/logging.h"
 #include "common/windows/timer_resolution.h"
 #endif
 
@@ -94,14 +94,23 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
             Common::SetCurrentThreadToPerformanceCores();
             on_thread_init();
 #ifdef _WIN32
-            // EDEN_HIRES_CLOCK=0 keeps the plain timed wait.
+            // EDEN_HIRES_CLOCK=0 skips the high-resolution timer.
             const char* const hires_switch = std::getenv("EDEN_HIRES_CLOCK");
-            void* const hires_timer = (hires_switch != nullptr && hires_switch[0] == '0')
-                                          ? nullptr
-                                          : Common::Windows::CreateHighResolutionTimer();
+            void* timer = hires_switch && hires_switch[0] == '0'
+                              ? nullptr
+                              : Common::Windows::CreateHighResolutionTimer();
+            const bool high_resolution = timer != nullptr;
+            // As in Lichii #1016, leave the CPU to other threads while the timer is pending.
+            if (!timer) {
+                timer = Common::Windows::CreateStandardWaitTimer();
+            }
             SCOPE_EXIT {
-                Common::Windows::CloseWaitHandle(hires_timer);
+                Common::Windows::CloseWaitHandle(timer);
             };
+            LOG_INFO(Core, "Windows HostTiming wait mode: {}",
+                     !timer || !wake_handle ? "condition variable"
+                     : high_resolution      ? "high-resolution waitable timer"
+                                            : "standard waitable timer");
 #endif
             has_started = true;
 
@@ -117,10 +126,17 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                             // A high resolution timer keeps the guest's events (vsync among them)
                             // on time even where Windows doesn't honour our timer resolution
                             // request (Windows 11: players gained ~30% fps from making it global).
-                            if (!Common::Windows::WaitHighResolution(
-                                    hires_timer, wake_handle, std::chrono::nanoseconds(wait_time)))
+                            const auto timeout = std::chrono::nanoseconds(wait_time);
+                            if (!Common::Windows::WaitHighResolution(timer, wake_handle, timeout)) {
+                                const auto remaining = *next_time - GetGlobalTimeNs().count();
+                                if (remaining > 0) {
+                                    event.WaitUntil(std::chrono::steady_clock::now() +
+                                                    std::chrono::nanoseconds(remaining));
+                                }
+                            }
+#else
+                            event.WaitFor(std::chrono::nanoseconds(wait_time));
 #endif
-                                event.WaitFor(std::chrono::nanoseconds(wait_time));
                         }
                     } else {
                         // Queue is empty, wait until another event is scheduled and signals us to

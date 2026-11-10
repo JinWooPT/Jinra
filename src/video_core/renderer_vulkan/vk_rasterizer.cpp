@@ -73,6 +73,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_stutter_trace.h"
 
 namespace Vulkan {
 
@@ -826,6 +827,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         draw_func();
     }
     submitted = true;
+    buffer_cache.NoteWorkRecorded(false);
 #ifdef EGLANTINE_STREAMLINE
     constexpr u64 final_vertex = 0x16aff33d999f993fULL;
     constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
@@ -969,6 +971,8 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    VideoCommon::StutterTrace::Scope stutter_trace{
+        VideoCommon::StutterTrace::Category::RasterGraphics};
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
         // should have written. Past 16M vertices they are garbage: building the quad index
@@ -1188,6 +1192,8 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 
 void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    VideoCommon::StutterTrace::Scope stutter_trace{
+        VideoCommon::StutterTrace::Category::RasterGraphics};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     if (Common::DkbFrameTrace::Enabled()) {
         ++trace_indirect;
@@ -1511,6 +1517,8 @@ void RasterizerVulkan::DrawTexture() {
 
 void RasterizerVulkan::Clear(u32 layer_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
+    VideoCommon::StutterTrace::Scope stutter_trace{
+        VideoCommon::StutterTrace::Category::RasterGraphics};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
         const auto& regs = maxwell3d->regs;
         LOG_INFO(HW_GPU, "after upscale: clear rt0 {:#x} {}x{} fmt {:#x} surface {:#x} colour {} {} {} {}",
@@ -1744,6 +1752,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 
 void RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
+    VideoCommon::StutterTrace::Scope stutter_trace{
+        VideoCommon::StutterTrace::Category::RasterCompute};
     FlushWork();
     gpu_memory->FlushCaching();
     if (frame_dump.Capturing()) {
@@ -1850,6 +1860,7 @@ void RasterizerVulkan::DispatchCompute() {
                 cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
             });
         });
+        buffer_cache.NoteWorkRecorded(true);
         SubmitNx2ListCopies();
         return;
     }
@@ -1903,6 +1914,7 @@ void RasterizerVulkan::DispatchCompute() {
         // The deferred native binding may follow DLSS's command buffer bindings.
         scheduler.InvalidateState();
     }
+    buffer_cache.NoteWorkRecorded(true);
     SubmitNx2ListCopies();
 
 #ifdef EGLANTINE_STREAMLINE
@@ -2008,6 +2020,39 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     }
 }
 
+void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0) {
+        return;
+    }
+    // As FlushRegion, but the buffer cache doesn't wait for the host GPU here (Scheduler::Finish,
+    // with its lock held): the reading thread does, in FinishRead.
+    gpu.InvalidateGPUCache();
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.DownloadMemory(addr, size);
+    }
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.DownloadMemoryForRead(addr, size);
+    }
+    query_cache.FlushRegion(addr, size);
+}
+
+void RasterizerVulkan::FinishRead(DAddr addr, u64 size) {
+    VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::Readback};
+    buffer_cache.FinishReadDownloads(addr, size);
+}
+
+bool RasterizerVulkan::NoteReportPending(DAddr addr, u64 size) {
+    std::scoped_lock lock{buffer_cache.mutex};
+    return buffer_cache.NoteReportPending(addr, size);
+}
+
+void RasterizerVulkan::FinishReport(DAddr addr, u64 size) {
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.FinishReport(addr, size);
+}
+
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     // The split's front asks this before each macro DMA read, and the back holds the buffer
     // cache's lock through each draw: pages the GPU never wrote need no look under it.
@@ -2031,6 +2076,10 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
 
 bool RasterizerVulkan::HasPendingQueries(DAddr addr, u64 size) {
     return query_cache.IsRegionGpuModified(addr, size);
+}
+
+bool RasterizerVulkan::HoldsQueries(DAddr addr, u64 size) {
+    return query_cache.HoldsQueries(addr, size);
 }
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
@@ -2061,7 +2110,9 @@ void RasterizerVulkan::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::Cac
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex};
-    buffer_cache.ClearDownload(addr, size);
+    // MemoryManager landed the read downloads here just before (FinishRead) and writes guest memory
+    // next. Landing a newer one would wait for the host GPU with the lock held, from any thread.
+    buffer_cache.ClearReplacedDownload(addr, size);
 }
 
 void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
@@ -2603,6 +2654,7 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
         }
         return false;
     }
+    VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::DlssPrepare};
     // Logs why the game's own upscale draws, when the reason changes and every 120th repeat.
     const auto fail = [this](const char* reason) {
         if (reason != oot_fallback_reason || ++oot_fallback_repeats % 120 == 0) {
@@ -3026,6 +3078,32 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
         Tegra::SetNx2RenderFrameClock(reuse_render_targets);
     }
     pipeline_cache.LoadDiskResources(title_id, stop_loading, callback);
+#ifdef EGLANTINE_STREAMLINE
+    const auto disabled_addons = Settings::values.disabled_addons.find(title_id);
+    const bool max_resolution = disabled_addons == Settings::values.disabled_addons.end() ||
+        std::ranges::find(disabled_addons->second, "Max Resolution (built-in)") ==
+            disabled_addons->second.end();
+    if (title_id == OcarinaOfTimeProgramId && !stop_loading.stop_requested() &&
+        render_trace_frame == 0 && !oot_live_dlss && max_resolution &&
+        Settings::values.resolution_setup.GetValue() == Settings::ResolutionSetup::Res1X &&
+        Settings::values.nvidia_dlss.GetValue() && Streamline::IsDlssAvailable()) {
+        const auto start = std::chrono::steady_clock::now();
+        try {
+            auto upscaler = std::make_unique<OcarinaLiveDlss>(
+                device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
+            if (upscaler->WarmUp4k()) {
+                oot_live_dlss = std::move(upscaler);
+                LOG_INFO(Render_Vulkan, "Ocarina DLSS startup warm-up completed in {:.1f} ms",
+                         std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - start).count());
+            } else {
+                LOG_INFO(Render_Vulkan, "Ocarina DLSS startup warm-up declined; will retry in game");
+            }
+        } catch (const vk::Exception& error) {
+            LOG_WARNING(Render_Vulkan, "Ocarina DLSS startup warm-up failed: {}", error.what());
+        }
+    }
+#endif
 }
 
 void RasterizerVulkan::FlushWork() {

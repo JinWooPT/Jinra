@@ -35,6 +35,7 @@
 #include "video_core/texture_cache/util.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/render_trace.h"
 #include "video_core/textures/decoders.h"
 
@@ -1785,6 +1786,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    StutterTrace::Scope trace{StutterTrace::Category::TextureUpload};
 
     image.flags &= ~ImageFlagBits::CpuModified;
 

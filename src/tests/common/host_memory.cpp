@@ -6,7 +6,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <algorithm>
+#include <cstring>
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <unistd.h>
 #endif
 
@@ -256,3 +261,52 @@ TEST_CASE("HostMemory: Partial sparse middle unmap and check bindings", "[common
     REQUIRE(ptr[0x0000] == 19);
     REQUIRE(ptr[0x3fff] == 12);
 }
+
+#ifdef _WIN32
+TEST_CASE("HostMemory: Trim zero pages preserves contents and mappings", "[common]") {
+    constexpr size_t Page = 0x1000;
+    HostMemory mem(8_MiB, 64_MiB);
+    auto* const backing = mem.BackingBasePointer();
+    REQUIRE(backing != nullptr);
+    REQUIRE(mem.VirtualBasePointer() != nullptr);
+    mem.Map(0x10000, 0x100000, 2 * Page, PERMS, HEAP);
+    mem.Map(0x12000, 0x200000, Page, PERMS, HEAP);
+    mem.Map(0x13000, 0x300000, Page, PERMS, HEAP);
+    auto* const view = mem.VirtualBasePointer() + 0x10000;
+    std::memset(view, 0, Page);
+    std::memset(view + Page, 0x5a, Page);
+    std::memset(view + 2 * Page, 0, 2 * Page);
+    mem.MarkUsed(0x400000, Page);
+    std::memset(backing + 0x400000, 0, Page);
+
+    const auto resident = [](void* address) {
+        PSAPI_WORKING_SET_EX_INFORMATION info{};
+        info.VirtualAddress = address;
+        REQUIRE(K32QueryWorkingSetEx(GetCurrentProcess(), &info, sizeof(info)));
+        return info.VirtualAttributes.Valid != 0;
+    };
+    REQUIRE(resident(view));
+    REQUIRE(!resident(backing + 0x100000 + Page));
+
+    const auto [looked_at, trimmed] = mem.TrimZeroPages();
+    CHECK(looked_at >= 5 * Page);
+    CHECK(trimmed >= 4 * Page);
+    CHECK_FALSE(resident(view));
+    CHECK(resident(view + Page));
+    CHECK_FALSE(resident(view + 2 * Page));
+    CHECK_FALSE(resident(view + 3 * Page));
+    CHECK_FALSE(resident(backing + 0x400000));
+    CHECK_FALSE(resident(backing + 0x100000 + Page));
+
+    const auto all = [](const u8* page, u8 value) {
+        return std::all_of(page, page + Page, [value](u8 byte) { return byte == value; });
+    };
+    CHECK(all(view, 0));
+    CHECK(all(view + Page, 0x5a));
+    CHECK(all(view + 2 * Page, 0));
+    CHECK(all(view + 3 * Page, 0));
+    CHECK(all(backing + 0x400000, 0));
+    view[Page] = 0xa5;
+    CHECK(backing[0x100000 + Page] == 0xa5);
+}
+#endif

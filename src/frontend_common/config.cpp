@@ -157,7 +157,6 @@ void Config::SetUpIni() {
         seed(Settings::values.max_anisotropy, ToString(u32(Settings::AnisotropyMode::X16)));
         seed(Settings::values.astc_recompression,
              ToString(u32(Settings::AstcRecompression::Uncompressed)));
-        seed(Settings::values.frame_gen, ToString(true));
         seed(Settings::values.game_dlss_network, ToString(true));
         seed(Settings::values.nvidia_dlss, ToString(true));
 #else
@@ -969,6 +968,14 @@ void Config::ReadSettingGeneric(Settings::BasicSetting* const setting) {
     }
 
     if (global || !use_global) {
+#ifdef _WIN32
+        // Older builds marked a per-game OFF override as default. Keep it when the game
+        // explicitly overrides the global value.
+        if (!global && setting == &Settings::values.frame_gen) {
+            setting->LoadString(ReadStringSetting(key));
+            return;
+        }
+#endif
         const bool is_default = ReadBooleanSetting(std::string(key).append("\\default"), std::make_optional(true));
         if (!is_default) {
             setting->LoadString(ReadStringSetting(key, default_value));

@@ -13,6 +13,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_pipeline_binary_cache.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -790,6 +791,7 @@ PipelineLayout Device::CreatePipelineLayout(const VkPipelineLayoutCreateInfo& ci
 }
 
 Pipeline Device::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, VkPipelineCache cache) const {
+    VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::DriverBuild};
     VkPipeline object = VK_NULL_HANDLE;
     VkResult result;
     if (!PipelineBinaryCache::CreateGraphicsPipeline(handle, *dld, ci, cache, &object, &result)) {
@@ -806,6 +808,7 @@ Pipeline Device::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, 
 
 Pipeline Device::CreateComputePipeline(const VkComputePipelineCreateInfo& ci,
                                        VkPipelineCache cache) const {
+    VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::DriverBuild};
     VkPipeline object = VK_NULL_HANDLE;
     VkResult result;
     if (!PipelineBinaryCache::CreateComputePipeline(handle, *dld, ci, cache, &object, &result)) {

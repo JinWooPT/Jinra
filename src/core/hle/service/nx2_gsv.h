@@ -60,6 +60,7 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/nx2_video_decoder.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/textures/decoders.h"
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
@@ -1836,7 +1837,18 @@ private:
         m_previous_fence_id = ~w[22];
         m_previous_fence_value = w[24];
         const auto waited = std::chrono::steady_clock::now();
-        Composite(w[5], ~w[22], w[24], w[7]);
+        {
+            using namespace VideoCommon::StutterTrace;
+            const FlipTiming flip{
+                .id = recording.load(std::memory_order_relaxed) ? m_presents : 0,
+                .guest_gap = m_stats.last_present == FlipTiming::Clock::time_point{}
+                                 ? FlipTiming::Clock::duration{} : entered - m_stats.last_present,
+                .service_wait = waited - entered,
+                .service_ready = waited,
+            };
+            const FlipScope scope{flip};
+            Composite(w[5], ~w[22], w[24], w[7]);
+        }
         const auto composited = std::chrono::steady_clock::now();
         PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());
         const auto paced = std::chrono::steady_clock::now();

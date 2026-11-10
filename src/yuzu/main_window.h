@@ -394,6 +394,7 @@ private slots:
     void OnOpenSDMCFolder();
     void OnOpenModFolder();
     void OnOpenLogFolder();
+    void OnExportLogs();
     void OnVerifyInstalledContents();
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();

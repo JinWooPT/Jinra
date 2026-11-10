@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "common/assert.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"
@@ -39,6 +40,9 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_async_readback.h"
+#include "video_core/nx2_profile.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
@@ -110,17 +114,37 @@ struct GPU::Impl {
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
         std::vector<std::pair<DAddr, u64>> writes;
-        std::function<void(PAddr, size_t)> callback_writes(
-            [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
-        system.GatherGPUDirtyMemory(callback_writes);
-        if (!writes.empty()) {
-            renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+        {
+            // Gathered writes stay pending (ForEachPendingCpuWrite) until they are applied: a
+            // download written to guest memory meanwhile on another thread (FinishRead) would
+            // otherwise write the GPU's older bytes over them.
+            std::scoped_lock lock{applying_writes_mutex};
+            std::function<void(PAddr, size_t)> callback_writes(
+                [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
+            system.GatherGPUDirtyMemory(callback_writes);
+            if (writes.empty()) {
+                return;
+            }
+            applying_writes.push_back(&writes);
         }
+        // Also if OnCacheInvalidations throws: ForEachPendingCpuWrite must not reach `writes`
+        // once it is gone.
+        SCOPE_EXIT {
+            std::scoped_lock lock{applying_writes_mutex};
+            std::erase(applying_writes, &writes);
+        };
+        renderer->ReadRasterizer()->OnCacheInvalidations(writes);
     }
 
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
+        std::scoped_lock lock{applying_writes_mutex};
         for (auto& manager : system.GetGPUDirtyMemoryManager()) {
             manager.ForEachPending(callback);
+        }
+        for (const auto* writes : applying_writes) {
+            for (const auto& [address, size] : *writes) {
+                callback(address, size);
+            }
         }
     }
 
@@ -247,13 +271,35 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
-        const u64 fence = RequestSyncOperation([this, raster_area]() {
-            // Apply collected guest writes before downloading GPU data over guest memory.
-            InvalidateGPUCache();
-            renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
-        });
-        gpu_thread.TickGPU(is_async);
-        WaitForSyncOperation(fence);
+        namespace AsyncReadback = VideoCore::AsyncReadback;
+        const u64 request = AsyncReadback::Now();
+        const u64 area_size = raster_area.end_address - raster_area.start_address;
+        // In flight: an earlier read's downloads cover the area, only FinishRead is left.
+        if (!raster_area.in_flight) {
+            VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::ReadbackSubmit};
+            const u64 fence = RequestSyncOperation([this, raster_area, area_size]() {
+                const u64 start = AsyncReadback::Now();
+                // Apply collected guest writes before downloading GPU data over guest memory.
+                InvalidateGPUCache();
+                renderer->ReadRasterizer()->FlushRegionForRead(raster_area.start_address,
+                                                               area_size);
+                AsyncReadback::Add(AsyncReadback::g_counters.flush_ns,
+                                   AsyncReadback::Now() - start);
+            });
+            gpu_thread.TickGPU(is_async);
+            WaitForSyncOperation(fence);
+        }
+        // The GPU thread submitted the downloads without waiting for the host GPU: this thread
+        // waits for them and writes them to guest memory, while the GPU thread goes on.
+        AsyncReadback::t_reading = true;
+        renderer->ReadRasterizer()->FinishRead(raster_area.start_address, area_size);
+        AsyncReadback::t_reading = false;
+        AsyncReadback::CountRead(raster_area.in_flight ? AsyncReadback::Read::InFlight
+                                                       : AsyncReadback::Read::Async,
+                                 AsyncReadback::Now() - request);
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            AsyncReadback::MaybeReport();
+        }
         return raster_area;
     }
 
@@ -284,6 +330,7 @@ struct GPU::Impl {
     }
 
     void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers, std::vector<Service::Nvidia::NvFence>&& fences) {
+        namespace Trace = VideoCommon::StutterTrace;
         const size_t num_fences{fences.size()};
         size_t current_request_counter{};
         if (num_fences != 0) {
@@ -297,15 +344,37 @@ struct GPU::Impl {
                 free_swap_counters.pop_front();
             }
         }
+        Trace::FlipTiming flip{};
+        if (const auto* timing = Trace::current_flip) {
+            flip = *timing;
+            flip.queued = Trace::FlipTiming::Clock::now();
+        }
         pending_composite_fence = RequestSyncOperation(
             [this, current_request_counter, num_fences, composite_layers = std::move(layers),
-             composite_fences = std::move(fences)] {
+             composite_fences = std::move(fences), flip]() mutable {
+                if (flip.id != 0) {
+                    flip.dispatched = Trace::FlipTiming::Clock::now();
+                }
+                const auto compose = [this](const auto& layers, Trace::FlipTiming timing) {
+                    if (timing.id != 0) {
+                        timing.compositing = Trace::FlipTiming::Clock::now();
+                    }
+                    const Trace::FlipScope scope{timing};
+                    renderer->Composite(layers);
+                };
                 if (num_fences == 0) {
-                    renderer->Composite(composite_layers);
+                    compose(composite_layers, flip);
                     return;
                 }
                 auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
-                const auto executer = [this, current_request_counter, composite_layers]() {
+                if (flip.id != 0 && num_fences == 1) {
+                    const auto& fence = composite_fences.front();
+                    flip.fence_id = fence.id;
+                    flip.fence_target = fence.value;
+                    flip.fence_guest_at_dispatch =
+                        syncpoint_manager.GetGuestSyncpointValue(fence.id);
+                }
+                const auto executer = [this, current_request_counter, composite_layers, compose, flip]() {
                     {
                         std::unique_lock<std::mutex> lk(request_swap_mutex);
                         if (--request_swap_counters[current_request_counter] != 0) {
@@ -313,7 +382,7 @@ struct GPU::Impl {
                         }
                         free_swap_counters.push_back(current_request_counter);
                     }
-                    renderer->Composite(composite_layers);
+                    compose(composite_layers, flip);
                 };
                 for (size_t i = 0; i < num_fences; i++) {
                     syncpoint_manager.RegisterGuestAction(composite_fences[i].id,
@@ -377,6 +446,10 @@ struct GPU::Impl {
     VideoCommon::PendingMaps pending_maps;
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
+
+    /// InvalidateGPUCache: the writes it gathered and is applying, on each thread doing so.
+    std::vector<const std::vector<std::pair<DAddr, u64>>*> applying_writes;
+    std::mutex applying_writes_mutex;
 
     const bool is_async;
 
@@ -610,3 +683,12 @@ void GPU::FlushAndInvalidateRegion(DAddr addr, u64 size) {
 }
 
 } // namespace Tegra
+
+namespace VideoCore {
+
+bool MayHoldGpuWrites(DAddr addr, u64 size) {
+    return !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+           Tegra::Nx2MayBeGpuWritten(addr, size);
+}
+
+} // namespace VideoCore

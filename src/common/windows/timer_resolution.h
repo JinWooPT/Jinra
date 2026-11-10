@@ -39,14 +39,16 @@ void SleepForOneTick();
 /// and later), or nullptr where it isn't available. Close with CloseWaitHandle.
 void* CreateHighResolutionTimer();
 
+/// A regular auto-reset waitable timer, for hosts without a high-resolution timer.
+void* CreateStandardWaitTimer();
+
 /// An auto-reset event for WaitHighResolution's early wake-up. Close with CloseWaitHandle.
 void* CreateWakeEvent();
 
 /// Signals an event from CreateWakeEvent (no-op for nullptr).
 void SignalWakeEvent(void* wake_event);
 
-/// Waits `ns` on `timer` or until `wake_event` is signalled. False if the timer couldn't be set
-/// (the caller then waits its usual way).
+/// Waits `ns` on `timer` or until `wake_event` is signalled. False if the wait fails.
 bool WaitHighResolution(void* timer, void* wake_event, std::chrono::nanoseconds ns);
 
 void CloseWaitHandle(void* handle);

@@ -92,6 +92,7 @@
 #include <QProgressDialog>
 #include <QScreen>
 #include <QShortcut>
+#include <QStandardPaths>
 #include <QStatusBar>
 #include <QtConcurrentRun>
 
@@ -108,6 +109,7 @@
 #include "qt_common/qt_common.h"
 #include "qt_common/qt_string_lookup.h"
 
+#include "qt_common/util/compress.h"
 #include "qt_common/util/content.h"
 #include "qt_common/util/fs.h"
 #include "qt_common/util/meta.h"
@@ -138,6 +140,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 
 // Common //
 #include "common/fs/fs.h"
+#include "common/fs/fs_paths.h"
 #include "common/logging.h"
 #include "common/memory_detect.h"
 #include "common/scm_rev.h"
@@ -1705,6 +1708,7 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_SDMC_Folder, &MainWindow::OnOpenSDMCFolder);
     connect_menu(ui->action_Mod_Folder, &MainWindow::OnOpenModFolder);
     connect_menu(ui->action_Log_Folder, &MainWindow::OnOpenLogFolder);
+    connect_menu(ui->action_Export_Logs, &MainWindow::OnExportLogs);
 
     connect_menu(ui->action_Verify_installed_contents, &MainWindow::OnVerifyInstalledContents);
     connect_menu(ui->action_Firmware_From_Folder, &MainWindow::OnInstallFirmware);
@@ -4160,6 +4164,63 @@ void MainWindow::OnOpenModFolder() {
 
 void MainWindow::OnOpenLogFolder() {
     QtCommon::Game::OpenLogFolder();
+}
+
+void MainWindow::OnExportLogs() {
+    const auto title = tr("Export Jinra Logs");
+    const QDir log_dir{
+        QString::fromStdString(Common::FS::GetEdenPathString(Common::FS::EdenPath::LogDir))};
+    QMap<QString, QString> files;
+    const auto add_log = [&](const QString& source, const QString& entry) {
+        const QFileInfo file(log_dir.filePath(source));
+        if (file.isFile() && !file.isSymLink()) {
+            files.insert(entry, file.filePath());
+        }
+    };
+    add_log(QStringLiteral(LOG_FILE), QStringLiteral(LOG_FILE));
+    add_log(QStringLiteral(LOG_PREVIOUS_FILE), QStringLiteral(LOG_PREVIOUS_FILE));
+    if (!files.contains(QStringLiteral(LOG_PREVIOUS_FILE))) {
+        add_log(QStringLiteral(LEGACY_LOG_FILE), QStringLiteral(LOG_PREVIOUS_FILE));
+    }
+    if (!files.contains(QStringLiteral(LOG_PREVIOUS_FILE))) {
+        add_log(QStringLiteral(LEGACY_LOG_PREVIOUS_FILE), QStringLiteral(LOG_PREVIOUS_FILE));
+    }
+    if (files.isEmpty()) {
+        QMessageBox::information(this, title, tr("There are no logs to export."));
+        return;
+    }
+
+    QFileDialog dialog(this, title,
+                       QStandardPaths::writableLocation(QStandardPaths::DownloadLocation),
+                       tr("ZIP archive (*.zip)"));
+    dialog.setAcceptMode(QFileDialog::AcceptSave);
+    dialog.setDefaultSuffix(QStringLiteral("zip"));
+    dialog.selectFile(QStringLiteral("jinra-logs.zip"));
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    const auto destination = dialog.selectedFiles().front();
+    if (QFileInfo(destination).suffix().compare(QStringLiteral("zip"), Qt::CaseInsensitive) != 0) {
+        QMessageBox::warning(this, title, tr("Choose a filename ending in .zip."));
+        return;
+    }
+
+    Common::Log::Flush();
+    ui->action_Export_Logs->setEnabled(false);
+    auto* watcher = new QFutureWatcher<bool>(this);
+    connect(watcher, &QFutureWatcher<bool>::finished, this, [this, watcher, title, destination] {
+        const bool success = watcher->result();
+        watcher->deleteLater();
+        ui->action_Export_Logs->setEnabled(true);
+        if (success) {
+            QMessageBox::information(this, title, tr("Logs saved to %1.").arg(destination));
+        } else {
+            QMessageBox::warning(this, title, tr("Could not write the log archive."));
+        }
+    });
+    watcher->setFuture(QtConcurrent::run([destination, files] {
+        return QtCommon::Compress::compressFiles(destination, files);
+    }));
 }
 
 void MainWindow::OnVerifyInstalledContents() {

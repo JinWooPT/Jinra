@@ -7,6 +7,7 @@
 
 #ifdef EGLANTINE_STREAMLINE
 #include "common/logging.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/host_shaders/ocarina_dlss_color_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_output_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_4k_composite_comp_spv.h"
@@ -629,6 +630,81 @@ OcarinaLiveDlss::OcarinaLiveDlss(const Device& device, Scheduler& scheduler, Des
 
 OcarinaLiveDlss::~OcarinaLiveDlss() = default;
 
+bool OcarinaLiveDlss::WarmUp4k() {
+    auto& state = *impl;
+    constexpr VkExtent2D render_size{2560, 1440};
+    constexpr VkExtent2D output_size{3840, 2160};
+    constexpr auto clear_usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    const auto clear_depth = reinterpret_cast<PFN_vkCmdClearDepthStencilImage>(
+        state.device.GetDispatchLoader().vkGetDeviceProcAddr(
+            *state.device.GetLogical(), "vkCmdClearDepthStencilImage"));
+    if (!clear_depth) {
+        return false;
+    }
+
+    auto color = CreateOcarinaImage(state.allocator, render_size, LIVE_COLOR_FORMAT, clear_usage);
+    auto motion = CreateOcarinaImage(state.allocator, render_size, MOTION_FORMAT, clear_usage);
+    auto depth = CreateOcarinaImage(state.allocator, render_size, VK_FORMAT_D32_SFLOAT,
+                                    clear_usage | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    auto color_view = CreateOcarinaView(state.device, *color, LIVE_COLOR_FORMAT);
+    auto motion_view = CreateOcarinaView(state.device, *motion, MOTION_FORMAT);
+    auto depth_view = state.device.GetLogical().CreateImageView(VkImageViewCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = *depth,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_D32_SFLOAT,
+        .subresourceRange = DEPTH_RANGE,
+    });
+
+    state.scheduler.RequestOutsideRenderPassOperationContext();
+    state.scheduler.Record([color = *color, motion = *motion, depth = *depth,
+                            clear_depth](vk::CommandBuffer cmd) {
+        const auto prepare = [](VkImage image, VkImageSubresourceRange range) {
+            return VkImageMemoryBarrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = image,
+                .subresourceRange = range,
+            };
+        };
+        const std::array barriers{prepare(color, COLOR_RANGE), prepare(motion, COLOR_RANGE),
+                                  prepare(depth, DEPTH_RANGE)};
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            0, {}, {}, barriers);
+        cmd.ClearColorImage(color, VK_IMAGE_LAYOUT_GENERAL, {}, COLOR_RANGE);
+        cmd.ClearColorImage(motion, VK_IMAGE_LAYOUT_GENERAL, {}, COLOR_RANGE);
+        constexpr VkClearDepthStencilValue far_depth{1.0f, 0};
+        clear_depth(*cmd, depth, VK_IMAGE_LAYOUT_GENERAL, &far_depth, 1, &DEPTH_RANGE);
+    });
+
+    bool queued;
+    try {
+        queued = state.upscaler.Upscale({
+            .color = {*color_view, *color, LIVE_COLOR_FORMAT, COLOR_RANGE, VK_IMAGE_ASPECT_COLOR_BIT},
+            .depth = {*depth_view, *depth, VK_FORMAT_D32_SFLOAT, DEPTH_RANGE, VK_IMAGE_ASPECT_DEPTH_BIT},
+            .motion_vectors = {*motion_view, *motion, MOTION_FORMAT, COLOR_RANGE,
+                               VK_IMAGE_ASPECT_COLOR_BIT},
+            .render_size = render_size,
+            .upscale_size = output_size,
+            .jitter = {0.0f, 0.0f},
+            .motion_vector_scale = {1.0f, 1.0f},
+            .reset = true,
+            .depth_inverted = false,
+            .hdr = false,
+        });
+    } catch (...) {
+        state.scheduler.Finish();
+        throw;
+    }
+    // Finish before releasing the private inputs. Leave last_frame empty to reset real history.
+    state.scheduler.Finish();
+    return queued && !state.upscaler.Failed();
+}
+
 bool OcarinaLiveDlss::EvaluationFailed() const {
     return impl->upscaler.Failed();
 }
@@ -653,6 +729,7 @@ void OcarinaLiveDlss::SaveSceneReference(VkImageView color) {
 }
 
 void OcarinaLiveDlss::Composite4k(VkImageView native_composite, u64 frame) {
+    VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::DlssPrepare};
     auto& state = *impl;
     if (state.composited_frame == frame) {
         return;

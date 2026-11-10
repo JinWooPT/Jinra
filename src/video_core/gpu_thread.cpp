@@ -24,6 +24,7 @@
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
 
@@ -55,6 +56,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
     thread = std::jthread([&](std::stop_token stop_token) {
         const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuCommand};
         Common::SetCurrentThreadName("GPU");
+        VideoCommon::GpuSplit::MarkGpuThread();
 #ifdef __linux__
         // The pending-channel polls below sleep 50 us; the default timer slack adds up to 50 more.
         prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
@@ -71,10 +73,14 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         // When a pending channel last moved or a command arrived (see the polling below).
         auto last_progress = std::chrono::steady_clock::now();
         namespace Profile = VideoCommon::Nx2Profile;
+        namespace Trace = VideoCommon::StutterTrace;
         auto& split = VideoCommon::GpuSplit::Get();
         while (!stop_token.stop_requested()) {
             Profile::Report();
             split.MaybeStart(system);
+            if (VideoCommon::g_acquire_counting) {
+                split.ReportAcquire();
+            }
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
                 {
@@ -88,6 +94,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // present waited ~17 ms a frame in Kokiri village, with 50 us ~1 ms. A channel
                     // still waiting after 2 s (menus, loading) goes back to 1 ms sleeps.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
+                    split.SettleIdleBack();
+                    Trace::Scope trace{Trace::Category::GuestPendingBackoff};
                     const auto waited = std::chrono::steady_clock::now() - last_progress;
                     if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();
@@ -100,6 +108,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 }
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
+                Trace::Scope trace{Trace::Category::GuestCommandIdle};
                 state.queue.PopWait(next, stop_token);
             }
             if (stop_token.stop_requested()) {
@@ -112,6 +121,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
                     Profile::Scope scope{Profile::Zone::Push};
+                    Trace::Scope trace{Trace::Category::GuestCommandList};
                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
@@ -142,6 +152,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             }
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
                 Profile::Scope scope{Profile::Zone::Push};
+                Trace::Scope trace{Trace::Category::GuestCommandList};
                 scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
             } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                 Profile::Scope scope{Profile::Zone::Tick};

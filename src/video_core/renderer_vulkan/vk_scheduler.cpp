@@ -26,6 +26,7 @@
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -262,6 +263,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
 
 void Scheduler::WaitWorker() {
     DispatchWork();
+    VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::WorkerWait};
 
     // Ensure the queue is drained.
     {

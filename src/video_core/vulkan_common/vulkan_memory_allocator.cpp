@@ -19,6 +19,7 @@
 #include "common/literals.h"
 #include "common/logging.h"
 #include <ranges>
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/vulkan_common/unbacked_fallback.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -225,6 +226,7 @@ vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedi
 
 VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
                                         vk::Image &image) const {
+    VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::GpuAllocate};
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
             // should fill before VMA takes another block.
@@ -425,6 +427,7 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const {
+    VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::GpuAllocate};
     // MESA will do memcpy() if not marked as host cached, so just force mark it for most buffers
     auto const anv_flags = (usage == MemoryUsage::Stream
         && device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
@@ -490,6 +493,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     if (min_alignment <= 1) {
         return CreateBuffer(ci, usage);
     }
+    VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::GpuAllocate};
     VkMemoryPropertyFlags anv_flags = 0;
     if (usage == MemoryUsage::Stream &&
         device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {

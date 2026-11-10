@@ -204,6 +204,48 @@ private:
 
     void QueueVulkanPipelineCacheFlush();
 
+    enum class RuntimePipelineResult { Translated, Prepared, Failed };
+
+    struct RuntimePipelineStats {
+        size_t translated{};
+        size_t prepared{};
+        size_t failed{};
+        std::chrono::steady_clock::duration gpu_time{};
+
+        [[nodiscard]] size_t Requests() const {
+            return translated + prepared + failed;
+        }
+    };
+
+    struct PipelineSessionStats {
+        u64 title_id{};
+        size_t preloaded_graphics{};
+        size_t preloaded_compute{};
+        size_t background_hits{};
+        std::chrono::steady_clock::duration preload_time{};
+        RuntimePipelineStats graphics;
+        RuntimePipelineStats compute;
+        size_t slow_logs{};
+        size_t reported_requests{};
+        std::chrono::steady_clock::duration reported_gpu_time{};
+        std::array<std::chrono::nanoseconds, 2> reported_spirv{};
+        std::chrono::nanoseconds draw_wait{};
+        std::chrono::steady_clock::time_point last_report{std::chrono::steady_clock::now()};
+    };
+
+    void ReportRuntimePipeline(RuntimePipelineStats& stats, const char* kind,
+                               RuntimePipelineResult result,
+                               std::chrono::steady_clock::time_point begin,
+                               const std::string& shaders);
+    void ReportPipelineSession() const;
+    void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point begin);
+    [[nodiscard]] std::array<std::chrono::nanoseconds, 2> RuntimeSpirvTime() const;
+
+    // Boot workers report through their load state. Only the GPU thread updates these runtime
+    // counts; graphics shader emission can also be measured by the pipeline workers.
+    PipelineSessionStats pipeline_session;
+    std::array<std::atomic<std::chrono::nanoseconds::rep>, 2> runtime_spirv_ns{};
+
     const Device& device;
     Scheduler& scheduler;
     DescriptorPool& descriptor_pool;
@@ -251,11 +293,13 @@ private:
     Shader::HostTranslateInfo host_info;
 
     std::filesystem::path pipeline_cache_filename;
+    std::filesystem::path graphics_repair_filename;
 
     /// Key hashes of the graphics pipelines in the disk cache. Only those a recent session used
     /// (used_pipelines) are built at boot; the rest are built when first needed, and not stored
     /// again. Each built pipeline holds driver memory (title 1: 6.5k cached, a quarter used).
     std::unordered_set<u64> disk_pipelines;
+    std::unordered_set<GraphicsPipelineCacheKey> incomplete_disk_graphics;
     std::unordered_map<u64, u8> used_pipelines; ///< Key hash -> sessions since it was last used
     std::unordered_set<const GraphicsPipeline*> used_this_session;
     std::filesystem::path used_pipelines_filename;

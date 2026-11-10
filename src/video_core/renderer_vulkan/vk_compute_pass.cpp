@@ -19,6 +19,7 @@
 #include "common/logging.h"
 #include "common/div_ceil.h"
 #include "common/vector_math.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/host_shaders/astc_decoder_comp_spv.h"
 #include "video_core/host_shaders/bc_encoder_comp_spv.h"
 #include "video_core/host_shaders/queries_prefix_scan_sum_comp_spv.h"
@@ -664,6 +665,7 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                                    size_t guest_size_bytes, const Target& target,
                                    const StagingBufferRef& map,
                                    std::span<const VideoCommon::SwizzleParameters> swizzles) {
+    VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::AstcPrepare};
     using namespace VideoCommon::Accelerated;
     const std::array<u32, 2> block_dims{
         VideoCore::Surface::DefaultBlockWidth(info.format),

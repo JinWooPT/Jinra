@@ -11,6 +11,9 @@
 #include <optional>
 #include <span>
 #include <utility>
+#ifdef _WIN32
+#include <stop_token>
+#endif
 #include "common/common_funcs.h"
 #include "common/common_types.h"
 
@@ -64,6 +67,13 @@ public:
     /// it needs RAM. The contents stay; using the pages brings them back.
     void HintCold(size_t physical_offset, size_t length,
                   std::optional<size_t> virtual_offset) const;
+
+#ifdef _WIN32
+    /// Evicts resident all-zero guest pages without changing the mappings or contents.
+    /// Returns guest view bytes in the snapshot and bytes accepted for trimming.
+    std::pair<size_t, size_t> TrimZeroPages(std::stop_token stop = {}) const;
+#endif
+
     /// Pages the kernel hands out (cleared or not).
     void MarkUsed(size_t physical_offset, size_t length);
 

@@ -14,6 +14,7 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_stutter_trace.h"
 
 namespace Tegra::Control {
 
@@ -56,6 +57,8 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
 }
 
 void Scheduler::ResumePending(GPU& gpu) {
+    namespace Trace = VideoCommon::StutterTrace;
+    Trace::Scope trace{Trace::Category::GuestPendingResume};
     // Running one channel can release the semaphore another waits for: retry until none moves.
     for (bool progress = true; progress;) {
         progress = false;

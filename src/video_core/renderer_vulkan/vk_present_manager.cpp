@@ -7,6 +7,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
+#include "video_core/nx2_stutter_trace.h"
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
@@ -170,7 +171,7 @@ PresentManager::PresentManager(const vk::Instance& instance_,
 PresentManager::~PresentManager() = default;
 
 Frame* PresentManager::GetRenderFrame() {
-
+    VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::FrameAcquire};
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
     free_cv.wait(lock, [this] { return !free_queue.empty(); });
@@ -397,6 +398,7 @@ void PresentManager::DiscardFrame(Frame* frame) {
 }
 
 void PresentManager::CopyToSwapchain(Frame* frame) {
+    VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::Present};
     bool requires_recreation = false;
 
     for (u32 attempt = 0; attempt < MAX_PRESENT_ATTEMPTS; ++attempt) {

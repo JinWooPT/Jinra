@@ -120,6 +120,10 @@ void* CreateHighResolutionTimer() {
     return CreateWaitableTimerExW(nullptr, nullptr, HighResolution, TIMER_ALL_ACCESS);
 }
 
+void* CreateStandardWaitTimer() {
+    return CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+}
+
 void* CreateWakeEvent() {
     return CreateEventW(nullptr, FALSE, FALSE, nullptr);
 }
@@ -136,13 +140,14 @@ bool WaitHighResolution(void* timer, void* wake_event, std::chrono::nanoseconds 
     }
     // Relative due time in 100 ns units (negative = relative).
     LARGE_INTEGER due{};
-    due.QuadPart = -(std::max<LONGLONG>)(1, static_cast<LONGLONG>(ns.count() / 100));
+    const auto units = std::chrono::ceil<std::chrono::duration<LONGLONG, std::ratio<1, 10000000>>>(ns);
+    due.QuadPart = -(std::max<LONGLONG>)(1, units.count());
     if (!SetWaitableTimerEx(static_cast<HANDLE>(timer), &due, 0, nullptr, nullptr, nullptr, 0)) {
         return false;
     }
     const HANDLE handles[2]{static_cast<HANDLE>(wake_event), static_cast<HANDLE>(timer)};
-    WaitForMultipleObjects(2, handles, FALSE, INFINITE);
-    return true;
+    const DWORD result = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+    return result == WAIT_OBJECT_0 || result == WAIT_OBJECT_0 + 1;
 }
 
 void CloseWaitHandle(void* handle) {

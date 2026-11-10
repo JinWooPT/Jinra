@@ -552,19 +552,24 @@ struct System::Impl {
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
 
-        // Reset per-game flags
-        Settings::values.use_squashed_iterated_blend = false;
-
-        is_powered_on = false;
-        exit_locked = false;
-        exit_requested = false;
-        if (gpu_core)
-            gpu_core->NotifyShutdown();
-
+        LOG_INFO(Core, "Shutdown: requesting guest services to stop");
         stop_event.request_stop();
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
+        // Guest cores can be waiting for GPU readback or a queued sync request.
+        LOG_INFO(Core, "Shutdown: suspending guest CPU threads");
         kernel.SuspendEmulation(true);
+
+        is_powered_on = false;
+        LOG_INFO(Core, "Shutdown: stopping GPU command threads");
+        if (gpu_core) {
+            gpu_core->NotifyShutdown();
+        }
+        Settings::values.use_squashed_iterated_blend = false;
+        exit_locked = false;
+        exit_requested = false;
+
+        LOG_INFO(Core, "Shutdown: closing guest services and processes");
         kernel.CloseServices();
         kernel.ShutdownCores();
         services.reset();
@@ -574,6 +579,7 @@ struct System::Impl {
         core_timing.ClearPendingEvents();
         app_loader.reset();
         audio_core.reset();
+        LOG_INFO(Core, "Shutdown: releasing the renderer and saving pipeline caches");
         gpu_core.reset();
         host1x_core.reset();
         perf_stats.reset();

@@ -37,6 +37,7 @@
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_stutter_trace.h"
 
 #if defined(__clang__) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE __attribute__((always_inline))
@@ -312,6 +313,7 @@ void GraphicsPipeline::WaitForDrawBuild() const {
     const auto begin = std::chrono::steady_clock::now();
     build->Wait(!worker_only_build);
     const auto elapsed = std::chrono::steady_clock::now() - begin;
+    VideoCommon::StutterTrace::Record(VideoCommon::StutterTrace::Category::DrawBuildWait, elapsed);
     hold_time_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
                            std::memory_order_relaxed);
 }

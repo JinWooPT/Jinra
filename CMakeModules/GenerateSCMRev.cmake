@@ -14,16 +14,16 @@ endfunction()
 
 get_timestamp(BUILD_DATE)
 
+get_filename_component(jinra_version_file "${CMAKE_CURRENT_LIST_DIR}/../VERSION" ABSOLUTE)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${jinra_version_file}")
+file(STRINGS "${jinra_version_file}" BUILD_VERSION LIMIT_COUNT 1)
+
 if (JINRA_BUILD_TAG MATCHES "^build-[0-9]+$")
-    set(BUILD_VERSION "${JINRA_BUILD_TAG}")
     set(IS_DEV_BUILD false)
 elseif (DEFINED GIT_RELEASE)
-    set(BUILD_VERSION "${GIT_TAG}")
     set(GIT_REFSPEC "${GIT_RELEASE}")
     set(IS_DEV_BUILD false)
 else()
-    string(SUBSTRING ${GIT_COMMIT} 0 10 BUILD_VERSION)
-    set(BUILD_VERSION "${BUILD_VERSION}-${GIT_REFSPEC}")
     set(IS_DEV_BUILD true)
 endif()
 

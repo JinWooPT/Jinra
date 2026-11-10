@@ -6,10 +6,15 @@
 
 #ifdef _WIN32
 
+#include <array>
+#include <cstring>
 #include <iterator>
+#include <limits>
+#include <new>
 #include "common/container/unordered_map.h"
 #include <boost/icl/separate_interval_set.hpp>
 #include <windows.h>
+#include <psapi.h>
 #include "common/dynamic_library.h"
 
 #else // ^^^ Windows ^^^ vvv POSIX vvv
@@ -1202,6 +1207,112 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
         hint(virtual_base + *virtual_offset);
     }
 }
+
+#ifdef _WIN32
+std::pair<size_t, size_t> HostMemory::TrimZeroPages(std::stop_token stop) const try {
+    if (backing_base == nullptr || stop.stop_requested()) {
+        return {};
+    }
+    const HANDLE process = GetCurrentProcess();
+    constexpr size_t MaxEntries = std::numeric_limits<DWORD>::max() / sizeof(ULONG_PTR);
+    constexpr size_t EntrySlack = 16384;
+    std::vector<ULONG_PTR> entries(1);
+    for (int attempt = 0;; ++attempt) {
+        if (K32QueryWorkingSet(process, entries.data(),
+                               static_cast<DWORD>(entries.size() * sizeof(ULONG_PTR)))) {
+            break;
+        }
+        if (GetLastError() != ERROR_BAD_LENGTH || attempt == 3 ||
+            entries[0] >= MaxEntries - EntrySlack || stop.stop_requested()) {
+            return {};
+        }
+        entries.resize(static_cast<size_t>(entries[0]) + EntrySlack + 1);
+    }
+
+    const auto backing_begin = reinterpret_cast<uintptr_t>(backing_base);
+    const auto view_begin = reinterpret_cast<uintptr_t>(impl ? impl->virtual_base : nullptr);
+    const size_t view_size = impl ? impl->virtual_size : 0;
+    const size_t count = (std::min)(static_cast<size_t>(entries[0]), entries.size() - 1);
+    // Keep just the guest mappings, in the snapshot buffer itself.
+    size_t guest_pages = 0;
+    for (size_t i = 1; i <= count; ++i) {
+        const uintptr_t page = entries[i] & ~uintptr_t{PageAlignment - 1};
+        if (page - backing_begin < backing_size ||
+            (view_begin != 0 && page - view_begin < view_size)) {
+            entries[guest_pages++] = page;
+        }
+    }
+    entries.resize(guest_pages);
+    std::ranges::sort(entries);
+
+    constexpr size_t BatchPages = 64;
+    static constexpr std::array<u8, PageAlignment> ZeroPage{};
+    std::vector<u8> sample(BatchPages * PageAlignment);
+    const auto read = [&](uintptr_t address, size_t pages) {
+        // The guest may write or remap these pages. Ask Windows for a copy into private memory
+        // instead of racing guest stores or dereferencing a view that became inaccessible.
+        const size_t bytes = pages * PageAlignment;
+        SIZE_T copied{};
+        return ReadProcessMemory(process, reinterpret_cast<const void*>(address), sample.data(),
+                                 bytes, &copied) && copied == bytes;
+    };
+    const auto is_zero = [&](size_t index) {
+        return std::memcmp(sample.data() + index * PageAlignment, ZeroPage.data(),
+                           PageAlignment) == 0;
+    };
+    const auto unlock = [](uintptr_t address, size_t bytes) {
+        return VirtualUnlock(reinterpret_cast<void*>(address), bytes) ||
+               GetLastError() == ERROR_NOT_LOCKED;
+    };
+    size_t trimmed = 0;
+    const auto trim = [&](size_t first, size_t end) {
+        // VirtualUnlock preserves contents, including writes made after the snapshot. A run may
+        // cross view boundaries; retry by page if Windows won't accept the whole range.
+        const size_t bytes = (end - first) * PageAlignment;
+        if (unlock(entries[first], bytes)) {
+            trimmed += bytes;
+        } else if (end - first > 1) {
+            for (size_t i = first; i < end; ++i) {
+                if (unlock(entries[i], PageAlignment)) {
+                    trimmed += PageAlignment;
+                }
+            }
+        }
+    };
+    for (size_t first = 0; first < guest_pages && !stop.stop_requested();) {
+        size_t end = first + 1;
+        while (end < guest_pages && end - first < BatchPages &&
+               entries[end] == entries[end - 1] + PageAlignment) {
+            ++end;
+        }
+        if (read(entries[first], end - first)) {
+            for (size_t i = first; i < end;) {
+                if (!is_zero(i - first)) {
+                    ++i;
+                    continue;
+                }
+                const size_t start = i++;
+                while (i < end && is_zero(i - first)) {
+                    ++i;
+                }
+                trim(start, i);
+            }
+        } else if (end - first > 1) {
+            // One page that became inaccessible need not exclude the rest of the batch.
+            for (size_t i = first; i < end; ++i) {
+                if (read(entries[i], 1) && is_zero(0)) {
+                    trim(i, i + 1);
+                }
+            }
+        }
+        first = end;
+    }
+    return {guest_pages * PageAlignment, trimmed};
+} catch (const std::bad_alloc&) {
+    // Trimming is opportunistic; skip this pass if its working-set snapshot won't fit.
+    return {};
+}
+#endif
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
     if (length == 0) {

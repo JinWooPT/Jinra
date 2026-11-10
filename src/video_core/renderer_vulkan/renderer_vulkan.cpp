@@ -22,6 +22,7 @@
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/present.h"
 #include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/present/util.h"
@@ -205,12 +206,14 @@ try
         .api = "Vulkan",
     };
     Report();
+    VideoCommon::StutterTrace::Start(Settings::GetCurrentProgramID());
 } catch (const vk::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Vulkan initialization failed with error: {}", exception.what());
     throw std::runtime_error{fmt::format("Vulkan initialization error {}", exception.what())};
 }
 
 RendererVulkan::~RendererVulkan() {
+    VideoCommon::StutterTrace::Stop();
     scheduler.RegisterOnSubmit([] {});
     void(device.GetLogical().WaitIdle());
 }
@@ -229,6 +232,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         return;
     }
 
+    VideoCommon::StutterTrace::OnFrame();
     RenderScreenshot(framebuffers);
     const auto acquiring = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};

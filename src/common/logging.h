@@ -138,6 +138,9 @@ void Initialize();
 
 void Start();
 
+/// Flushes buffered log entries so the current file can be exported.
+void Flush();
+
 /// Explicitly stops the logger thread and flushes the buffers
 void Stop();
 

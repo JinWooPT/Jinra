@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdlib>
 #include <cstdio>
 #include <span>
@@ -21,6 +22,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
@@ -53,7 +55,16 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
     , synced{false}
 {}
 
-DmaPusher::~DmaPusher() = default;
+DmaPusher::~DmaPusher() {
+    if (puller.HasPendingAcquire()) {
+        Nx2SemaphoreWaiters::Get().Remove(&puller);
+    }
+}
+
+bool DmaPusher::CanResumeAcquire() {
+    VideoCommon::Count(VideoCommon::g_acquire_stats.acquire_polls);
+    return puller.CanResumeAcquire(*this);
+}
 
 void DmaPusher::DispatchCalls() {
     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
@@ -198,8 +209,12 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
+        // Pages no GPU work has written yet may still get the list from compute or copy work
+        // queued before it. The GPU fetches the list after that work only past a host-level wait
+        // (NoteSync): later work is not ordered before the fetch, and the list does not wait for
+        // it (nor for draws, which write memory too; draw-written lists wait for the last sync).
+        if (!gpu_written && VideoCommon::GpuSplit::Get().Active()) {
+            VideoCommon::GpuSplit::Get().WaitForSyncedWriters();
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         }
@@ -473,6 +488,9 @@ void DmaPusher::CallMethod(u32 argument) {
         const bool writer = split.Active() &&
                             IsMemoryWriter(*subchannel, engine_type, dma_state.method);
         SCOPE_EXIT {
+            if (engine_type == Engines::EngineTypes::MaxwellDMA) {
+                NoteDmaSemaphore(dma_state.method, argument);
+            }
             if (writer) {
                 split.NoteWriter();
             }
@@ -531,6 +549,11 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         const bool writer = split.Active() &&
                             IsMemoryWriter(*subchannel, engine_type, dma_state.method);
         SCOPE_EXIT {
+            if (engine_type == Engines::EngineTypes::MaxwellDMA) {
+                for (u32 i = 0; i < num_methods; ++i) {
+                    NoteDmaSemaphore(dma_state.method, base_start[i]);
+                }
+            }
             if (writer) {
                 split.NoteWriter();
             }
@@ -563,6 +586,36 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         subchannel->ConsumeSink(system);
         subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
         subchannel->CallMultiMethod(system, dma_state.method, base_start, num_methods, dma_state.method_count);
+    }
+}
+
+void DmaPusher::NoteDmaSemaphore(u32 method, u32 argument) {
+    using Engines::MaxwellDMA;
+    if (method >= MaxwellDMA::SemaphoreMethod && method < MaxwellDMA::SemaphoreMethod + 3) {
+        dma_semaphore[method - MaxwellDMA::SemaphoreMethod] = argument;
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (method != MaxwellDMA::LaunchDmaMethod || !split.Active()) {
+        return;
+    }
+    // As MaxwellDMA::ReleaseSemaphore writes it.
+    using SemaphoreType = MaxwellDMA::LaunchDMA::SemaphoreType;
+    const auto type = std::bit_cast<MaxwellDMA::LaunchDMA>(argument).semaphore_type.Value();
+    if (type != SemaphoreType::RELEASE_ONE_WORD_SEMAPHORE &&
+        type != SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) {
+        return;
+    }
+    const GPUVAddr address = MaxwellDMA::PackedGPUVAddr{dma_semaphore[0], dma_semaphore[1]};
+    const auto device = memory_manager.GpuToCpuAddress(address);
+    if (!device) {
+        return;
+    }
+    split.NoteSemaphoreWrite(*device, dma_semaphore[2], true);
+    if (type == SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) {
+        split.NoteSemaphoreWrite(*device + 4, 0, true);
+        split.NoteSemaphoreWrite(*device + 8, 0, false);
+        split.NoteSemaphoreWrite(*device + 12, 0, false);
     }
 }
 
