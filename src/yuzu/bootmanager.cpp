@@ -184,6 +184,10 @@ bool GRenderWindow::IsShown() const {
 // and hence, do not support DPI scaling ("retina" displays).
 // The result will be a viewport that is smaller than the extent of the window.
 void GRenderWindow::OnFramebufferSizeChanged() {
+    const auto* display = screen();
+    const auto refresh_rate = display != nullptr ? display->refreshRate() : 0.0;
+    Settings::SetDisplayRefreshPeriodNs(
+        refresh_rate >= 20.0 ? static_cast<s64>(1'000'000'000.0 / refresh_rate) : 0);
     // Screen changes potentially incur a change in screen DPI, hence we should update the
     // framebuffer size
     const qreal pixel_ratio = windowPixelRatio();
@@ -943,6 +947,7 @@ void GRenderWindow::showEvent(QShowEvent* event) {
     // windowHandle() is not initialized until the Window is shown, so we connect it here.
     connect(windowHandle(), &QWindow::screenChanged, this, &GRenderWindow::OnFramebufferSizeChanged,
             Qt::UniqueConnection);
+    OnFramebufferSizeChanged();
 }
 
 bool GRenderWindow::eventFilter(QObject* object, QEvent* event) {

@@ -171,7 +171,15 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             (!high_priority_mode && must_download)) {
             return false;
         }
+        // Spread synchronous readbacks across frames while there is still room to allocate.
+        // This is the Fritchii EXP57 policy, limited to the render-target reuse path.
+        if (must_download && render_target_reuse && !out_of_memory &&
+            gc_download_frame == frame_tick) {
+            ++gc_downloads_deferred;
+            return false;
+        }
         if (must_download) {
+            gc_download_frame = frame_tick;
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
@@ -442,9 +450,9 @@ void TextureCache<P>::TickFrame() {
         if constexpr (requires { runtime.LogMemoryStatistics(); }) {
             runtime.LogMemoryStatistics();
         }
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha",
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded, {} downloads deferred), {} async decodes, ASTC {} opaque / {} alpha",
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
-                 gc_download_deletes,
+                 gc_download_deletes, gc_downloads_deferred,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
@@ -463,7 +471,8 @@ void TextureCache<P>::TickFrame() {
         created_shapes.clear();
         // The per-image and per-shape tallies only feed debug lines: skip them while those are off.
         debug_stats = Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
-        gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+        gc_deletes = gc_costly_deletes = gc_download_deletes = gc_downloads_deferred =
+            async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
     // An image that could not be made at all: the driver is out of memory whatever the counts
@@ -2086,12 +2095,9 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
             std::vector<BufferImageCopy> copies;
             for (size_t i = 0; i < layers.size(); ++i) {
                 const GPUVAddr layer_addr = image.gpu_addr + u64{layers[i]} * image.info.layer_stride;
-                Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead>
-                    swizzle_data(*gpu_memory, layer_addr, image.info.layer_stride,
-                                 &swizzle_data_buffer);
-                auto layer_copies =
-                    UnswizzleImage(*gpu_memory, layer_addr, layer_info, swizzle_data,
-                                   staging.mapped_span.subspan(i * layer_size, layer_size));
+                auto layer_copies = ReadAndUnswizzleImage(
+                    *gpu_memory, layer_addr, layer_info, image.info.layer_stride,
+                    swizzle_data_buffer, staging.mapped_span.subspan(i * layer_size, layer_size));
                 for (BufferImageCopy copy : layer_copies) {
                     copy.buffer_offset += i * layer_size;
                     copy.image_subresource.base_layer = static_cast<s32>(layers[i]);
@@ -2110,6 +2116,7 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
         const size_t tail = image.info.layer_stride - level_offset;
         auto staging = runtime.UploadStagingBuffer(tail * layers.size());
         for (size_t i = 0; i < layers.size(); ++i) {
+            StutterTrace::Scope read{StutterTrace::Category::TextureRead};
             gpu_memory->ReadBlock(image.gpu_addr + u64{layers[i]} * image.info.layer_stride +
                                       level_offset,
                                   staging.mapped_span.data() + i * tail, tail,
@@ -2139,6 +2146,7 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         const size_t level_offset = uploads[image.host_level_offset].buffer_offset;
         const size_t tail = image.info.layer_stride - level_offset;
         for (s32 layer = 0; layer < image.info.resources.layers; ++layer) {
+            StutterTrace::Scope read{StutterTrace::Category::TextureRead};
             gpu_memory->ReadBlock(gpu_addr + layer * image.info.layer_stride + level_offset,
                                   mapped_span.data() + layer * tail, tail,
                                   VideoCommon::CacheType::NoTextureCache);
@@ -2151,24 +2159,27 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         return;
     }
     if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
-        gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
-                              VideoCommon::CacheType::NoTextureCache);
+        {
+            StutterTrace::Scope read{StutterTrace::Category::TextureRead};
+            gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
+                                  VideoCommon::CacheType::NoTextureCache);
+        }
         const auto uploads = FullUploadSwizzles(image.info);
         runtime.AccelerateImageUpload(image, staging, uploads, 0, 0);
         return;
     }
 
-    Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(
-        *gpu_memory, gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
     if (True(image.flags & ImageFlagBits::Converted)) {
         unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
-        auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
-                                    unswizzle_data_buffer, &unswizzle_worker);
+        auto copies = ReadAndUnswizzleImage(*gpu_memory, gpu_addr, image.info, image.guest_size_bytes,
+                                            swizzle_data_buffer, unswizzle_data_buffer,
+                                            &unswizzle_worker);
         ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);
         image.UploadMemory(staging, copies);
     } else {
-        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
-                                          mapped_span, &unswizzle_worker);
+        const auto copies = ReadAndUnswizzleImage(*gpu_memory, gpu_addr, image.info,
+                                                  image.guest_size_bytes, swizzle_data_buffer,
+                                                  mapped_span, &unswizzle_worker);
         image.UploadMemory(staging, copies);
     }
 }
@@ -2233,7 +2244,9 @@ ImageId TextureCache<P>::FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_a
 template <class P>
 ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                    RelaxedOptions options) {
-    const std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
+    StutterTrace::Scope trace{StutterTrace::Category::TextureLookup};
+    const size_t guest_size = CalculateGuestSizeInBytes(info);
+    const std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, guest_size);
     if (!cpu_addr) {
         return ImageId{};
     }
@@ -2268,7 +2281,7 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
         }
         return false;
     };
-    ForEachImageInRegion(*cpu_addr, CalculateGuestSizeInBytes(info), lambda);
+    ForEachImageInRegion(*cpu_addr, guest_size, lambda);
     if (image_ids.size() <= 1) [[likely]] {
         return image_id;
     }
@@ -2394,8 +2407,9 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
     async_decodes.push_back(std::move(decode));
 
     std::vector<u8> local_unswizzle_data_buffer(image.unswizzled_size_bytes, 0);
-    Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(*gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
-    auto copies = UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, swizzle_data, local_unswizzle_data_buffer);
+    auto copies = ReadAndUnswizzleImage(*gpu_memory, image.gpu_addr, image.info,
+                                        image.guest_size_bytes, swizzle_data_buffer,
+                                        local_unswizzle_data_buffer);
     const size_t out_size = MapSizeBytes(image);
     if (False(image.flags & ImageFlagBits::ZeroFilled)) {
         // Until the decode lands (a second or more while title 1 streams ~40 textures a second)
@@ -2661,15 +2675,23 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             return;
         }
         join_overlaps_found.insert(overlap_id);
-        // A shifted single-layer target cannot start at another image's mip or layer.
-        if (new_info.type == ImageType::e2D && overlap.info.type == ImageType::e2D &&
+        const bool single_subresource =
             new_info.resources.levels == 1 && overlap.info.resources.levels == 1 &&
-            new_info.resources.layers == 1 && overlap.info.resources.layers == 1 &&
-            new_info.layer_stride == overlap.info.layer_stride && gpu_addr != overlap.gpu_addr) {
+            new_info.resources.layers == 1 && overlap.info.resources.layers == 1;
+        if (single_subresource && new_info.type == overlap.info.type &&
+            gpu_addr != overlap.gpu_addr) {
             const u64 distance = gpu_addr > overlap.gpu_addr ? gpu_addr - overlap.gpu_addr
                                                              : overlap.gpu_addr - gpu_addr;
-            const u64 stride = new_info.layer_stride ? new_info.layer_stride : size_bytes;
-            if (distance < stride && distance < size_bytes && distance < overlap.guest_size_bytes) {
+            const bool overlapping = distance < size_bytes && distance < overlap.guest_size_bytes;
+            const u64 layer_stride = new_info.layer_stride ? new_info.layer_stride : size_bytes;
+            const bool shifted_2d = new_info.type == ImageType::e2D &&
+                                    new_info.layer_stride == overlap.info.layer_stride &&
+                                    distance < layer_stride;
+            // A one-slice 3D image only has subresource offset zero, even with depth padding.
+            const bool shifted_volume = new_info.type == ImageType::e3D &&
+                                        new_info.size.depth == 1 && overlap.info.size.depth == 1 &&
+                                        distance <= (std::numeric_limits<u32>::max)();
+            if (overlapping && (shifted_2d || shifted_volume)) {
                 join_bad_overlap_ids.push_back(overlap_id);
                 return;
             }
@@ -2700,7 +2722,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             join_bad_overlap_ids.push_back(overlap_id);
         }
     };
-    ForEachImageInRegion(cpu_addr, size_bytes, region_check);
+    {
+        StutterTrace::Scope trace{StutterTrace::Category::TextureOverlap};
+        ForEachImageInRegion(cpu_addr, size_bytes, region_check);
+    }
     const auto region_check_gpu = [&](ImageId overlap_id, ImageBase& overlap) {
         if (!join_overlaps_found.contains(overlap_id)) {
             if (True(overlap.flags & ImageFlagBits::Remapped)) {
@@ -3564,6 +3589,7 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
 
 template <class P>
 void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
+    StutterTrace::Scope trace{StutterTrace::Category::TextureTrack};
     ASSERT(False(image.flags & ImageFlagBits::Tracked));
     image.flags |= ImageFlagBits::Tracked;
     if (False(image.flags & ImageFlagBits::Sparse)) {
@@ -4002,6 +4028,7 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
 
 template <class P>
 void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
+    StutterTrace::Scope trace{StutterTrace::Category::TextureAliases};
     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
     bool any_rescaled = True(image.flags & ImageFlagBits::Rescaled);

@@ -125,6 +125,9 @@ public:
     /// Returns the current CNTPCT tick value.
     u64 GetClockTicks() const;
 
+    /// Host-relative guest counter rate under the current CPU clock and sync settings.
+    [[nodiscard]] float GuestClockRateScale() const;
+
     /// Returns the current GPU tick value.
     u64 GetGPUTicks() const;
 

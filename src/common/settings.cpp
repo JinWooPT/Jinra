@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <version>
 #if __cpp_lib_chrono >= 201907L
 #include <chrono>
@@ -47,6 +48,7 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(OotRefreshCap, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -216,14 +218,32 @@ bool IsNceEnabled() {
     return is_nce_enabled;
 }
 
-static u64 current_program_id = 0;
+static std::atomic<u64> current_program_id{};
+static std::atomic_bool pin_ocarina_speed{};
+static std::atomic<s64> display_refresh_period_ns{};
 
-void SetCurrentProgramID(u64 program_id) {
-    current_program_id = program_id;
+void SetCurrentProgramID(u64 program_id, bool high_refresh_patched) {
+    pin_ocarina_speed.store(program_id == OcarinaOfTimeProgramId && !high_refresh_patched,
+                            std::memory_order_relaxed);
+    current_program_id.store(program_id, std::memory_order_relaxed);
 }
 
 u64 GetCurrentProgramID() {
-    return current_program_id;
+    return current_program_id.load(std::memory_order_relaxed);
+}
+
+void SetDisplayRefreshPeriodNs(s64 period) {
+    display_refresh_period_ns.store(period, std::memory_order_relaxed);
+}
+
+s64 OotHighRefreshPeriodNs() {
+    constexpr s64 Periods[] = {0, 1'000'000'000LL / 90, 1'000'000'000LL / 120,
+                              1'000'000'000LL / 144, 1'000'000'000LL / 165};
+    const auto cap = static_cast<size_t>(values.oot_high_refresh_cap.GetValue());
+    const s64 cap_period = cap < std::size(Periods) ? Periods[cap] : 0;
+    const s64 display_period = display_refresh_period_ns.load(std::memory_order_relaxed);
+    const s64 period = std::max(cap_period, display_period);
+    return period > 0 ? period : 1'000'000'000LL / 60;
 }
 
 static bool current_program_is_switch2 = false;
@@ -442,19 +462,30 @@ void SetConfiguringGlobal(bool is_global) {
     configuring_global = is_global;
 }
 
+bool SpeedLimitEnabled() {
+    // The stock game takes a fixed step at high FPS. Keep the console speed limited
+    // unless the game's variable step was installed successfully.
+    return values.use_speed_limit.GetValue() ||
+           pin_ocarina_speed.load(std::memory_order_relaxed);
+}
+
 u16 SpeedLimit() {
+    u16 limit = 100;
     switch (SpeedMode(values.current_speed_mode)) {
     case SpeedMode::Standard:
-        return values.speed_limit.GetValue();
+        limit = values.speed_limit.GetValue();
+        break;
     case SpeedMode::Turbo:
-        return values.turbo_speed_limit.GetValue();
+        limit = values.turbo_speed_limit.GetValue();
+        break;
     case SpeedMode::Slow:
-        return values.slow_speed_limit.GetValue();
+        limit = values.slow_speed_limit.GetValue();
+        break;
     default:
         UNIMPLEMENTED();
     }
 
-    return 100;
+    return limit == 0 && pin_ocarina_speed.load(std::memory_order_relaxed) ? 100 : limit;
 }
 
 void SetSpeedMode(const SpeedMode& mode) {

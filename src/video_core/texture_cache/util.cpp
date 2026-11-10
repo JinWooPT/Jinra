@@ -29,6 +29,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/decode_bc.h"
 #include "video_core/texture_cache/format_lookup_table.h"
@@ -852,34 +853,53 @@ bool IsValidEntry(const Tegra::MemoryManager& gpu_memory, const TICEntry& config
     return gpu_memory.GpuToCpuAddress(address, guest_size_bytes).has_value();
 }
 
+namespace {
+boost::container::small_vector<BufferImageCopy, 16> ReadLinearTexture(
+    Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
+    size_t guest_size_bytes, std::span<u8> output) {
+    StutterTrace::Scope read{StutterTrace::Category::TextureRead};
+    ASSERT(output.size_bytes() >= guest_size_bytes);
+    gpu_memory.ReadBlockUnsafe(gpu_addr, output.data(), guest_size_bytes);
+
+    const u32 bpp_log2 = BytesPerBlockLog2(info.format);
+    ASSERT((info.pitch >> bpp_log2) << bpp_log2 == info.pitch);
+    return {{
+        .buffer_offset = 0,
+        .buffer_size = guest_size_bytes,
+        .buffer_row_length = info.pitch * DefaultBlockWidth(info.format) >> bpp_log2,
+        .buffer_image_height = info.size.height,
+        .image_subresource = {.base_level = 0, .base_layer = 0, .num_layers = 1},
+        .image_offset = {0, 0, 0},
+        .image_extent = info.size,
+    }};
+}
+} // namespace
+
+boost::container::small_vector<BufferImageCopy, 16> ReadAndUnswizzleImage(
+    Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
+    size_t guest_size_bytes, Common::ScratchBuffer<u8>& scratch, std::span<u8> output,
+    Tegra::Texture::UnswizzleWorker* worker) {
+    if (info.type == ImageType::Linear) {
+        return ReadLinearTexture(gpu_memory, gpu_addr, info, guest_size_bytes, output);
+    }
+    const auto input = [&] {
+        StutterTrace::Scope read{StutterTrace::Category::TextureRead};
+        return Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead>{
+            gpu_memory, gpu_addr, guest_size_bytes, &scratch};
+    }();
+    return UnswizzleImage(gpu_memory, gpu_addr, info, input, output, worker);
+}
+
 boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const u8> input, std::span<u8> output, Tegra::Texture::UnswizzleWorker* worker) {
-    const size_t guest_size_bytes = input.size_bytes();
+    if (info.type == ImageType::Linear) {
+        return ReadLinearTexture(gpu_memory, gpu_addr, info, input.size_bytes(), output);
+    }
+    StutterTrace::Scope unswizzle{StutterTrace::Category::TextureUnswizzle};
     const u32 bpp_log2 = BytesPerBlockLog2(info.format);
     const Extent2D tile_size = DefaultBlockSize(info.format);
     const Extent3D size = info.size;
-
-    if (info.type == ImageType::Linear) {
-        ASSERT(output.size_bytes() >= guest_size_bytes);
-        gpu_memory.ReadBlockUnsafe(gpu_addr, output.data(), guest_size_bytes);
-
-        ASSERT((info.pitch >> bpp_log2) << bpp_log2 == info.pitch);
-        return {{
-            .buffer_offset = 0,
-            .buffer_size = guest_size_bytes,
-            .buffer_row_length = info.pitch * tile_size.width >> bpp_log2,
-            .buffer_image_height = size.height,
-            .image_subresource =
-                {
-                    .base_level = 0,
-                    .base_layer = 0,
-                    .num_layers = 1,
-                },
-            .image_offset = {0, 0, 0},
-            .image_extent = size,
-        }};
-    }
     const LevelInfo level_info = MakeLevelInfo(info);
     const s32 num_layers = info.resources.layers;
     const s32 num_levels = info.resources.levels;

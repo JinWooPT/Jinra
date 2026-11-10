@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+
+#define JINRA_VERSION_STRING "@JINRA_VERSION@"
+#define JINRA_WINDOWS_VERSION @JINRA_WINDOWS_VERSION@
+
+#ifndef RC_INVOKED
 namespace Jinra {
-inline constexpr char CurrentVersion[] = "@JINRA_VERSION@";
+inline constexpr char CurrentVersion[] = JINRA_VERSION_STRING;
 inline constexpr bool PgoBuild = @JINRA_IS_PGO@;
 }
+#endif

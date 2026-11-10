@@ -65,6 +65,7 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(OotRefreshCap, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -655,6 +656,11 @@ struct Values {
                                                 Category::RendererAdvanced};
 
     // Mario Kart World: select a fixed or dynamic in-game frame-rate mode (loader/nso.cpp).
+    SwitchableSetting<bool> oot_high_refresh{linkage, false, "oot_high_refresh",
+                                             Category::RendererAdvanced, Specialization::Paired};
+    SwitchableSetting<OotRefreshCap> oot_high_refresh_cap{
+        linkage, OotRefreshCap::Display, "oot_high_refresh_cap", Category::RendererAdvanced,
+        Specialization::Default, true, true, &oot_high_refresh};
     SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};
     SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
                                             Category::RendererAdvanced};
@@ -1039,7 +1045,10 @@ bool IsFastmemEnabled();
 void SetNceEnabled(bool is_64bit);
 bool IsNceEnabled();
 
-void SetCurrentProgramID(u64 program_id);
+inline constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+void SetCurrentProgramID(u64 program_id, bool oot_high_refresh_patched);
+void SetDisplayRefreshPeriodNs(s64 period);
+[[nodiscard]] s64 OotHighRefreshPeriodNs();
 u64 GetCurrentProgramID();
 
 // Whether the program being loaded is a Switch 2 one (set by the core before the GPU starts).
@@ -1059,6 +1068,7 @@ float Volume();
 
 // speed limit ops
 u16 SpeedLimit();
+[[nodiscard]] bool SpeedLimitEnabled();
 void SetSpeedMode(const SpeedMode &mode);
 void ToggleStandardMode();
 void ToggleTurboMode();

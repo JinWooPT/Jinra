@@ -56,6 +56,7 @@ namespace Vulkan {
 
 namespace PrecompiledKept {
 class Index;
+class PreparationLock;
 }
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
@@ -122,6 +123,8 @@ struct ComputePipelineCacheEntry {
     std::vector<u64> mapped_pointers;
     u32 rebuilds{};
     bool prepared{};
+    // Keep dispatching with the current pipeline while a replacement builds.
+    std::unique_ptr<ComputePipelineCacheEntry> pending;
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
                                        const ComputePipelineCacheKey& key) const;
@@ -238,12 +241,15 @@ private:
                                std::chrono::steady_clock::time_point begin,
                                const std::string& shaders);
     void ReportPipelineSession() const;
+    void SetPipelineSessionDirectory(const std::filesystem::path& directory);
     void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point begin);
     [[nodiscard]] std::array<std::chrono::nanoseconds, 2> RuntimeSpirvTime() const;
 
     // Boot workers report through their load state. Only the GPU thread updates these runtime
     // counts; graphics shader emission can also be measured by the pipeline workers.
     PipelineSessionStats pipeline_session;
+    std::unique_ptr<PrecompiledKept::PreparationLock> pipeline_session_lock;
+    std::filesystem::path pipeline_session_marker;
     std::array<std::atomic<std::chrono::nanoseconds::rep>, 2> runtime_spirv_ns{};
 
     const Device& device;

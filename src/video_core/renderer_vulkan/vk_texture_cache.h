@@ -134,6 +134,8 @@ public:
 
     bool CanReportMemoryUsage() const;
 
+    VkFormatFeatureFlags2 SampledViewFeatures(VkFormat format);
+
     /// Images that did not fit the device memory budget so far (see MemoryAllocator).
     u32 MemoryPressureEvents() const noexcept {
         return memory_allocator.MemoryPressureEvents();
@@ -290,6 +292,13 @@ public:
                          std::array<f32, 2> motion_scale);
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
+
+    /// The LOD bias Ocarina's FSR adds to mipmapped samplers this session (0 for other games or
+    /// upscalers), resolved on first use.
+    [[nodiscard]] f32 OcarinaFsrLodBias();
+    std::optional<f32> ocarina_fsr_lod_bias;
+    /// Set when the Ocarina upscaler fails during the session: samplers drop the bias again.
+    bool ocarina_fsr_failed{};
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
     std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
@@ -344,6 +353,7 @@ public:
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;
     std::array<std::vector<VkFormat>, VideoCore::Surface::MaxPixelFormat> view_formats;
+    ::Common::unordered_map<VkFormat, VkFormatFeatureFlags2> sampled_view_features;
 
     static constexpr size_t indexing_slots = 8 * sizeof(size_t);
     std::array<vk::Buffer, indexing_slots> buffers{};
@@ -786,9 +796,7 @@ public:
 
     [[nodiscard]] bool IsRescaled() const noexcept;
 
-    [[nodiscard]] VkImageView Handle(Shader::TextureType texture_type) const noexcept {
-        return *image_views[static_cast<size_t>(texture_type)];
-    }
+    [[nodiscard]] VkImageView Handle(Shader::TextureType texture_type) const;
 
     [[nodiscard]] VkImage ImageHandle() const noexcept {
         return image_handle;
@@ -842,11 +850,13 @@ private:
 
     [[nodiscard]] vk::ImageView MakeView(VkFormat vk_format, VkImageAspectFlags aspect_mask,
                                          std::optional<Shader::TextureType> texture_type = std::nullopt);
+    [[nodiscard]] vk::ImageView CreateTypedView(Shader::TextureType texture_type,
+                                               std::optional<u32> layers) const;
 
     const Device* device = nullptr;
     const SlotVector<Image>* slot_images = nullptr;
 
-    std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> image_views;
+    mutable std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> image_views;
     std::optional<StorageViews> storage_views;
     vk::ImageView typeless_storage_view;
     vk::ImageView depth_view;
@@ -859,11 +869,15 @@ private:
     u32 buffer_size = 0;
 
     VkComponentMapping swizzle_mapping{};
+    VkImageSubresourceRange typed_view_range{};
+    VkFormat typed_view_format{VK_FORMAT_UNDEFINED};
+    VkImageUsageFlags typed_view_usage{};
 
     bool supports_depth_comparison = false;
     bool requires_border_color_format = false;
     bool supports_minmax_filter = false;
     bool has_identity_swizzle = true;
+    bool deferred_2d_array = false;
 };
 
 class ImageAlloc : public VideoCommon::ImageAllocBase {};
@@ -914,6 +928,7 @@ private:
         bool drop_reduction;
         bool drop_custom_border;
         bool srgb_border;
+        bool use_ocarina_lod_bias;
         std::array<VkComponentSwizzle, 4> swizzle;
 
         bool operator==(const VariantKey&) const noexcept = default;
@@ -938,6 +953,7 @@ private:
     std::vector<Variant> variants;
 
     const Device* device_ptr{nullptr};
+    const bool* ocarina_fsr_failed{}; ///< TextureCacheRuntime::ocarina_fsr_failed
     Tegra::Texture::TSCEntry descriptor{};
     VkSamplerCreateInfo base_ci{};
     VkSamplerReductionModeEXT reduction_mode{VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT};
@@ -948,6 +964,7 @@ private:
     bool has_added_anisotropy{};
     bool has_linear_filtering{};
     bool has_depth_comparison{};
+    f32 added_lod_bias{}; ///< Ocarina FSR part of base_ci.mipLodBias
     bool has_minmax_reduction{};
     bool has_custom_border_colors{};
     bool has_srgb_border_color{};

@@ -62,12 +62,99 @@ function(jinra_shader_cache_fingerprint output)
     string(APPEND material "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}\n")
     string(APPEND material "${flags}\n${encoder_hash}\n")
 
+    # Approved v5.6 host-only revisions. These changes affect scheduling, diagnostics,
+    # texture data, media decoding, or the host upscaler. Guest SPIR-V and serialized shader metadata
+    # remain compatible. A later edit must be audited before it can reuse an alias.
+    foreach(revision IN ITEMS
+        "common/settings_enums.h|3cdda3cdb062fd83baca1700ba8cbe78bbde06e4e26466ccfdd2e3428c926547|a40c27b266c8b8f563930ed6ba38bc2702d3be4429d76ca3732b74ce19cd318b"
+        "video_core/fence_manager.h|ff2ca179e145408d33af7d059a52e10488fef7d6d91414dd17ce2720e25262dc|73afee0af5bfc2e96671cb6393dff923761956b0cba2a8aa7465a481730ec715"
+        "video_core/fsr.h|c5644cd85ec353a1d978bc3f4499f7dc2a412cda84f865d840722805cee5d47e|c33fe76543ceb29dcb82aef55faf23e445ed1bd7f4beeca5e50ac0e1d413a8f5"
+        "video_core/ocarina_upscale.h|43f57b8834800c9a67a891abf2e561f456e94f0ebad6031ef05a9d92d9ddf4ac|host-only"
+        "video_core/host1x/ffmpeg.cpp|8ae8a19a58abb4eede89a28f3ad7d0922bf12e46dc235f4d0389c4bcc0347807|3aef40a13fcd6472a01af9a178421a542235b27888506ff35bf238cf422ed6d8"
+        "video_core/host1x/ffmpeg.h|cb896c4975b477837c3547da00b62d4375d05090aaca1b75b8a1d6d79f6f6f2d|73495ec4e721672344538869f4ca4cbad60fb6ecf088210b24de6b75a1249f7c"
+        "video_core/host1x/nx2_video_decoder.cpp|0591ec18a685736f8393adcf369481286d26c4f37525869ec214a47ecf82a62d|42923af302c71f763f6e3ae8bac588cb15dd8098cae10c803c0b036481dca861"
+        "video_core/host1x/nx2_video_decoder.h|9284c06c78441ad9806e20466a7b5483c0e4d1c966850461fe4fb8b3d412a0f7|097d53bd7533a723b8b599bffe23b47b6fecddd618225781f78d4fbb1ba6c8fe"
+        "video_core/host_shaders/CMakeLists.txt|a41a1c7d1ada2e7bb8ed4e2a94a1d327b13b61bfd45f06b6ccbd339e449a057b|ca221cb87a101803bb79c4fa32b3e3699d5426806d6f795bf9f0a4fe4cb9d4f6"
+        "video_core/nx2_stutter_trace.cpp|4640b167badc651219f356b1970b9f2133c06acbfc862eedbfc30b2f91d170ea|e2eed9c78cc6314985ee2b8efb3cbefc6e037414c4539f5e2732e4a17c3b811e"
+        "video_core/nx2_stutter_trace.h|c425e2249608e52158a94df8b4b4f7e358071adb42a1b0fbe085182979749f0a|df4e864f896d1866748e94f7b7460ad248a8f78a4b88ca666e62a35b89c1f1a9"
+        "video_core/query_cache/query_cache.h|f7efdfb1bac1423315782d95bbc3a55eab1cf154253af79c525dbba8620b3566|6aa2239e04c73cd958f8fc522f26a8e2ae1bf3e1cc79de5e4c1d63ab82f701ed"
+        "video_core/query_cache/query_stream.h|11ab9efb8a1bb20cff7cbdeaf4b843e75a1d2674140a44c8dda2fd030e380133|643a6d2530bcc15898757664117e7e98b351a43866550c39d6c103d837f41101"
+        "video_core/renderer_vulkan/vk_compute_pipeline.cpp|1e8fb8ce8acddd2a17a690f0f09efcdf3323b93544b33dd2ca5015aa3220c51e|8b81925264b808ef53ad8dd762a9d779d681b9722eefd385acc62599141d05cc"
+        "video_core/renderer_vulkan/vk_compute_pipeline.h|09f88094a481975078f764a50b8ece8d022ec08b0f7196eb450eae5196d47081|ba480736fef98dfb574fae9021dbf85d756ce5487093e6505d0c7ede83ce1645"
+        "video_core/renderer_vulkan/vk_fsr3_upscaler.cpp|316bc78d0e81de402449f112bab38b6d82b3aa98b46e7c7499851a1872c4906b|fedef10d36d216bf0b53796e2cfc7f1c350282a84b21b970c11403470cf46d3c"
+        "video_core/renderer_vulkan/vk_fsr3_upscaler.h|ba63788b8991828655d55f33c69b13c37d7e7dfd778e6da01639b41d05b7c7dc|37e8d933df4b146d8ab6c45bd550823ac4aeb0f0f673058ba958e6faaf7438ab"
+        "video_core/renderer_vulkan/vk_graphics_pipeline.cpp|18909af2b904f33781e6ef1e25b2d7780a13b25866e3c530b2ed224cb80b6e11|0d61198c79c9e48f1953d97acf0160463e760ccf1a2aab5075186518eb520d0b"
+        "video_core/renderer_vulkan/vk_master_semaphore.cpp|46302418123cd6151995a188acc86ca9e35366df00ee7d3a7d1363ba9d75b137|fe7fd37c5dfc58a8f7aeeadadb8506ba19f1365d50bfc8cc4850e60617785d84"
+        "video_core/renderer_vulkan/vk_master_semaphore.h|855fe478fc4ddcfaa58b03a805948865329bf3e323197bc601c933f5fe776550|67b9d6c03659569c53a10ff439070835c8093b0efd8495c1a30e0d82cce6e1d8"
+        "video_core/renderer_vulkan/vk_ocarina_camera_motion.cpp|55c4230b23d3ccc595e81d90d9b19411198dd31cb42823169b42e7c0ebfd2fd5|b9a9bb2f513cac1ae882c4f2422137a8fef79900d2e064f448cf6599b457f3ad"
+        "video_core/renderer_vulkan/vk_ocarina_camera_motion.h|59d9a1edd91642c08726ef4c10bd2d0a973f60a87f4022a181f8a93dad4cb679|bdc89bd4d011992f408787113cf2000125e1af19bd3bba9a1058f9fbfece1f68"
+        "video_core/renderer_vulkan/vk_pipeline_cache.cpp|d39a0283350ecca03e121d6bc70015628b8c666cb4a595ebf13ed1c8a5b77b81|a6cbf6d6a2ac16b260eca1ceb6d7d8d937385f8aaeb6b24c5c4a4edbc650f935"
+        "video_core/renderer_vulkan/vk_pipeline_cache.h|28ab108633ae2d327d6ec40ca1de35bcbddf49bb4da9ab98d47c047e9b31fbe6|99bd8ede10e7c7463d50dba66b84468a52a7dcfefa4e9d3c2c854cdf5a943144"
+        "video_core/renderer_vulkan/vk_query_cache.cpp|a5cd049e0cd366e9d4057566a36eff9ec9311ba330fb1dbf6fe46ad0fb83e067|951dc1416cf6cc532181defb6f7690095d29525b8cef788f324a6bc251d361f5"
+        "video_core/renderer_vulkan/vk_rasterizer.cpp|aa020eb3032e480193e0c778907809e0211c3f7df90c29f36f82fdec0c41c2cd|cf917668761d4d3aa2ed283445383b727ffb01d2ad77c55a491afb09445e34c1"
+        "video_core/renderer_vulkan/vk_rasterizer.h|6928fdab295c3d862a693ba21c140ba2f40cbb866d8afd4ddd292a5b0d27c5e4|ea7d69c2b314012f18ede593723a9a9912ae24106fd602229800042ac42a5f97"
+        "video_core/renderer_vulkan/vk_scheduler.cpp|1d4c895019166543c8b3dbb817bb0c080a077425717d3719bde8f3acb6a5e403|1f9674ed47c29023dfa30c95897bb070d54d1cba757b1285ea5467a376897cc7"
+        "video_core/renderer_vulkan/vk_scheduler.h|189fc1292cb37fdf43d4648cc7bd31cd32359c8c230ce1ef647c1500907861e1|0bfa34aac7f9e2c1866805328fe2ef267590034bd2cb4a0f66a2ab2bedf6024b"
+        "video_core/renderer_vulkan/vk_texture_cache.cpp|a8847e21494de8f5bbb52215ec0d2eb397c303d3c109716e85345e4488442f18|d1ab07480f59cdb93cd18533c4648d5fefccf44cc250b1415e9406441f5552d5"
+        "video_core/renderer_vulkan/vk_texture_cache.h|cc404b1985f058c3729e110e7bfb3f613ee5ac367a8e216e88faf0dac8bf6e76|2cb80f9eef4c3a6d42ad76ed17c62133b620487785bdafd0fb8f835bc780aa62"
+        "video_core/texture_cache/texture_cache_base.h|7f0e6b5c0bf20d5aa979e3051c686ebd57627c3eb46f74efce74e2b8a3802226|5fd80df8855357db728137684df0f90c64f03a9b0a829fdcf81b65db8ae9d236"
+        "video_core/texture_cache/texture_cache.h|0bc60211a2e3c3979d4ba6d81d33f21ddb4385de74fe46fded89651768cb4ed9|d88c9b0e9cefd85d2f644b69fded3e9e22b0c05a923bf0ba2b4fd8ff309279b3"
+        "video_core/texture_cache/util.cpp|93196060f065a2918eb7e3092938e4771fb6eac32ce21b323c0d3ca7ca67ab1c|e0f2e9f060a2fb1619a5571f21376dc250b33bc60cefadccee3c7325d8f763ad"
+        "video_core/texture_cache/util.h|bea391760e175c2ca3e214f8368c39e0b9431924710de0fff04a7d06566b7b11|2c649b2e64e8399fa5735313e421de809b437dd3296a01e38da6a85f08878148"
+        "video_core/textures/decoders.cpp|b03643f4f27041043bd806dd7accc61a467d96bb30b033075d3384d9f4153505|95967fe67c3f2a41da6b39091232cf596e7046445dd47858810bbe319274e83b"
+    )
+        string(REPLACE "|" ";" revision "${revision}")
+        list(GET revision 0 relative_path)
+        list(GET revision 1 revision_hash)
+        list(GET revision 2 old_hash)
+        set("host_revision_path_${revision_hash}" "${source_root}/${relative_path}")
+        set("host_revision_base_${revision_hash}" "${old_hash}")
+    endforeach()
+
     set(hashes)
     foreach(input IN LISTS inputs)
         # Match files across checkout line-ending policies.
         file(READ "${input}" contents)
         string(REPLACE "\r\n" "\n" contents "${contents}")
         string(SHA256 digest "${contents}")
+        if(input STREQUAL "${host_revision_path_${digest}}")
+            if(host_revision_base_${digest} STREQUAL "host-only")
+                continue()
+            endif()
+            set(digest "${host_revision_base_${digest}}")
+        endif()
+        # These revisions change compute replacement timing and mesh feature selection only.
+        # The preparation key separately records when the device forces the mesh fallback.
+        if(input STREQUAL "${source_root}/video_core/renderer_vulkan/vk_pipeline_cache.cpp"
+           AND digest STREQUAL "a6cbf6d6a2ac16b260eca1ceb6d7d8d937385f8aaeb6b24c5c4a4edbc650f935")
+            set(digest "4f70f2b7abf0217ffe4c89d678a0455365178e0f7e6de6ecfea91be613d98e02")
+        elseif(input STREQUAL "${source_root}/video_core/renderer_vulkan/vk_pipeline_cache.h"
+           AND digest STREQUAL "99bd8ede10e7c7463d50dba66b84468a52a7dcfefa4e9d3c2c854cdf5a943144")
+            set(digest "56aefa6cd413bdab06f8f7704d18c98d79ecdabdfaf195fa6554e009ef355c88")
+        elseif(input STREQUAL "${source_root}/video_core/vulkan_common/vulkan_device.cpp"
+           AND digest STREQUAL "99ea69fb8fcc32036ec9f2a6a13789f0bbd04389e0a6848d92d220eacadb2f09")
+            set(digest "ce094864f4deb450e4c2d55b9881ee681ab431a410d2d87bf4db7880daf7a4eb")
+        elseif(input STREQUAL "${source_root}/video_core/vulkan_common/vulkan_device.h"
+           AND digest STREQUAL "14e8ebcb63f70872017e76f54ca7e78f5d6fb042f7d09c6bd78f48f897d7c451")
+            set(digest "261fe5356579b6127ee1ed6542ffc72f884d2d4003fe7c6105623975b098e67a")
+        endif()
+        # High-refresh settings and presentation pacing do not change translated shaders.
+        if(input STREQUAL "${source_root}/common/settings.cpp"
+           AND digest STREQUAL "54a53edb3623edea25bd9a311c80dbc56e55dbaabbdfd9f1c484efcccda8baa2")
+            set(digest "80fce58b9ccce318a3d315e6dcbdcd64937ea4a594836391b2e7948e93142430")
+        elseif(input STREQUAL "${source_root}/common/settings.h"
+           AND digest STREQUAL "95df9689e315805ceb2d76b2ea51b170b4cca57b18dcc2b9ae6df3f981ad057d")
+            set(digest "d61a557e4ddf760bf3202e28f93f2b91eff34e38a3fb5629e7f69a30a430a4c7")
+        elseif(input STREQUAL "${source_root}/common/settings_enums.h"
+           AND digest STREQUAL "a40c27b266c8b8f563930ed6ba38bc2702d3be4429d76ca3732b74ce19cd318b")
+            set(digest "2e1eee18484484b31a74fa445ed451ae626fc91ba6404ab37dc6fcd8b59b8fa9")
+        elseif(input STREQUAL "${source_root}/video_core/renderer_vulkan/vk_scheduler.h"
+           AND digest STREQUAL "0bfa34aac7f9e2c1866805328fe2ef267590034bd2cb4a0f66a2ab2bedf6024b")
+            set(digest "641888fc57e8c6522a1bdaac06ee103901d9b669a451d62e8634597e233cabfd")
+        elseif(input STREQUAL "${source_root}/video_core/renderer_vulkan/vk_swapchain.cpp"
+           AND digest STREQUAL "64ffeb4d6c7d6990cc12ade6c23c018548b79ee075fbc05e333ebb66ff3b6819")
+            set(digest "fdbcfbffcfd9d91ffeb18140426dbc38dbd71e642ecf59d87f32a5feb188ed21")
+        endif()
         # The early DLSS pass uses only host-owned images and existing host SPIR-V.
         if(input STREQUAL "${source_root}/video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
            AND digest STREQUAL "bdc89bd4d011992f408787113cf2000125e1af19bd3bba9a1058f9fbfece1f68")

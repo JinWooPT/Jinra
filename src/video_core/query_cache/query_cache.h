@@ -290,7 +290,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     // Written later: the buffer cache keeps GPU writes over it until then (NoteReportPending).
     const bool report_noted =
         !immediate && impl->rasterizer.NoteReportPending(cpu_addr, report_size);
-    std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
+    // An immediate payload report never queues a callback.
+    const auto operation = [this, is_synced, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp, cpu_addr, addr,
                                      asid = gpu_memory->GetID(), counter_type, mirrored,
                                      report_size, report_noted] {
@@ -359,9 +360,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         if (!is_synced) [[likely]] {
             impl->pending_unregister.push_back(query_location);
         }
-    });
+    };
     if (is_fence) {
-        impl->rasterizer.SignalFence(std::move(operation));
+        impl->rasterizer.SignalFence(operation);
     } else {
         if (immediate) {
             FinishReads(cpu_addr, has_timestamp ? 16 : 4);
@@ -393,7 +394,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             streamer->Free(new_query_id);
             return;
         }
-        impl->rasterizer.SyncOperation(std::move(operation));
+        impl->rasterizer.SyncOperation(operation);
     }
     if (is_synced) {
         streamer->Free(new_query_id);

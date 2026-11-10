@@ -26,6 +26,7 @@
 #include "shader_recompiler/byte_addressed_image.h"
 #include "shader_recompiler/exception.h"
 
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
 #include "video_core/render_trace.h"
@@ -36,6 +37,7 @@
 #include "video_core/renderer_vulkan/framebuffer_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -1298,11 +1300,24 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
     }
 }
 
+VkFormatFeatureFlags2 TextureCacheRuntime::SampledViewFeatures(VkFormat format) {
+    // View creation holds the texture cache lock. These are immutable physical-device properties.
+    const auto [entry, inserted] = sampled_view_features.try_emplace(format);
+    if (inserted) {
+        entry->second = device.ApiVersion() >= VK_API_VERSION_1_3
+                            ? device.GetPhysical().GetFormatProperties3(format).optimalTilingFeatures
+                            : device.GetPhysical().GetFormatProperties(format).optimalTilingFeatures |
+                                  VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
+    }
+    return entry->second;
+}
+
 void TextureCacheRuntime::Finish() {
     scheduler.Finish();
 }
 
 StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {
+    VideoCommon::StutterTrace::Scope staging{VideoCommon::StutterTrace::Category::TextureStaging};
     return staging_buffer_pool.Request(size, MemoryUsage::Upload, deferred);
 }
 
@@ -3256,6 +3271,7 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
 }
 
 void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImageCopy> copies) {
+    VideoCommon::StutterTrace::Scope record{VideoCommon::StutterTrace::Category::TextureRecord};
     UploadMemory(map.buffer, map.offset, copies);
 }
 
@@ -4341,20 +4357,9 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
                                  ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK
                                  : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
     }
-    if (device->ApiVersion() >= VK_API_VERSION_1_3) {
-        const VkFormatProperties3 properties3 =
-            device->GetPhysical().GetFormatProperties3(format_info.format);
-        supports_depth_comparison =
-            (properties3.optimalTilingFeatures &
-             VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT) != 0;
-        supports_minmax_filter = (properties3.optimalTilingFeatures &
-                                  VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT) != 0;
-    } else {
-        supports_depth_comparison = true;
-        supports_minmax_filter =
-            (device->GetPhysical().GetFormatProperties(format_info.format).optimalTilingFeatures &
-             VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT) != 0;
-    }
+    const auto features = runtime.SampledViewFeatures(format_info.format);
+    supports_depth_comparison = (features & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT) != 0;
+    supports_minmax_filter = (features & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT) != 0;
     if (VideoCommon::RenderTrace::Enabled() &&
         (aspect_mask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0) {
         LOG_DEBUG(Render_Vulkan,
@@ -4376,44 +4381,11 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
     };
     has_identity_swizzle = swizzle[0] == SwizzleSource::R && swizzle[1] == SwizzleSource::G &&
                            swizzle[2] == SwizzleSource::B && swizzle[3] == SwizzleSource::A;
-    const VkImageUsageFlags requested_view_usage = ImageUsageFlags(format_info, format);
-    const VkImageUsageFlags image_usage = image.UsageFlags();
-    const VkImageUsageFlags clamped_view_usage = requested_view_usage & image_usage;
-    const VkImageViewUsageCreateInfo image_view_usage{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-        .pNext = nullptr,
-        .usage = clamped_view_usage,
-    };
-    const VkImageViewASTCDecodeModeEXT astc_decode_mode{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_ASTC_DECODE_MODE_EXT,
-        .pNext = &image_view_usage,
-        .decodeMode = VK_FORMAT_R8G8B8A8_UNORM,
-    };
-    const void* view_next = &image_view_usage;
-    if (device->IsExtAstcDecodeModeSupported() && IsLdrAstcFormat(format_info.format)) {
-        view_next = &astc_decode_mode;
-    }
-    const VkImageViewCreateInfo create_info{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .pNext = view_next,
-        .flags = 0,
-        .image = image.Handle(),
-        .viewType = VkImageViewType{},
-        .format = format_info.format,
-        .components = swizzle_mapping,
-        .subresourceRange = MakeSubresourceRange(aspect_mask, HostRange(image, info.range)),
-    };
+    typed_view_format = format_info.format;
+    typed_view_usage = ImageUsageFlags(format_info, format) & image.UsageFlags();
+    typed_view_range = MakeSubresourceRange(aspect_mask, HostRange(image, info.range));
     const auto create = [&](TextureType tex_type, std::optional<u32> num_layers) {
-        VkImageViewCreateInfo ci{create_info};
-        ci.viewType = ImageViewType(tex_type);
-        if (num_layers) {
-            ci.subresourceRange.layerCount = *num_layers;
-        }
-        vk::ImageView handle = device->GetLogical().CreateImageView(ci);
-        if (device->HasDebuggingToolAttached()) {
-            handle.SetObjectNameEXT(VideoCommon::Name(*this, gpu_addr).c_str());
-        }
-        image_views[static_cast<size_t>(tex_type)] = std::move(handle);
+        image_views[static_cast<size_t>(tex_type)] = CreateTypedView(tex_type, num_layers);
     };
     switch (info.type) {
     case VideoCommon::ImageViewType::e1D:
@@ -4426,8 +4398,15 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
     case VideoCommon::ImageViewType::e2DArray:
     case VideoCommon::ImageViewType::Rect:
         create(TextureType::Color2D, 1);
-        create(TextureType::ColorArray2D, std::nullopt);
-        render_target = Handle(Shader::TextureType::ColorArray2D);
+        if (info.type != VideoCommon::ImageViewType::e2DArray && typed_view_range.layerCount == 1) {
+            // A single-layer attachment can use the same 2D view. A sampler2DArray still gets
+            // an array view when requested by a shader, under the texture cache lock.
+            render_target = Handle(TextureType::Color2D);
+            deferred_2d_array = true;
+        } else {
+            create(TextureType::ColorArray2D, std::nullopt);
+            render_target = Handle(TextureType::ColorArray2D);
+        }
         // Native shaders can sample six layers of a 2D array as a cube (point-light shadows).
         // Adapted from Duck912/eden-fefw a1b23ac3.
         if (info.type == VideoCommon::ImageViewType::e2DArray && info.range.extent.layers >= 6 &&
@@ -4451,6 +4430,46 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
         ASSERT(false);
         break;
     }
+}
+
+vk::ImageView ImageView::CreateTypedView(Shader::TextureType texture_type,
+                                         std::optional<u32> layers) const {
+    VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::ImageViewCreate};
+    const VkImageViewUsageCreateInfo usage{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+        .usage = typed_view_usage,
+    };
+    const VkImageViewASTCDecodeModeEXT astc{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_ASTC_DECODE_MODE_EXT,
+        .pNext = &usage,
+        .decodeMode = VK_FORMAT_R8G8B8A8_UNORM,
+    };
+    const bool astc_decode = device->IsExtAstcDecodeModeSupported() && IsLdrAstcFormat(typed_view_format);
+    VkImageSubresourceRange view_range = typed_view_range;
+    if (layers) {
+        view_range.layerCount = *layers;
+    }
+    auto view = device->GetLogical().CreateImageView(VkImageViewCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext = astc_decode ? static_cast<const void*>(&astc) : &usage,
+        .image = image_handle,
+        .viewType = ImageViewType(texture_type),
+        .format = typed_view_format,
+        .components = swizzle_mapping,
+        .subresourceRange = view_range,
+    });
+    if (device->HasDebuggingToolAttached()) {
+        view.SetObjectNameEXT(VideoCommon::Name(*this, gpu_addr).c_str());
+    }
+    return view;
+}
+
+VkImageView ImageView::Handle(Shader::TextureType texture_type) const {
+    auto& view = image_views[static_cast<size_t>(texture_type)];
+    if (texture_type == Shader::TextureType::ColorArray2D && deferred_2d_array && !view) [[unlikely]] {
+        view = CreateTypedView(texture_type, std::nullopt);
+    }
+    return *view;
 }
 
 ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewInfo& info, ImageId image_id_, Image& image, const SlotVector<Image>& slot_imgs)
@@ -4632,6 +4651,15 @@ void CustomBorderColorBudget::Release() noexcept {
     held = 0;
 }
 
+f32 TextureCacheRuntime::OcarinaFsrLodBias() {
+    if (!ocarina_fsr_lod_bias) {
+        const bool ocarina = Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
+        ocarina_fsr_lod_bias =
+            ocarina ? VideoCommon::OcarinaFsrLodBias(ResolveOcarinaUpscaler(device)) : 0.0f;
+    }
+    return *ocarina_fsr_lod_bias;
+}
+
 Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& tsc) {
     const auto& device = runtime.device;
     device_ptr = &device;
@@ -4691,6 +4719,12 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
             max_lod = 0.25f;
         }
     }
+    ocarina_fsr_failed = &runtime.ocarina_fsr_failed;
+    if (const f32 fsr_lod_bias = runtime.OcarinaFsrLodBias();
+        fsr_lod_bias != 0.0f && tsc.mipmap_filter != TextureMipmapFilter::None) {
+        const f32 lod_bias = tsc.LodBias();
+        added_lod_bias = std::clamp(lod_bias + fsr_lod_bias, -15.0f, 15.0f) - lod_bias;
+    }
     base_ci = VkSamplerCreateInfo{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = nullptr,
@@ -4722,6 +4756,13 @@ Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth)
     key.drop_reduction = has_minmax_reduction && !image_view.SupportsMinmaxFilter();
     key.drop_custom_border = has_custom_border_colors && image_view.RequiresBorderColorFormat();
     key.srgb_border = has_srgb_border_color && IsPixelFormatSRGB(image_view.format);
+    if (added_lod_bias != 0.0f) {
+        const Image* const image = image_view.BackingImage();
+        key.use_ocarina_lod_bias =
+            image != nullptr && VideoCommon::KeepOcarinaFsrLodBias(
+                Settings::IsDockedMode(), *ocarina_fsr_failed,
+                True(image->flags & ImageFlagBits::GpuModified));
+    }
     if (needs_swizzle_mapping && !key.drop_custom_border && !image_view.HasIdentitySwizzle()) {
         const VkComponentMapping& mapping = image_view.Swizzle();
         key.swizzle = {mapping.r, mapping.g, mapping.b, mapping.a};
@@ -4785,6 +4826,9 @@ VkSampler Sampler::Emplace(VariantKey key) {
     }
 
     VkSamplerCreateInfo create_info = base_ci;
+    if (key.use_ocarina_lod_bias) {
+        create_info.mipLodBias += added_lod_bias;
+    }
     create_info.pNext = chain;
     if (key.force_nearest) {
         create_info.magFilter = VK_FILTER_NEAREST;

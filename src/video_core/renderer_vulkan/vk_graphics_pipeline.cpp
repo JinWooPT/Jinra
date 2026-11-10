@@ -639,6 +639,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     ASSERT(samplers.size() == num_textures);
     {
         Profile::Scope scope{Profile::Zone::FillImageViews};
+        VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::GraphicsImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
     }
@@ -751,6 +752,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        VideoCommon::StutterTrace::Scope trace{VideoCommon::StutterTrace::Category::GraphicsBuffers};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
@@ -821,6 +823,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
+        VideoCommon::StutterTrace::Scope trace{
+            VideoCommon::StutterTrace::Category::GraphicsRenderTargets};
         texture_cache.UpdateRenderTargets(false);
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);

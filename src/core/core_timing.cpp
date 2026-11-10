@@ -280,11 +280,23 @@ u64 CoreTiming::GetClockTicks() const {
         fres = fres * target / CPU_CLOCK_BASE_MHZ;
     }
     if (::Settings::values.sync_core_speed.GetValue()) {
-        auto const ticks = f64(fres);
-        auto const speed_limit = f64(Settings::SpeedLimit()) * 0.01;
-        return u64(ticks / speed_limit);
+        if (const u16 limit = Settings::SpeedLimit(); limit != 0) {
+            return u64(f64(fres) / (f64(limit) * 0.01));
+        }
     }
     return fres;
+}
+
+float CoreTiming::GuestClockRateScale() const {
+    // NCE derives CNTPCT directly from CNTVCT, independently of GetClockTicks.
+    if (Settings::IsNceEnabled()) {
+        return 1.0f;
+    }
+    const u32 target = CpuClockTargetMhz(Settings::values.cpu_clock.GetValue());
+    const u16 limit = Settings::SpeedLimit();
+    const float speed = Settings::values.sync_core_speed.GetValue() && limit != 0
+                            ? limit / 100.0f : 1.0f;
+    return static_cast<float>(target) / (CPU_CLOCK_BASE_MHZ * speed);
 }
 
 u64 CoreTiming::GetGPUTicks() const {

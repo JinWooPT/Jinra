@@ -41,6 +41,16 @@ void incrpdep(u32& value) {
     value = ((value | ~mask) + swizzled_incr) & mask;
 }
 
+void CopyNativeGobRow(u8* dst, const u8* src) {
+    constexpr u32 sector1 = NativeGobOffset(pdep<SWIZZLE_X_BITS>(16), true);
+    constexpr u32 sector2 = NativeGobOffset(pdep<SWIZZLE_X_BITS>(32), true);
+    constexpr u32 sector3 = NativeGobOffset(pdep<SWIZZLE_X_BITS>(48), true);
+    std::memcpy(dst, src, 16);
+    std::memcpy(dst + 16, src + sector1, 16);
+    std::memcpy(dst + 32, src + sector2, 16);
+    std::memcpy(dst + 48, src + sector3, 16);
+}
+
 template <bool TO_LINEAR, u32 BYTES_PER_PIXEL>
 void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32 height, u32 depth,
                  u32 block_height, u32 block_depth, u32 stride, bool native_tiling) {
@@ -63,6 +73,37 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
     const u32 block_depth_mask = (1U << block_depth) - 1;
     const u32 x_shift = GOB_SIZE_SHIFT + block_height + block_depth;
 
+    if constexpr (!TO_LINEAR && BYTES_PER_PIXEL == 16) {
+        if (native_tiling && depth == 1 && block_depth >= 2 && pitch >= 512 && height >= 32 &&
+            (pitch % GOB_SIZE_X) == 0) {
+            // Four rows consume whole cache lines in each native GOB. Keep a few
+            // columns together instead of jumping across the entire depth-padded row.
+            constexpr u32 rows_per_group = 4;
+            constexpr u32 gobs_per_group = 4;
+            const u32 row_gobs = pitch / GOB_SIZE_X;
+            for (u32 y = 0; y < height; y += rows_per_group) {
+                const u32 block_y = y >> GOB_SIZE_Y_SHIFT;
+                const u32 offset_y = (block_y >> block_height) * block_size +
+                                     ((block_y & block_height_mask) << GOB_SIZE_SHIFT);
+                const u32 src_group =
+                    NativeGobOffset(offset_y + pdep<SWIZZLE_Y_BITS>(y), true);
+                const u32 dst_group = y * pitch;
+                const u32 rows = (std::min)(rows_per_group, height - y);
+                for (u32 x = 0; x < row_gobs; x += gobs_per_group) {
+                    const u32 end = (std::min)(x + gobs_per_group, row_gobs);
+                    for (u32 row = 0; row < rows; ++row) {
+                        const u8* src = input.data() + src_group + row * 16;
+                        u8* dst = output.data() + dst_group + row * pitch;
+                        for (u32 gob = x; gob < end; ++gob) {
+                            CopyNativeGobRow(dst + gob * GOB_SIZE_X, src + (gob << x_shift));
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+
     for (u32 slice = 0; slice < depth; ++slice) {
         const u32 z = slice + origin_z;
         const u32 offset_z = (z >> block_depth) * slice_size +
@@ -75,8 +116,22 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
             const u32 offset_y = (block_y >> block_height) * block_size +
                                  ((block_y & block_height_mask) << GOB_SIZE_SHIFT);
 
-            u32 swizzled_x = pdep<SWIZZLE_X_BITS>(origin_x * BYTES_PER_PIXEL);
-            for (u32 column = 0; column < width;
+            u32 column = 0;
+            if constexpr (!TO_LINEAR && BYTES_PER_PIXEL == 16) {
+                if (native_tiling) {
+                    // One GOB row has four contiguous 16-byte sectors. Only the GOB
+                    // base changes across these groups, even for 3D block depths.
+                    const u32 source_row = NativeGobOffset(offset_z + offset_y + swizzled_y, true);
+                    const u32 dest_row = slice * pitch * height + line * pitch;
+                    for (; column + 4 <= width; column += 4) {
+                        const u8* src = input.data() + source_row + ((column / 4) << x_shift);
+                        u8* dst = output.data() + dest_row + column * BYTES_PER_PIXEL;
+                        CopyNativeGobRow(dst, src);
+                    }
+                }
+            }
+            u32 swizzled_x = pdep<SWIZZLE_X_BITS>((column + origin_x) * BYTES_PER_PIXEL);
+            for (; column < width;
                  ++column, incrpdep<SWIZZLE_X_BITS, BYTES_PER_PIXEL>(swizzled_x)) {
                 const u32 x = (column + origin_x) * BYTES_PER_PIXEL;
                 const u32 offset_x = (x >> GOB_SIZE_X_SHIFT) << x_shift;

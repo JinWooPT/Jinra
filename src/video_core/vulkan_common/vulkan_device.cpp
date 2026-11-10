@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <string_view>
 #include <thread>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
@@ -1712,10 +1713,17 @@ void Device::RemoveUnsuitableExtensions() {
     features.mesh_shader.primitiveFragmentShadingRateMeshShader = VK_FALSE;
     features.mesh_shader.meshShaderQueries = VK_FALSE;
     extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader;
-    // EDEN_NX2_FORCE_MESH_FALLBACK=1: leave VK_EXT_mesh_shader disabled, so task/mesh draws take
-    // the compute fallback a device without it uses.
-    if (extensions.mesh_shader && std::getenv("EDEN_NX2_FORCE_MESH_FALLBACK") != nullptr) {
-        LOG_WARNING(Render_Vulkan, "EDEN_NX2_FORCE_MESH_FALLBACK: VK_EXT_mesh_shader disabled");
+    const VkDriverId mesh_driver = properties.driver.driverID;
+    const bool amd_mesh_driver = mesh_driver == VK_DRIVER_ID_MESA_RADV ||
+                                 mesh_driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                                 mesh_driver == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+    // Native task/mesh draws can hang AMD drivers. Keep the override for comparisons.
+    const char* const mesh_override = std::getenv("EDEN_NX2_FORCE_MESH_FALLBACK");
+    const bool use_mesh_fallback = mesh_override ? std::string_view{mesh_override} != "0"
+                                                 : amd_mesh_driver;
+    if (extensions.mesh_shader && use_mesh_fallback) {
+        LOG_INFO(Render_Vulkan, "Using the compute fallback for Vulkan task/mesh draws");
+        force_mesh_shader_fallback = true;
         extensions.mesh_shader = false;
     }
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,

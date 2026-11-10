@@ -38,6 +38,7 @@
 #include <QNetworkRequest>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QScrollArea>
 #include <QStandardPaths>
 #include <QString>
 #include <QTimer>
@@ -393,7 +394,11 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
     ui->tabWidget->addTab(addons_tab.get(), tr("Add-Ons"));
     ui->tabWidget->addTab(system_tab.get(), tr("System"));
     ui->tabWidget->addTab(cpu_tab.get(), tr("CPU"));
-    ui->tabWidget->addTab(graphics_tab.get(), tr("Graphics"));
+    auto* graphics_scroll = new QScrollArea(ui->tabWidget);
+    graphics_scroll->setFrameShape(QFrame::NoFrame);
+    graphics_scroll->setWidgetResizable(true);
+    graphics_scroll->setWidget(graphics_tab.get());
+    ui->tabWidget->addTab(graphics_scroll, tr("Graphics"));
     ui->tabWidget->addTab(graphics_advanced_tab.get(), tr("Adv. Graphics"));
     ui->tabWidget->addTab(graphics_extensions_tab.get(), tr("Ext. Graphics"));
     ui->tabWidget->addTab(audio_tab.get(), tr("Audio"));

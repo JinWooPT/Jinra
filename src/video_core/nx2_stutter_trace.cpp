@@ -139,6 +139,24 @@ void OnFrame() {
                      elapsed(Category::GuestPendingResume), elapsed(Category::GuestPendingBackoff),
                      elapsed(Category::GuestCommandIdle), elapsed(Category::RasterGraphics),
                      elapsed(Category::RasterCompute), elapsed(Category::TextureUpload));
+            if (interval >= 50.0) {
+                LOG_INFO(Render_Vulkan,
+                         "Vulkan slow frame {} graphics preparation: image_views_ms={:.2f} "
+                         "buffers_ms={:.2f} render_targets_ms={:.2f} flush_ms={:.2f} "
+                         "texture_unswizzle_ms={:.2f} texture_overlap_ms={:.2f}",
+                         session.frame, elapsed(Category::GraphicsImageViews),
+                         elapsed(Category::GraphicsBuffers), elapsed(Category::GraphicsRenderTargets),
+                         elapsed(Category::GraphicsFlush), elapsed(Category::TextureUnswizzle),
+                         elapsed(Category::TextureOverlap));
+                LOG_INFO(Render_Vulkan,
+                         "Vulkan slow frame {} texture preparation detail: driver_view_create_ms={:.2f} "
+                         "track_ms={:.2f} lookup_ms={:.2f} aliases_ms={:.2f} "
+                         "guest_read_ms={:.2f} staging_ms={:.2f} upload_record_ms={:.2f}",
+                         session.frame, elapsed(Category::ImageViewCreate),
+                         elapsed(Category::TextureTrack), elapsed(Category::TextureLookup),
+                         elapsed(Category::TextureAliases), elapsed(Category::TextureRead),
+                         elapsed(Category::TextureStaging), elapsed(Category::TextureRecord));
+            }
         }
     }
     if (now - session.window_start >= 10s) {

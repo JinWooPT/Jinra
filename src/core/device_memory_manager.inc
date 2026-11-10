@@ -699,11 +699,13 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
 
         old_vpage = vpage;
 
-        // Adds or subtracts 1, as count is a unsigned 8-bit value
-        count.fetch_add(static_cast<CounterType>(delta), std::memory_order_release);
+        // The range lock serializes writers. Keep the result of the wrapping counter update.
+        const auto change = static_cast<CounterType>(delta);
+        const auto previous_count = count.fetch_add(change, std::memory_order_release);
+        const auto next_count = static_cast<CounterType>(previous_count + change);
 
         // Assume delta is either -1 or 1
-        if (count.load(std::memory_order::relaxed) == 0) {
+        if (next_count == 0) {
             if (uncache_bytes == 0) {
                 uncache_begin = vpage;
             }
@@ -715,7 +717,7 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
             }
             uncache_bytes = 0;
         }
-        if (count.load(std::memory_order::relaxed) == 1 && delta > 0) {
+        if (next_count == 1 && delta > 0) {
             if (cache_bytes == 0) {
                 cache_begin = vpage;
             }

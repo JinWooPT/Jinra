@@ -105,8 +105,7 @@ public:
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
             }
-            pending_operations.emplace_back(std::move(uncommitted_operations));
-            uncommitted_operations.clear(); // moved-from: make it empty explicitly
+            pending_operations.emplace_back(TakeUncommittedOperations());
         }
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
@@ -213,6 +212,30 @@ protected:
     TQueryCache& query_cache;
 
 private:
+    using OperationList = std::vector<std::function<void()>>;
+
+    // Keep the capacity of completed lists for the next fences (Fritchii's fence batching).
+    // Callers hold uncommitted_guard. Callback destruction happens before taking that lock.
+    OperationList TakeUncommittedOperations() {
+        if (uncommitted_operations.empty()) {
+            return {};
+        }
+        OperationList taken;
+        taken.swap(uncommitted_operations);
+        if (!spare_operations.empty()) {
+            uncommitted_operations.swap(spare_operations.back());
+            spare_operations.pop_back();
+        }
+        return taken;
+    }
+
+    void RecycleOperations(OperationList& operations) {
+        if (spare_operations.size() < 32 && operations.capacity() != 0 &&
+            operations.capacity() <= 256) {
+            spare_operations.push_back(std::move(operations));
+        }
+    }
+
     template <bool force_wait>
     void TryReleasePendingFences() {
         while (!fences.empty()) {
@@ -230,6 +253,11 @@ private:
             pending_operations.pop_front();
             for (auto& operation : operations) {
                 operation();
+            }
+            operations.clear();
+            {
+                std::scoped_lock lock{uncommitted_guard};
+                RecycleOperations(operations);
             }
             {
                 std::unique_lock lock(ring_guard);
@@ -255,7 +283,7 @@ private:
         }();
         struct Released {
             TFence fence;
-            std::deque<std::function<void()>> operations;
+            OperationList operations;
             u8 flushes;
         };
         std::vector<Released> batch;
@@ -309,6 +337,13 @@ private:
                 query_cache.PopAsyncFlushes();
                 for (auto& operation : released.operations) {
                     operation();
+                }
+                released.operations.clear();
+            }
+            {
+                std::scoped_lock lock{uncommitted_guard};
+                for (auto& released : batch) {
+                    RecycleOperations(released.operations);
                 }
             }
             {
@@ -399,8 +434,9 @@ private:
     }
 
     std::queue<TFence> fences;
-    std::deque<std::function<void()>> uncommitted_operations;
-    std::deque<std::deque<std::function<void()>>> pending_operations;
+    OperationList uncommitted_operations;
+    std::deque<OperationList> pending_operations;
+    std::vector<OperationList> spare_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
 

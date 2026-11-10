@@ -88,6 +88,54 @@ constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{0x3C46200, DYNAMIC_FPS_ROUTINE, {}, true},
 };
 
+// Fritchii's real-time step (363832faf7), based on Lichii #655 and Dark's Dynamic FPS.
+constexpr std::array<u8, 140> HIGH_REFRESH_ROUTINE{
+    0x28, 0x18, 0x20, 0x1E, 0xCA, 0x92, 0x00, 0xB0, 0x4A, 0x01, 0x38, 0x91,
+    0x2B, 0xE0, 0x3B, 0xD5, 0x4C, 0x01, 0x40, 0xF9, 0x4B, 0x01, 0x00, 0xF9,
+    0xCC, 0x02, 0x00, 0xB4, 0x6B, 0x01, 0x0C, 0xCB, 0x0D, 0xE0, 0x3B, 0xD5,
+    0x8E, 0x02, 0x80, 0xD2, 0xAE, 0x09, 0xCE, 0x9A, 0x7F, 0x01, 0x0E, 0xEB,
+    0xCB, 0x81, 0x8B, 0x9A, 0x4C, 0x05, 0x40, 0xF9, 0x4C, 0x00, 0x00, 0xB5,
+    0xEC, 0x03, 0x0B, 0xAA, 0x6E, 0x01, 0x0C, 0xCB, 0x8C, 0x0D, 0x8E, 0x8B,
+    0x4C, 0x05, 0x00, 0xF9, 0x82, 0x01, 0x23, 0x9E, 0xA3, 0x01, 0x23, 0x9E,
+    0x42, 0x18, 0x23, 0x1E, 0x42, 0x08, 0x21, 0x1E, 0x23, 0x01, 0x00, 0x1C,
+    0x42, 0x68, 0x23, 0x1E, 0x03, 0x01, 0x00, 0x1C, 0x42, 0x78, 0x23, 0x1E,
+    0x02, 0x00, 0x00, 0x14, 0xC0, 0x03, 0x5F, 0xD6, 0xA3, 0x00, 0x00, 0x1C,
+    0x48, 0x08, 0x23, 0x1E, 0xC0, 0x03, 0x5F, 0xD6, 0x0A, 0xD7, 0xA3, 0x3C,
+    0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x80, 0x3F,
+};
+// Lichii #1152's per-object fractional ripple step, relocated by Fritchii in d389685a4c.
+constexpr std::array<u8, 128> WATER_ACCUMULATOR{
+    0xC9, 0x92, 0x00, 0xB0, 0x29, 0x81, 0x38, 0x91, 0x0B, 0x01, 0x80, 0x52, 0x2A, 0x01,
+    0x40, 0xF9, 0x5F, 0x01, 0x15, 0xEB, 0x80, 0x02, 0x00, 0x54, 0x29, 0x41, 0x00, 0x91,
+    0x6B, 0x05, 0x00, 0x71, 0x61, 0xFF, 0xFF, 0x54, 0x29, 0x01, 0x02, 0xD1, 0x0B, 0x01,
+    0x80, 0x52, 0x2A, 0x01, 0x40, 0xF9, 0x6A, 0x01, 0x00, 0xB4, 0x29, 0x41, 0x00, 0x91,
+    0x6B, 0x05, 0x00, 0x71, 0x81, 0xFF, 0xFF, 0x54, 0x29, 0x41, 0x02, 0xD1, 0x2A, 0x01,
+    0x40, 0xB9, 0x4B, 0x05, 0x00, 0x11, 0x6B, 0x09, 0x00, 0x12, 0x2B, 0x01, 0x00, 0xB9,
+    0x29, 0x41, 0x00, 0x91, 0x29, 0x11, 0x0A, 0x8B, 0x35, 0x01, 0x00, 0xF9, 0x3F, 0x09,
+    0x00, 0xB9, 0x21, 0x09, 0x40, 0xBD, 0x00, 0x28, 0x21, 0x1E, 0x01, 0xC0, 0x25, 0x1E,
+    0x00, 0x38, 0x21, 0x1E, 0x20, 0x09, 0x00, 0xBD, 0x29, 0x00, 0x38, 0x1E, 0xBC, 0x04,
+    0x10, 0x17, // b main+0x475FC
+};
+constexpr size_t OOT_ROUTINE_OFFSET = 0x3C46200;
+constexpr size_t OOT_SCALE_OFFSET = OOT_ROUTINE_OFFSET + 0x88;
+constexpr size_t OOT_RIPPLE_OFFSET = 0x475F8;
+constexpr std::array<u8, 4> WATER_ORIGINAL{0x09, 0x00, 0x38, 0x1E};
+constexpr std::array<u8, 4> WATER_HOOK{0x26, 0xFB, 0xEF, 0x14};
+constexpr std::array<u8, 0x110> HIGH_REFRESH_CAVE = [] {
+    std::array<u8, 0x110> cave{};
+    std::ranges::copy(HIGH_REFRESH_ROUTINE, cave.begin());
+    std::ranges::copy(WATER_ACCUMULATOR, cave.begin() + 0x90);
+    return cave;
+}();
+constexpr std::array HIGH_REFRESH_RECORDS{
+    BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
+    BuiltinPatchRecord{OOT_ROUTINE_OFFSET, HIGH_REFRESH_CAVE, {}, true},
+    BuiltinPatchRecord{OOT_RIPPLE_OFFSET, WATER_HOOK, WATER_ORIGINAL},
+};
+constexpr std::string_view OOT_BUILD_ID = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348";
+constexpr std::string_view DYNAMIC_FPS_NAME = "Dynamic FPS by Dark (built-in)";
+constexpr std::string_view HIGH_REFRESH_NAME = "High refresh rate (built-in, experimental)";
+
 constexpr std::array BUILTIN_PATCHES{
     // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
     // instead of following the GPU-time controller down to its 480p floor.
@@ -99,7 +147,16 @@ constexpr std::array BUILTIN_PATCHES{
         .records = MAX_RESOLUTION_RECORDS,
     },
     BuiltinPatch{
-        .name = "Dynamic FPS by Dark (built-in)",
+        .name = HIGH_REFRESH_NAME,
+        .title_id = Settings::OcarinaOfTimeProgramId,
+        .module = "main",
+        .build_id = OOT_BUILD_ID,
+        .records = HIGH_REFRESH_RECORDS,
+        .state_offset = 0x4E9FE00,
+        .state_size = 0xA0,
+    },
+    BuiltinPatch{
+        .name = DYNAMIC_FPS_NAME,
         .title_id = 0x0400486024DEC000,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
@@ -468,7 +525,11 @@ std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualD
     return out;
 }
 
-std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name) const {
+std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name,
+                                       size_t* oot_speed_scale_offset) const {
+    if (oot_speed_scale_offset != nullptr) {
+        *oot_speed_scale_offset = 0;
+    }
     if (nso.size() < sizeof(Loader::NSOHeader)) {
         return nso;
     }
@@ -528,8 +589,12 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
     }
 
     const auto disabled = GetDisabledAddons();
+    bool high_refresh_applied = false;
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id || patch.module != name) {
+        const bool high_refresh = patch.name == HIGH_REFRESH_NAME;
+        if (patch.title_id != title_id || patch.module != name ||
+            (high_refresh && !Settings::values.oot_high_refresh.GetValue()) ||
+            (high_refresh_applied && patch.name == DYNAMIC_FPS_NAME)) {
             continue;
         }
         if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
@@ -539,6 +604,10 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (patch.build_id != build_id) {
             LOG_INFO(Loader, "    - Skipping \"{}\": build id {} is not {}", patch.name, build_id,
                      patch.build_id);
+            continue;
+        }
+        if (high_refresh && !Settings::values.use_multi_core.GetValue()) {
+            LOG_INFO(Loader, "    - Skipping \"{}\": requires the multicore guest clock", patch.name);
             continue;
         }
         const auto fits = [](const std::vector<u8>& data, size_t offset, size_t size) {
@@ -568,6 +637,26 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
                 continue;
             }
         }
+        // Accept the original standalone Dark routine and Jinra's built-in variant. A partial
+        // match or any change outside Dark's two records remains a user mod conflict.
+        constexpr auto original_dark = [] {
+            auto routine = DYNAMIC_FPS_ROUTINE;
+            routine[0x24] = 0x8E;
+            routine[0x25] = 0x02;
+            return routine;
+        }();
+        const auto call_offset = sizeof(Loader::NSOHeader) + HIGH_REFRESH_RECORDS[0].module_offset;
+        const auto cave_offset = sizeof(Loader::NSOHeader) + OOT_ROUTINE_OFFSET;
+        const bool standalone_dark =
+            high_refresh && fits(out, HIGH_REFRESH_RECORDS[0].module_offset,
+                                 DYNAMIC_FPS_CALL.size()) &&
+            fits(out, OOT_ROUTINE_OFFSET, HIGH_REFRESH_CAVE.size()) &&
+            std::ranges::equal(DYNAMIC_FPS_CALL,
+                               std::span{out}.subspan(call_offset, DYNAMIC_FPS_CALL.size())) &&
+            (std::ranges::equal(original_dark,
+                                std::span{out}.subspan(cave_offset, original_dark.size())) ||
+             std::ranges::equal(DYNAMIC_FPS_ROUTINE,
+                                std::span{out}.subspan(cave_offset, original_dark.size())));
         bool apply = true;
         for (const auto& record : patch.records) {
             if (!fits(nso, record.module_offset, record.bytes.size()) ||
@@ -601,8 +690,17 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
                 apply = false;
                 break;
             }
-            if (!std::equal(nso.begin() + offset, nso.begin() + offset + record.bytes.size(),
-                            out.begin() + offset)) {
+            size_t verified_prefix = 0;
+            if (standalone_dark) {
+                if (record.module_offset == HIGH_REFRESH_RECORDS[0].module_offset) {
+                    verified_prefix = DYNAMIC_FPS_CALL.size();
+                } else if (record.module_offset == OOT_ROUTINE_OFFSET) {
+                    verified_prefix = DYNAMIC_FPS_ROUTINE.size();
+                }
+            }
+            if (!std::equal(nso.begin() + offset + verified_prefix,
+                            nso.begin() + offset + record.bytes.size(),
+                            out.begin() + offset + verified_prefix)) {
                 LOG_INFO(Loader, "    - Skipping \"{}\": a user mod already patched {}+{:#x}",
                          patch.name, name, record.module_offset);
                 apply = false;
@@ -618,6 +716,12 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }
         LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} records) to {}", patch.name,
                  patch.records.size(), name);
+        if (high_refresh) {
+            high_refresh_applied = true;
+            if (oot_speed_scale_offset != nullptr) {
+                *oot_speed_scale_offset = OOT_SCALE_OFFSET;
+            }
+        }
     }
 
     if (out.size() < sizeof(Loader::NSOHeader)) {
@@ -1176,7 +1280,8 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id) {
+        if (patch.title_id != title_id ||
+            (patch.name == HIGH_REFRESH_NAME && !Settings::values.oot_high_refresh.GetValue())) {
             continue;
         }
         const auto patch_disabled =

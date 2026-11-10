@@ -3,11 +3,13 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -53,7 +55,7 @@ constexpr std::array<std::pair<Common::FS::EdenPath, const char*>, 4> TestDirect
     {Common::FS::EdenPath::DumpDir, "dump"},
 }};
 
-void WriteIps(const std::filesystem::path& path, u32 word, size_t offset = PatchOffset) {
+void WriteIps(const std::filesystem::path& path, std::span<const u8> bytes, size_t offset) {
     const bool ips32 = offset > 0xFFFFFF;
     std::vector<u8> ips =
         ips32 ? std::vector<u8>{'I', 'P', 'S', '3', '2'} : std::vector<u8>{'P', 'A', 'T', 'C', 'H'};
@@ -63,11 +65,9 @@ void WriteIps(const std::filesystem::path& path, u32 word, size_t offset = Patch
     ips.push_back(static_cast<u8>(offset >> 16));
     ips.push_back(static_cast<u8>(offset >> 8));
     ips.push_back(static_cast<u8>(offset));
-    ips.push_back(0);
-    ips.push_back(sizeof(word));
-    for (size_t i = 0; i < sizeof(word); ++i) {
-        ips.push_back(static_cast<u8>(word >> (i * 8)));
-    }
+    ips.push_back(static_cast<u8>(bytes.size() >> 8));
+    ips.push_back(static_cast<u8>(bytes.size()));
+    ips.insert(ips.end(), bytes.begin(), bytes.end());
     if (ips32) {
         ips.push_back('E');
     }
@@ -89,10 +89,8 @@ public:
         const auto title_dir = root / "load" / fmt::format("{:016X}", OcarinaTitleId);
         std::filesystem::create_directories(title_dir);
         if (user_mod_word) {
-            const auto exefs = title_dir / "UserMod" / "exefs";
-            std::filesystem::create_directories(exefs);
-            WriteIps(exefs / fmt::format("{}.ips", OcarinaBuildIdHex), *user_mod_word,
-                     user_mod_offset);
+            const auto bytes = std::bit_cast<std::array<u8, sizeof(u32)>>(*user_mod_word);
+            AddUserPatch(bytes, user_mod_offset);
         }
         system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
         system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
@@ -110,6 +108,12 @@ public:
 
     PatchManagerTestContext(const PatchManagerTestContext&) = delete;
     PatchManagerTestContext& operator=(const PatchManagerTestContext&) = delete;
+
+    void AddUserPatch(std::span<const u8> bytes, size_t offset) {
+        const auto exefs = root / "load" / fmt::format("{:016X}", OcarinaTitleId) / "UserMod" / "exefs";
+        std::filesystem::create_directories(exefs);
+        WriteIps(exefs / fmt::format("{}.{}.ips", OcarinaBuildIdHex, offset), bytes, offset);
+    }
 
     FileSys::PatchManager Manager(u64 title_id = OcarinaTitleId) {
         return FileSys::PatchManager{title_id, system.GetFileSystemController(),
@@ -363,4 +367,75 @@ TEST_CASE("Built-in Dynamic FPS leaves both records alone when a user mod change
     auto expected = nso;
     std::memcpy(expected.data() + offset, &mod_word, sizeof(mod_word));
     REQUIRE(context.Manager().PatchNSO(nso, "main") == expected);
+}
+
+TEST_CASE("Ocarina high refresh is opt-in and reports only a complete applied patch",
+          "[patch_manager]") {
+    constexpr auto ScaleOffset = DynamicRoutineOffset + 0x88;
+    constexpr auto WaterHookOffset = sizeof(Loader::NSOHeader) + 0x475F8;
+    constexpr u32 WaterOriginal = 0x1E380009;
+    constexpr u32 WaterHook = 0x14EFFB26;
+    auto& enabled = Settings::values.oot_high_refresh;
+    struct RestoreSetting {
+        bool previous;
+        ~RestoreSetting() {
+            Settings::values.oot_high_refresh.SetValue(previous);
+        }
+    } restore{enabled.GetValue()};
+
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    auto nso = MakeDynamicMain();
+    nso.resize(DynamicStateOffset + 0xA0);
+    std::memcpy(nso.data() + WaterHookOffset, &WaterOriginal, sizeof(WaterOriginal));
+    size_t scale_offset{1};
+    enabled.SetValue(false);
+    const auto baseline = manager.PatchNSO(nso, "main", &scale_offset);
+    REQUIRE(scale_offset == 0);
+    REQUIRE(WordAt(baseline, WaterHookOffset) == WaterOriginal);
+    REQUIRE(WordAt(baseline, ScaleOffset) == 0);
+
+    enabled.SetValue(true);
+    SECTION("The matching build gets both hooks and the initial scale") {
+        const auto patched = manager.PatchNSO(nso, "main", &scale_offset);
+        CHECK(scale_offset == ScaleOffset - sizeof(Loader::NSOHeader));
+        CHECK(WordAt(patched, ScaleOffset) == 0x3F800000);
+        CHECK(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
+        CHECK(WordAt(patched, DynamicRoutineOffset + 0x78) == 0x1E230848);
+        CHECK(WordAt(patched, WaterHookOffset) == WaterHook);
+        CHECK(WordAt(patched, DynamicRoutineOffset + 0x10C) == 0x171004BC);
+    }
+    SECTION("A conflicting ripple hook leaves the user mod and the previous Dynamic FPS patch") {
+        const auto word = std::bit_cast<std::array<u8, sizeof(u32)>>(NopInstruction);
+        context.AddUserPatch(word, WaterHookOffset);
+        const auto patched = manager.PatchNSO(nso, "main", &scale_offset);
+        CHECK(scale_offset == 0);
+        CHECK(WordAt(patched, WaterHookOffset) == NopInstruction);
+        CHECK(WordAt(patched, DynamicRoutineOffset + 116) == 0x3F83D70A);
+        CHECK(WordAt(patched, ScaleOffset) == 0);
+    }
+    SECTION("The standalone Dark patch can be upgraded without removing its files") {
+        const auto bytes = std::span{baseline};
+        context.AddUserPatch(bytes.subspan(DynamicCallOffset, sizeof(u32)), DynamicCallOffset);
+        const auto routine = bytes.subspan(DynamicRoutineOffset, DynamicRoutineSize);
+        std::vector<u8> dark{routine.begin(), routine.end()};
+        dark[0x24] = 0x8E;
+        dark[0x25] = 0x02;
+        context.AddUserPatch(dark, DynamicRoutineOffset);
+        const auto patched = manager.PatchNSO(nso, "main", &scale_offset);
+        CHECK(scale_offset == ScaleOffset - sizeof(Loader::NSOHeader));
+        CHECK(WordAt(patched, WaterHookOffset) == WaterHook);
+    }
+    SECTION("An incompatible Build ID leaves the module untouched") {
+        nso[offsetof(Loader::NSOHeader, build_id)] ^= 1;
+        CHECK(manager.PatchNSO(nso, "main", &scale_offset) == nso);
+        CHECK(scale_offset == 0);
+    }
+    SECTION("Truncating the extra ripple state falls back to the previous Dynamic FPS patch") {
+        nso.resize(DynamicStateOffset + 16);
+        const auto patched = manager.PatchNSO(nso, "main", &scale_offset);
+        CHECK(scale_offset == 0);
+        CHECK(WordAt(patched, DynamicRoutineOffset + 116) == 0x3F83D70A);
+        CHECK(WordAt(patched, WaterHookOffset) == WaterOriginal);
+    }
 }

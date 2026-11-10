@@ -8,6 +8,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -89,6 +91,61 @@ using VideoCommon::GraphicsEnvironment;
 constexpr u32 CACHE_VERSION = VideoCommon::VulkanPipelineCacheVersion;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
+
+// The driver cache is separate from Jinra's prepared and transferable caches.
+void LogDriverCache([[maybe_unused]] const Device& device,
+                    [[maybe_unused]] std::string_view phase) {
+#ifdef _WIN32
+    const wchar_t* local = _wgetenv(L"LOCALAPPDATA");
+    if (local == nullptr || *local == L'\0') {
+        return;
+    }
+    std::filesystem::path folder{local};
+    const char* label;
+    switch (device.GetDriverID()) {
+    case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+        folder /= L"NVIDIA/GLCache";
+        label = "NVIDIA GLCache";
+        break;
+    case VK_DRIVER_ID_AMD_PROPRIETARY:
+        if (const wchar_t* override_path = _wgetenv(L"AMD_VK_PIPELINE_CACHE_PATH");
+            override_path != nullptr && *override_path != L'\0') {
+            folder = override_path;
+        } else {
+            folder /= L"AMD/VkCache";
+        }
+        label = "AMD VkCache";
+        break;
+    default:
+        return;
+    }
+    std::error_code error;
+    if (!std::filesystem::is_directory(folder, error)) {
+        LOG_INFO(Render_Vulkan, "Driver cache ({}, {}): folder unavailable", label, phase);
+        return;
+    }
+    constexpr size_t ScanLimit = 4096;
+    size_t visited = 0;
+    size_t files = 0;
+    u64 bytes = 0;
+    bool incomplete = false;
+    for (std::filesystem::recursive_directory_iterator it{folder, error}, end;
+         !error && it != end && visited < ScanLimit; it.increment(error), ++visited) {
+        std::error_code entry_error;
+        if (it->is_regular_file(entry_error)) {
+            const auto size = it->file_size(entry_error);
+            if (!entry_error) {
+                ++files;
+                bytes += size;
+            }
+        }
+        incomplete |= bool(entry_error);
+    }
+    LOG_INFO(Render_Vulkan, "Driver cache ({}, {}): {} files, {:.1f} MiB{}",
+             label, phase, files, static_cast<double>(bytes) / (1 << 20),
+             error || incomplete || visited == ScanLimit ? " (partial scan)" : "");
+#endif
+}
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
 
 template <typename Container>
@@ -798,6 +855,42 @@ PipelineCache::~PipelineCache() {
     if (pipeline_binaries_enabled) {
         device.GetLogical().DisablePipelineBinaryCache();
     }
+    if (pipeline_session.title_id != 0) {
+        LogDriverCache(device, "renderer shutdown");
+    }
+    SetPipelineSessionDirectory({});
+}
+
+void PipelineCache::SetPipelineSessionDirectory(const std::filesystem::path& directory) {
+    if (!pipeline_session_marker.empty() && directory == pipeline_session_marker.parent_path()) {
+        return;
+    }
+    std::error_code error;
+    if (!pipeline_session_marker.empty()) {
+        std::filesystem::remove(pipeline_session_marker, error);
+        pipeline_session_marker.clear();
+    }
+    pipeline_session_lock.reset();
+    if (directory.empty()) {
+        return;
+    }
+    auto lock = std::make_unique<PrecompiledKept::PreparationLock>(
+        directory / "pipeline-session.lock");
+    if (!lock->IsLocked()) {
+        return;
+    }
+    const auto marker = directory / "pipeline-session.open";
+    if (std::filesystem::exists(marker, error)) {
+        LOG_WARNING(Render_Vulkan,
+                    "The previous Vulkan session for this game did not finish saving its caches");
+    }
+    std::ofstream file(marker, std::ios::trunc);
+    file << "open\n";
+    file.close();
+    if (file) {
+        pipeline_session_marker = marker;
+        pipeline_session_lock = std::move(lock);
+    }
 }
 
 void PipelineCache::SaveUsedPipelines() {
@@ -983,6 +1076,19 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     auto& entry{pair->second};
     if (is_new) {
         entry = CreateComputePipeline(key, shader);
+    } else if (entry.pending) {
+        if (entry.pending->pipeline->IsBuildTaskDone()) {
+            auto rebuilt = std::move(entry.pending);
+            if (rebuilt->pipeline->IsBound()) {
+                retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                       std::move(entry.pipeline));
+                entry = std::move(*rebuilt);
+            } else {
+                LOG_WARNING(Render_Vulkan, "Keeping compute shader {:016x}: rebuild failed",
+                            key.unique_hash);
+                entry.rebuilds = MaxComputeRebuilds;
+            }
+        }
     } else if (entry.prepared && entry.pipeline->IsBuildTaskDone() && !entry.pipeline->IsBound()) {
         rejected_prepared_compute.insert(key.Hash());
         auto rebuilt = CreateComputePipeline(key, shader, entry.mapped_pointers, false);
@@ -995,12 +1101,16 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
         // binds, null now or not: a null pointer binds nothing.
         auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
         if (rebuilt.pipeline) {
-            if (entry.pipeline) {
-                retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
-                                                       std::move(entry.pipeline));
-            }
             rebuilt.rebuilds = entry.rebuilds + 1;
-            entry = std::move(rebuilt);
+            if (entry.pipeline && entry.pipeline->IsBuildTaskDone() && entry.pipeline->IsBound()) {
+                entry.pending = std::make_unique<ComputePipelineCacheEntry>(std::move(rebuilt));
+            } else {
+                if (entry.pipeline) {
+                    retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                           std::move(entry.pipeline));
+                }
+                entry = std::move(rebuilt);
+            }
         } else {
             // Keep the working translation when the new one cannot be built (for example a
             // narrow access that now stays global across two buffers), and stop retrying.
@@ -1122,6 +1232,9 @@ bool PipelineCache::PreparePipelines(const std::filesystem::path& file,
         // Older prepared indexes can look complete even if these records were skipped.
         checkpoint_key += " static-logic-op-v1";
     }
+    if (device.ForcesMeshShaderFallback()) {
+        checkpoint_key += " mesh-fallback";
+    }
     const auto checkpoint = base_dir / (cache_stem + ".txt");
 
     std::string reason;
@@ -1163,6 +1276,7 @@ bool PipelineCache::PreparePipelines(const std::filesystem::path& file,
         cursor = 0;
     }
 
+    const auto prepare_begin = std::chrono::steady_clock::now();
     const size_t threads = background ? 1 : std::min<size_t>(4, num_pipeline_workers);
     const auto temporary = base_dir / fmt::format("shader-prep.{}.{}.tmp",
         std::chrono::steady_clock::now().time_since_epoch().count(),
@@ -1324,8 +1438,18 @@ bool PipelineCache::PreparePipelines(const std::filesystem::path& file,
                         error ? error.message() : reason);
         }
     }
-    LOG_INFO(Render_Vulkan, "Shader preparation: {} of {} processed, {} built, {} skipped, {} failed",
-             cursor, total, built.load(), skipped.load(), failed.load());
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - prepare_begin).count();
+    const auto attempted = built.load() + skipped.load() + failed.load();
+    LOG_INFO(Render_Vulkan,
+             "Shader preparation: {} of {} processed, {} built, {} skipped, {} failed "
+             "({}; {:.1f} records/s)",
+             cursor, total, built.load(), skipped.load(), failed.load(),
+             background ? "background" : "startup",
+             static_cast<double>(attempted) / (std::max)(elapsed, 0.001));
+    if (cursor == total) {
+        LogDriverCache(device, "after shader preparation");
+    }
     if (skipped.load() != 0) {
         std::string reasons;
         for (size_t i = 0; i < pipeline_feature_names.size(); ++i) {
@@ -1392,6 +1516,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
         return;
     }
+    SetPipelineSessionDirectory(base_dir);
+    LogDriverCache(device, "game startup");
     vulkan_pipeline_cache.reset();
     {
         std::scoped_lock lock{prepared_spirv_mutex};

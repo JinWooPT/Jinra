@@ -464,7 +464,8 @@ struct System::Impl {
         LOG_INFO(Core, "Loading {} ({:016X}) ...", name, params.program_id);
 
         // Expose program id to dump sites and other global readers.
-        Settings::SetCurrentProgramID(params.program_id);
+        Settings::SetCurrentProgramID(params.program_id,
+                                      process->GetHandle()->GetOotSpeedScaleAddress() != 0);
 
         // Track launch time for frontend launches
         LaunchTimestampCache::SaveLaunchTimestamp(params.program_id);
@@ -596,6 +597,7 @@ struct System::Impl {
 
         // Reset all glue registrations
         arp_manager.ResetAll();
+        Settings::SetCurrentProgramID(0, false);
 
         LOG_DEBUG(Core, "Shutdown OK");
     }

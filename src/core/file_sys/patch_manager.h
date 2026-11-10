@@ -72,8 +72,9 @@ public:
     // - IPS
     // - IPSwitch
     // - Built-in patches, keyed by title and build id
-    [[nodiscard]] std::vector<u8> PatchNSO(const std::vector<u8>& nso,
-                                           const std::string& name) const;
+    // Optionally reports the Ocarina speed-scale word's module offset when its patch applies.
+    [[nodiscard]] std::vector<u8> PatchNSO(const std::vector<u8>& nso, const std::string& name,
+                                           size_t* oot_speed_scale_offset = nullptr) const;
 
     // Checks to see if PatchNSO() will have any effect given the NSO's build ID.
     // Used to prevent expensive copies in NSO loader.

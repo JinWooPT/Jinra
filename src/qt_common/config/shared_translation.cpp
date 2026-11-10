@@ -173,10 +173,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
     INSERT(Settings, oot_anti_aliasing, tr("Ocarina of Time anti-aliasing:"),
-           tr("The Legend of Zelda: Ocarina of Time only.\nGame: the game's own anti-aliasing "
-              "network, which sharpens heavily.\nNo sharpening: the image as the game renders it, "
-              "without the network (faster; pairs well with a higher resolution). Has no effect while "
-              "NVIDIA DLSS is on.\nTakes effect when the game starts."));
+           tr("The Legend of Zelda: Ocarina of Time only.\nGame: the game's own anti-aliasing.\n"
+              "No sharpening: presents the tonemapped game image with the HUD.\n"
+              "AMD FSR 3.1: experimental temporal anti-aliasing and upscaling. Requires Vulkan.\n"
+              "NVIDIA DLSS takes priority when enabled and available. Changes apply after restart."));
     INSERT(Settings, post_shader_chain, QString(), QString());
     INSERT(Settings, post_shader_preset, QString(), QString());
     INSERT(Settings, post_shader_enabled, tr("Enable post-processing effects"),
@@ -320,6 +320,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, use_video_framerate, tr("Sync to framerate of video playback"),
            tr("Run the game at normal speed during video playback, even when the framerate is "
               "unlocked."));
+    INSERT(Settings, oot_high_refresh, QString(), QString());
+    INSERT(Settings, oot_high_refresh_cap, tr("Ocarina of Time high refresh rate (experimental)"),
+           tr("Allows a compatible version of Ocarina of Time to render above 60 FPS at normal "
+              "game speed when multicore emulation is enabled. Restart the game to enable or "
+              "disable this option."));
     INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
            tr("Forces the game to use its native 30 FPS mode at normal game speed. "
               "Takes effect after restarting the game."));
@@ -568,10 +573,19 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(AntiAliasing, Fxaa, tr("FXAA")),
                               PAIR(AntiAliasing, Smaa, tr("SMAA")),
                           }});
+    translations->insert({Settings::EnumMetadata<Settings::OotRefreshCap>::Index(),
+                          {
+                              PAIR(OotRefreshCap, Display, tr("Monitor refresh rate")),
+                              PAIR(OotRefreshCap, Hz90, tr("90 FPS")),
+                              PAIR(OotRefreshCap, Hz120, tr("120 FPS")),
+                              PAIR(OotRefreshCap, Hz144, tr("144 FPS")),
+                              PAIR(OotRefreshCap, Hz165, tr("165 FPS")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::OotAntiAliasing>::Index(),
                           {
                               PAIR(OotAntiAliasing, Game, tr("Game")),
                               PAIR(OotAntiAliasing, NoSharpening, tr("No sharpening")),
+                              PAIR(OotAntiAliasing, Fsr31, tr("AMD FSR 3.1 (experimental)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {

@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "winresrc.h"
+#include "jinra_build_version.h"
 
 1 VERSIONINFO
-FILEVERSION 0,1,0,7
-PRODUCTVERSION 0,1,0,7
+FILEVERSION JINRA_WINDOWS_VERSION
+PRODUCTVERSION JINRA_WINDOWS_VERSION
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -14,11 +15,11 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "FileDescription", "Jinra\0"
-            VALUE "FileVersion", "0.1.0-preview.7\0"
+            VALUE "FileVersion", JINRA_VERSION_STRING "\0"
             VALUE "InternalName", "jinra\0"
             VALUE "OriginalFilename", "jinra.exe\0"
             VALUE "ProductName", "Jinra\0"
-            VALUE "ProductVersion", "0.1.0-preview.7\0"
+            VALUE "ProductVersion", JINRA_VERSION_STRING "\0"
         END
     END
     BLOCK "VarFileInfo"
