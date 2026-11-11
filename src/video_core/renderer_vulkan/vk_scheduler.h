@@ -16,6 +16,7 @@
 #include <utility>
 #include <queue>
 #include <source_location>
+#include <span>
 #include <vector>
 
 #include "common/alignment.h"
@@ -41,6 +42,7 @@ class Device;
 class Framebuffer;
 class GraphicsPipeline;
 class StateTracker;
+class UploadBatch;
 
 struct QueryCacheParams;
 
@@ -176,12 +178,18 @@ public:
         on_submit = std::move(func);
     }
 
+    /// Queue consecutive in-order uploads outside a render pass.
+    void RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies);
+
     /// Send work to a separate thread.
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordWithUploadBuffer(T&& command) {
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
+        }
+        if (uploads_pending) {
+            FlushUploads();
         }
         ++record_serial;
         if (chunk->Record(command)) {
@@ -202,7 +210,8 @@ public:
 
     /// A deferred clear becomes a command when the next submission ends the render pass.
     [[nodiscard]] bool HasUnsubmittedCommands() const noexcept {
-        return record_serial != submitted_serial || deferred_clear.framebuffer != nullptr;
+        return uploads_pending || record_serial != submitted_serial ||
+               deferred_clear.framebuffer != nullptr;
     }
 
     /// Whether the recording thread submitted `tick` within 20 ms.
@@ -459,6 +468,9 @@ private:
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;
+    std::unique_ptr<UploadBatch> upload_batch;
+    bool uploads_pending{};
+    void FlushUploads();
 
     vk::QueryPool trace_query_pool;
     static constexpr u32 TraceMaxSubmissions = 512;

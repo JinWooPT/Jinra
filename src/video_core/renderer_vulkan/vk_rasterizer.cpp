@@ -1780,6 +1780,22 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     }
 }
 
+namespace {
+
+void RecordDispatchBarrier(vk::CommandBuffer cmdbuf) {
+    static constexpr VkMemoryBarrier READ_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+    };
+    cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                           VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           0, READ_BARRIER);
+}
+
+} // Anonymous namespace
+
 void RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     VideoCommon::StutterTrace::Scope stutter_trace{
@@ -1847,23 +1863,10 @@ void RasterizerVulkan::DispatchCompute() {
     }
 
     const auto& qmd{kepler_compute->launch_description};
-    // Earlier writes must be visible to the dispatch, its indirect arguments included, and what it
-    // writes to the next render pass.
-    const auto record_read_barrier = [this] {
-        static constexpr VkMemoryBarrier READ_BARRIER{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
-        };
-        scheduler.Record([](vk::CommandBuffer cmdbuf) {
-            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
-                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
-                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                   0, READ_BARRIER);
-        });
-        scheduler.NoteComputeWrites();
-    };
+    static const bool fold_dispatch_barriers = [] {
+        const char* value = std::getenv("JINRA_VULKAN_FOLD_DISPATCH_BARRIERS");
+        return value && std::string_view{value} == "1";
+    }();
     if (frame_dump.CapturingBuffers()) {
         std::optional<std::array<u32, 3>> indirect_grid;
         if (indirect_address) {
@@ -1883,10 +1886,16 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         scheduler.RequestOutsideRenderPassOperationContext();
-        record_read_barrier();
+        if (!fold_dispatch_barriers) {
+            scheduler.Record(RecordDispatchBarrier);
+        }
+        scheduler.NoteComputeWrites();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
         scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
+            if (fold_dispatch_barriers) {
+                RecordDispatchBarrier(cmdbuf);
+            }
             if (!pipeline->IsBound()) {
                 return;
             }
@@ -1904,7 +1913,11 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
-    record_read_barrier();
+    const bool barrier_recorded = !fold_dispatch_barriers || can_replace || marking_effects;
+    if (barrier_recorded) {
+        scheduler.Record(RecordDispatchBarrier);
+    }
+    scheduler.NoteComputeWrites();
     if (marking_effects) {
         const auto written = pipeline->WrittenImages();
         if (std::ranges::any_of(written, [this](VideoCommon::ImageViewId id) {
@@ -1922,7 +1935,10 @@ void RasterizerVulkan::DispatchCompute() {
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
     }
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind),
-                      replacement](vk::CommandBuffer cmdbuf) {
+                      replacement, barrier_recorded](vk::CommandBuffer cmdbuf) {
+        if (!barrier_recorded) {
+            RecordDispatchBarrier(cmdbuf);
+        }
         if (replacement && !replacement->EvaluationFailed()) {
             return;
         }
@@ -2511,7 +2527,7 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
     }
     oot_backend = ResolveOcarinaUpscaler(device);
     if (oot_backend == VideoCommon::OcarinaUpscaleBackend::Native &&
-        Settings::values.oot_anti_aliasing.GetValue() == Settings::OotAntiAliasing::Fsr31) {
+        VideoCommon::IsOcarinaFsr(Settings::values.oot_anti_aliasing.GetValue())) {
         LOG_WARNING(Render_Vulkan, "Ocarina FSR 3.1 unsupported on this device; using native upscale");
     }
     return *oot_backend != VideoCommon::OcarinaUpscaleBackend::Native;
@@ -2707,10 +2723,14 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
 /// Track the scene depth on its reader dispatch, or try to replace a recognized upscale dispatch.
 bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
     constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
-    const bool upscale_4k = replace && pipeline.ShaderHash() == ComputePipeline::Ocarina1440pShader;
+    const bool pass_1440p = replace && pipeline.ShaderHash() == ComputePipeline::Ocarina1440pShader;
     if ((!replace && pipeline.ShaderHash() != depth_reader) || !OcarinaTemporalEnabled()) {
         return false;
     }
+    const auto dlss_settings = Settings::GetNvidiaDlssRuntimeSettings();
+    const bool native_resolution = oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
+                                   dlss_settings.quality == Settings::NvidiaDlssQuality::Native;
+    const bool upscale_4k = pass_1440p && !native_resolution;
     const auto read_tic = [this](u32 index) -> std::optional<Tegra::Texture::TICEntry> {
         const auto& table = kepler_compute->regs.tic;
         using Entry = Tegra::Texture::TICEntry;
@@ -2794,13 +2814,12 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     using VideoCore::Surface::PixelFormat;
     const auto extent = oot_motion.extent;
     const bool native_size = pipeline.ShaderHash() == ComputePipeline::OcarinaFullSizeShader;
-    const bool valid_extents = upscale_4k
-        ? extent.width == 2560 && extent.height == 1440 &&
-            target.size.width == 2560 && target.size.height == 1440
-        : native_size
-        ? target.size.width == extent.width && target.size.height == extent.height
-        : target.size.width == extent.width * 4 / 3 &&
-            target.size.height == extent.height * 4 / 3;
+    const bool valid_extents =
+        pass_1440p ? extent.width == 2560 && extent.height == 1440 && target.size.width == 2560 &&
+                         target.size.height == 1440
+        : native_size ? target.size.width == extent.width && target.size.height == extent.height
+                      : target.size.width == extent.width * 4 / 3 &&
+                            target.size.height == extent.height * 4 / 3;
     if (!valid_extents || !color.BackingImage() || !target.BackingImage() ||
         color.IsRescaled() || target.IsRescaled() ||
         color.Samples() != VK_SAMPLE_COUNT_1_BIT || target.Samples() != VK_SAMPLE_COUNT_1_BIT ||
@@ -2836,13 +2855,15 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
                 staging_pool, *oot_backend);
         }
         const VkExtent2D target_extent{target.size.width, target.size.height};
-        const VkExtent2D output_extent = upscale_4k ? VkExtent2D{3840, 2160} : target_extent;
+        const VkExtent2D output_extent = native_resolution ? extent
+                                         : upscale_4k      ? VkExtent2D{3840, 2160}
+                                                           : target_extent;
         const std::array<f32, 2> jitter =
             oot_jitter_frame == render_trace_frame ? oot_jitter_offset : std::array<f32, 2>{};
         const bool recorded = oot_live_dlss->Record(color_view, depth.DepthView(), target_view,
                                                    extent, output_extent, target_extent, oot_motion.current,
                                                    oot_motion.previous, mesh, depth.ImageHandle(),
-                                                   render_trace_frame, jitter);
+                                                   render_trace_frame, jitter, dlss_settings);
         if (!recorded) {
             return fail("temporal upscaler declined the frame");
         }

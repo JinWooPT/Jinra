@@ -139,6 +139,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 native_critical_memory{};
     u64 native_expected_memory{};
     u64 budget_check_frames{};
+    u64 last_logged_critical_memory{};
+    u64 base_minimum_memory{};
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
@@ -579,6 +581,7 @@ private:
 
     /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
     void ApplyThresholdOverrides(bool log = true);
+    void LogThresholds() const;
 
     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;

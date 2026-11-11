@@ -8,6 +8,7 @@
 #include <array>
 #include <cstring>
 #include <cstdlib>
+#include <string_view>
 #include <span>
 #include <vector>
 
@@ -598,6 +599,14 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
     }
 
     scheduler.RequestOutsideRenderPassOperationContext();
+    static const bool batch_uploads = [] {
+        const char* value = std::getenv("JINRA_VULKAN_BATCH_UPLOADS");
+        return value && std::string_view{value} == "1";
+    }();
+    if (batch_uploads && barrier && src_buffer == staging_pool.StreamBuf() && !vk_copies.empty()) {
+        scheduler.RecordUpload(src_buffer, dst_buffer, {vk_copies.data(), vk_copies.size()});
+        return;
+    }
     scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
         if (barrier) {
             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
@@ -606,7 +615,7 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
         if (barrier) {
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, WRITE_BARRIER);
+                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, WRITE_BARRIER);
         }
     });
 }
@@ -634,8 +643,8 @@ void BufferCacheRuntime::PostCopyBarrier() {
     };
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
-                               0, WRITE_BARRIER);
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, WRITE_BARRIER);
     });
 }
 

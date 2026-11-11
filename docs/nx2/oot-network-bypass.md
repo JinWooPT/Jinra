@@ -68,3 +68,25 @@ The game's constants (shader hashes, program keys, the cb0 offset) are in
   shows in deep shadows.
 - The heavy dispatch between the prepass and the network still runs; its result goes unused.
 - Vulkan only: other backends never learn the tonemapped image, so the setting has no effect there.
+
+## AMD FidelityFX temporal upscaling
+
+The Vulkan anti-aliasing options also offer AMD FSR 3.1 and, on supported AMD GPUs
+with AMD Software: Adrenalin Edition 26.10.1 or later on Windows, AMD FSR 4.
+If NVIDIA DLSS is enabled and available,
+Jinra uses it first. The RCAS Sharpness control applies to FSR. Changes take
+effect when the game starts.
+
+Selecting AMD FSR 4 exposes a download panel. The panel displays AMD's licence
+and downloads the two Vulkan DLLs from the
+[official AMD FidelityFX SDK 2.4.0 release](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases/tag/v2.4.0)
+after acceptance. Jinra checks the pinned file sizes, SHA-256 digests and AMD
+Authenticode signatures. The DLLs and licence are stored in the user data
+directory's `fidelityfx` folder. Jinra uses its built-in FSR 3.1 when the SDK
+files, an eligible driver or an FSR 4 provider are unavailable. If the temporal
+upscaler cannot handle the game's inputs, the game renders its original pass.
+
+The Ocarina integration follows Lichii build 150
+([FSR 3.1](https://github.com/zortos293/Lichii/pull/1060),
+[jitter and LOD bias](https://github.com/zortos293/Lichii/pull/1061),
+[FSR 4](https://github.com/zortos293/Lichii/pull/1062)).

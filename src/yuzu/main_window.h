@@ -57,6 +57,7 @@ class MultiplayerState;
 class QPushButton;
 class QProgressDialog;
 class NupProgressDialog;
+class NxTools;
 class QSlider;
 class QHBoxLayout;
 class WaitTreeWidget;
@@ -450,6 +451,8 @@ private slots:
 #endif
 
 private:
+    void OnGameListNxTool(const std::string& game_path, void (NxTools::*tool)(const std::string&));
+    void OnGameListEditNxMetadata(const std::string& game_path);
     void RemovePlayTimeData(u64 program_id);
     bool SelectRomFSDumpTarget(const FileSys::ContentProvider&, u64 program_id,
                                u64* selected_title_id, u8* selected_content_record_type);
@@ -535,6 +538,7 @@ private:
     QLabel* res_scale_label = nullptr;
     QLabel* emu_speed_label = nullptr;
     QLabel* game_fps_label = nullptr;
+    QLabel* dlss_status_label = nullptr;
     QLabel* emu_frametime_label = nullptr;
     QLabel* tas_label = nullptr;
     QLabel* firmware_label = nullptr;
@@ -548,6 +552,7 @@ private:
     QPushButton* frame_gen_status_button = nullptr;
     VideoCore::FrameGenState frame_gen_state{};
     u64 frame_gen_frames = 0;
+    u64 dlss_evaluations = 0;
     bool frame_gen_generating = false;
     VolumeButton* volume_button = nullptr;
     QWidget* volume_popup = nullptr;
@@ -600,6 +605,8 @@ private:
     QFutureWatcher<FileSys::Nup::PackResult> nup_watcher;
     std::shared_ptr<std::atomic_bool> nup_cancel;
     bool nup_running{};
+    NxTools* nx_tools = nullptr;
+    bool nx_metadata_write_in_progress = false;
     std::string nup_source_path;
 
     // Last game booted, used for multi-process apps

@@ -62,6 +62,7 @@ add_library(video_core STATIC
     engines/puller.h
     framebuffer_config.cpp
     framebuffer_config.h
+    fsr4_support.h
     render_trace.h
     fsr.cpp
     fsr.h
@@ -193,6 +194,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_compute_pass.h
     renderer_vulkan/vk_fsr3_upscaler.cpp
     renderer_vulkan/vk_fsr3_upscaler.h
+    renderer_vulkan/vk_fsr4_upscaler.cpp
+    renderer_vulkan/vk_fsr4_upscaler.h
     renderer_vulkan/vk_dlss_network_probe.cpp
     renderer_vulkan/vk_dlss_network_probe.h
     renderer_vulkan/vk_ocarina_camera_motion.cpp
@@ -250,6 +253,9 @@ add_library(video_core STATIC
     renderer_vulkan/vk_update_descriptor.cpp
     renderer_vulkan/vk_update_descriptor.h
     renderer_vulkan/descriptor_payload_growth.h
+    vulkan_common/ffx_files.h
+    vulkan_common/ffx_runtime.cpp
+    vulkan_common/ffx_runtime.h
     vulkan_common/vulkan_debug_callback.cpp
     vulkan_common/vulkan_debug_callback.h
     vulkan_common/vulkan_device.cpp
@@ -489,6 +495,10 @@ target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
 
 add_dependencies(video_core host_shaders)
 target_include_directories(video_core PRIVATE ${HOST_SHADERS_INCLUDE})
+target_include_directories(video_core PRIVATE ${CMAKE_SOURCE_DIR}/externals/ffx-api)
+if (WIN32)
+    target_link_libraries(video_core PRIVATE bcrypt wintrust crypt32)
+endif()
 
 target_link_libraries(video_core PRIVATE sirit::sirit)
 

@@ -10,6 +10,7 @@
 #include <map>
 #include <random>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 
 #include <fmt/format.h>
@@ -34,6 +35,7 @@ constexpr std::size_t TlvHeaderSize = 0x8;
 constexpr u32 TocMagic = 0x01434F54; // "TOC\x01" little-endian
 constexpr u8 CodecRaw = 0;
 constexpr u8 CodecZstd = 1;
+constexpr std::array<u8, 4> ZstdMagic{0x28, 0xB5, 0x2F, 0xFD};
 constexpr u8 PackageFlagStandaloneUpdate = 0x01;
 constexpr u32 MaxDirDepth = 128;
 
@@ -705,40 +707,137 @@ VirtualFile NupContainer::OpenFile(std::size_t file_index) {
     if (file_index >= files.size()) {
         return nullptr;
     }
+    return OpenFileAs(file_index, files[file_index].name);
+}
+
+VirtualFile NupContainer::OpenFileAs(std::size_t file_index, const std::string& name) {
     const FileNode& node = files[file_index];
     if (node.size == 0) {
-        return std::make_shared<VectorVfsFile>(std::vector<u8>{}, node.name);
+        return std::make_shared<VectorVfsFile>(std::vector<u8>{}, name);
     }
     if (node.codec == CodecRaw) {
         return std::make_shared<OffsetVfsFile>(
             file, static_cast<std::size_t>(node.extent_size),
-            static_cast<std::size_t>(node.extent_offset), node.name);
+            static_cast<std::size_t>(node.extent_offset), name);
     }
     return std::make_shared<NupVfsFile>(file, node.extent_offset, node.extent_size, node.size,
-                                        node.name, cache, file_index);
+                                        name, cache, file_index);
 }
 
-void NupContainer::BuildDirTree(u32 dir_index, VectorVfsDirectory& out) {
+std::optional<bool> NupContainer::HasZstdMagic(std::size_t file_index) const {
+    const FileNode& node = files[file_index];
+    std::array<u8, ZstdMagic.size()> head{};
+    if (node.size < head.size()) {
+        return false;
+    }
+    if (node.codec == CodecRaw) {
+        if (node.extent_size < head.size() ||
+            file->Read(head.data(), head.size(), static_cast<std::size_t>(node.extent_offset)) !=
+                head.size()) {
+            return std::nullopt;
+        }
+    } else {
+        // Probe one outer Zstandard block plus framing to inspect the game's texture header.
+        constexpr std::size_t MaxProbeBytes = 132 * 1024;
+        const auto compressed_size = static_cast<std::size_t>(
+            std::min<u64>(node.extent_size, MaxProbeBytes));
+        const auto compressed =
+            file->ReadBytes(compressed_size, static_cast<std::size_t>(node.extent_offset));
+        std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> context{ZSTD_createDCtx(),
+                                                                    &ZSTD_freeDCtx};
+        if (compressed.size() != compressed_size || !context) {
+            return std::nullopt;
+        }
+        ZSTD_inBuffer input{compressed.data(), compressed.size(), 0};
+        ZSTD_outBuffer output{head.data(), head.size(), 0};
+        while (output.pos < output.size) {
+            const auto previous_input = input.pos;
+            const auto previous_output = output.pos;
+            const auto result = ZSTD_decompressStream(context.get(), &output, &input);
+            if (ZSTD_isError(result) ||
+                (previous_input == input.pos && previous_output == output.pos)) {
+                return std::nullopt;
+            }
+        }
+    }
+    // A skippable frame may precede the real frame. Its four-byte prefix is inconclusive.
+    if ((head[0] & 0xF0) == 0x50 && head[1] == 0x2A && head[2] == 0x4D && head[3] == 0x18) {
+        return std::nullopt;
+    }
+    return head == ZstdMagic;
+}
+
+std::optional<std::size_t> NupContainer::FindTextureStandIn(std::size_t damaged,
+                                                           std::span<const u32> siblings) const {
+    const auto& target = files[damaged];
+    const auto separator = target.name.rfind('_');
+    if (separator == std::string::npos) {
+        return std::nullopt;
+    }
+    // Match the texture type, then rank by name prefix and closest size.
+    const auto suffix = std::string_view{target.name}.substr(separator);
+    std::optional<std::size_t> best;
+    std::size_t best_prefix{};
+    u64 best_gap{};
+    for (const u32 child : siblings) {
+        if (child < dirs.size()) {
+            continue;
+        }
+        const auto index = child - dirs.size();
+        const auto& candidate = files[index];
+        if (index == damaged || !candidate.name.ends_with(suffix)) {
+            continue;
+        }
+        const auto mismatch = std::ranges::mismatch(target.name, candidate.name);
+        const auto prefix = static_cast<std::size_t>(mismatch.in1 - target.name.begin());
+        const u64 gap = std::max(target.size, candidate.size) -
+                        std::min(target.size, candidate.size);
+        if (best && (prefix < best_prefix || (prefix == best_prefix && gap >= best_gap))) {
+            continue;
+        }
+        if (HasZstdMagic(index) == true) {
+            best = index;
+            best_prefix = prefix;
+            best_gap = gap;
+        }
+    }
+    return best;
+}
+
+void NupContainer::BuildDirTree(u32 dir_index, VectorVfsDirectory& out, bool serve_stand_ins) {
     const DirNode& node = dirs[dir_index];
-    const u64 end = static_cast<u64>(node.first_child) + node.child_count;
-    for (u64 slot = node.first_child; slot < end; ++slot) {
-        const u32 child = children[slot];
+    const auto siblings = std::span<const u32>{children}.subspan(node.first_child, node.child_count);
+    for (const u32 child : siblings) {
         if (child >= dirs.size()) {
-            out.AddFile(OpenFile(child - static_cast<u32>(dirs.size())));
+            const auto index = child - dirs.size();
+            const auto& member = files[index];
+            // Damaged .bntx.zs members shrink enough to be compressed again by the NUP writer.
+            if (serve_stand_ins && member.codec == CodecZstd && member.name.ends_with(".bntx.zs") &&
+                HasZstdMagic(index) == false) {
+                if (const auto stand_in = FindTextureStandIn(index, siblings)) {
+                    LOG_WARNING(Loader, "NUP: {} has a damaged header. Using {} in its place.",
+                                member.name, files[*stand_in].name);
+                    out.AddFile(OpenFileAs(*stand_in, member.name));
+                    continue;
+                }
+                LOG_WARNING(Loader, "NUP: {} has a damaged header and no matching texture.",
+                            member.name);
+            }
+            out.AddFile(OpenFile(index));
         } else {
             auto sub = std::make_shared<VectorVfsDirectory>(std::vector<VirtualFile>{},
                                                             std::vector<VirtualDir>{},
                                                             dirs[child].name);
-            BuildDirTree(child, *sub);
+            BuildDirTree(child, *sub, serve_stand_ins);
             out.AddDirectory(sub);
         }
     }
 }
 
-VirtualDir NupContainer::BuildPackageDir(u32 dir_index) {
+VirtualDir NupContainer::BuildPackageDir(u32 dir_index, bool serve_stand_ins) {
     auto out = std::make_shared<VectorVfsDirectory>(std::vector<VirtualFile>{},
                                                     std::vector<VirtualDir>{}, dirs[dir_index].name);
-    BuildDirTree(dir_index, *out);
+    BuildDirTree(dir_index, *out, serve_stand_ins);
     return out;
 }
 
@@ -750,7 +849,7 @@ VirtualDir NupContainer::GetExeFSDir(std::size_t package_index) {
         exefs_dir_cache.resize(packages.size());
     }
     if (exefs_dir_cache[package_index] == nullptr) {
-        auto dir = BuildPackageDir(packages[package_index].exefs_dir);
+        auto dir = BuildPackageDir(packages[package_index].exefs_dir, false);
         if (dir->GetFiles().empty() && dir->GetSubdirectories().empty()) {
             return nullptr;
         }
@@ -767,7 +866,7 @@ VirtualDir NupContainer::GetRomFSDir(std::size_t package_index) {
         romfs_dir_cache.resize(packages.size());
     }
     if (romfs_dir_cache[package_index] == nullptr) {
-        romfs_dir_cache[package_index] = BuildPackageDir(packages[package_index].romfs_dir);
+        romfs_dir_cache[package_index] = BuildPackageDir(packages[package_index].romfs_dir, true);
     }
     return romfs_dir_cache[package_index];
 }
@@ -776,7 +875,7 @@ VirtualDir NupContainer::GetPackageDir(std::size_t package_index) {
     if (package_index >= packages.size()) {
         return nullptr;
     }
-    return BuildPackageDir(packages[package_index].root_dir);
+    return BuildPackageDir(packages[package_index].root_dir, false);
 }
 
 VirtualDir NupContainer::MergeShadowDirs(const VirtualDir& base, const VirtualDir& overlay) {

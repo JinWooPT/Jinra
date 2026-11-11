@@ -1,0 +1,234 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <mutex>
+#include <system_error>
+
+#include "common/fs/path_util.h"
+#include "common/logging.h"
+#include "video_core/vulkan_common/ffx_runtime.h"
+
+#ifdef _WIN32
+#include <array>
+#include <cstdio>
+#include <fstream>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <windows.h>
+#include <bcrypt.h>
+#include <softpub.h>
+#include <wincrypt.h>
+#include <wintrust.h>
+#endif
+
+namespace Vulkan::FfxRuntime {
+
+std::filesystem::path Folder() {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::FidelityFxDir);
+}
+
+bool FilesPresent() {
+    const std::filesystem::path folder = Folder();
+    std::error_code ec;
+    for (const File& file : FILES) {
+        if (std::filesystem::file_size(folder / file.name, ec) != file.size || ec) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#ifdef _WIN32
+
+/// AMD signs with more than one name: its other signed files on a Ryzen PC read "Advanced Micro
+/// Devices Inc." (2026-11-09), and an exact "Advanced Micro Devices" would silently drop FSR 4 to
+/// FSR 3.1. The files are SHA-256 pinned as well, so the name only has to be AMD's.
+static bool IsAmdSignerName(std::wstring_view name) {
+    constexpr std::wstring_view Amd = L"Advanced Micro Devices";
+    if (!name.starts_with(Amd)) {
+        return false;
+    }
+    const std::wstring_view rest = name.substr(Amd.size());
+    return rest.empty() || rest == L" Inc." || rest == L", Inc." || rest == L" Inc" ||
+           rest == L", Inc" || rest == L" Incorporated";
+}
+
+bool IsSignedByAmd(const std::filesystem::path& path) {
+    const std::wstring file_path = std::filesystem::absolute(path).wstring();
+    WINTRUST_FILE_INFO file{};
+    file.cbStruct = sizeof(file);
+    file.pcwszFilePath = file_path.c_str();
+    WINTRUST_DATA data{};
+    data.cbStruct = sizeof(data);
+    data.dwUIChoice = WTD_UI_NONE;
+    data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.pFile = &file;
+    data.dwStateAction = WTD_STATEACTION_VERIFY;
+    data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    bool valid = WinVerifyTrust(nullptr, &action, &data) == ERROR_SUCCESS;
+    if (valid) {
+        CRYPT_PROVIDER_DATA* const provider = WTHelperProvDataFromStateData(data.hWVTStateData);
+        CRYPT_PROVIDER_SGNR* const signer =
+            provider ? WTHelperGetProvSignerFromChain(provider, 0, FALSE, 0) : nullptr;
+        CRYPT_PROVIDER_CERT* const cert = signer ? WTHelperGetProvCertFromChain(signer, 0) : nullptr;
+        wchar_t name[128]{};
+        valid = cert &&
+                CertGetNameStringW(cert->pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name,
+                                   static_cast<DWORD>(std::size(name))) > 1 &&
+                IsAmdSignerName(name);
+    }
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &action, &data);
+    return valid;
+}
+
+bool HasSha256(const std::filesystem::path& path, std::string_view sha256) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        return false;
+    }
+    BCRYPT_ALG_HANDLE algorithm{};
+    if (!BCRYPT_SUCCESS(
+            BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0))) {
+        return false;
+    }
+    BCRYPT_HASH_HANDLE hash{};
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0))) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return false;
+    }
+    std::vector<char> buffer(1 << 20);
+    bool ok = true;
+    while (ok && stream) {
+        stream.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto read = static_cast<ULONG>(stream.gcount());
+        ok = read == 0 || BCRYPT_SUCCESS(BCryptHashData(
+                              hash, reinterpret_cast<PUCHAR>(buffer.data()), read, 0));
+    }
+    std::array<UCHAR, 32> digest{};
+    ok = ok && stream.eof() &&
+         BCRYPT_SUCCESS(BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0));
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (!ok || sha256.size() != digest.size() * 2) {
+        return false;
+    }
+    std::array<char, 3> hex{};
+    for (size_t i = 0; i < digest.size(); ++i) {
+        std::snprintf(hex.data(), hex.size(), "%02x", digest[i]);
+        if (sha256.substr(i * 2, 2) != std::string_view{hex.data(), 2}) {
+            return false;
+        }
+    }
+    return true;
+}
+
+namespace {
+
+struct Loaded : Api {
+    HMODULE loader{};
+    HMODULE upscaler{};
+
+    ~Loaded() {
+        if (loader) {
+            FreeLibrary(loader);
+        }
+        if (upscaler) {
+            FreeLibrary(upscaler);
+        }
+    }
+};
+
+std::mutex mutex;
+std::shared_ptr<const Loaded> current;
+
+HMODULE LoadVerified(const File& file) {
+    const auto path = Folder() / file.name;
+    const auto name = std::filesystem::path{file.name}.wstring();
+    // Keep the file stable between verifying it and mapping it as an executable image.
+    const HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        LOG_INFO(Render_Vulkan, "AMD FSR 4: cannot open {}; using FSR 3.1", file.name);
+        return nullptr;
+    }
+    LARGE_INTEGER size{};
+    const bool verified = GetFileSizeEx(handle, &size) && size.QuadPart >= 0 &&
+                          static_cast<u64>(size.QuadPart) == file.size &&
+                          HasSha256(path, file.sha256) && IsSignedByAmd(path);
+    HMODULE module = nullptr;
+    if (verified) {
+        module = LoadLibraryExW(path.c_str(), nullptr,
+                                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+    const DWORD error = module ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(handle);
+    if (!verified) {
+        LOG_WARNING(Render_Vulkan, "AMD FSR 4: {} failed verification; using FSR 3.1", file.name);
+    } else if (!module) {
+        LOG_WARNING(Render_Vulkan, "AMD FSR 4: cannot load {} (error {}); using FSR 3.1",
+                    file.name, error);
+    } else if (GetModuleHandleW(name.c_str()) != module) {
+        LOG_WARNING(Render_Vulkan, "AMD FSR 4: another {} is loaded; using FSR 3.1", file.name);
+        FreeLibrary(module);
+        return nullptr;
+    }
+    return module;
+}
+
+} // Anonymous namespace
+
+std::shared_ptr<const Api> Acquire() {
+    std::scoped_lock lock{mutex};
+    if (current) {
+        return current;
+    }
+    auto loaded = std::make_shared<Loaded>();
+    // AMD prefers effect DLLs already loaded by name, then those beside the executable.
+    // Preload the verified effect so it cannot pick up an unverified copy from either location.
+    loaded->upscaler = LoadVerified(FILES[1]);
+    if (!loaded->upscaler) {
+        return nullptr;
+    }
+    loaded->loader = LoadVerified(FILES[0]);
+    const HMODULE module = loaded->loader;
+    if (!module) {
+        return nullptr;
+    }
+    loaded->create_context =
+        reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(module, "ffxCreateContext"));
+    loaded->destroy_context =
+        reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(module, "ffxDestroyContext"));
+    loaded->query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(module, "ffxQuery"));
+    loaded->dispatch = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(module, "ffxDispatch"));
+    if (!loaded->create_context || !loaded->destroy_context || !loaded->query ||
+        !loaded->dispatch) {
+        LOG_WARNING(Render_Vulkan, "AMD FSR 4: the FidelityFX loader lacks its exports");
+        return nullptr;
+    }
+    LOG_INFO(Render_Vulkan, "AMD FSR 4: FidelityFX SDK {} runtime loaded", SDK_VERSION);
+    current = std::move(loaded);
+    return current;
+}
+
+#else
+
+bool IsSignedByAmd(const std::filesystem::path&) {
+    return false;
+}
+
+bool HasSha256(const std::filesystem::path&, std::string_view) {
+    return false;
+}
+
+std::shared_ptr<const Api> Acquire() {
+    return nullptr;
+}
+
+#endif
+
+} // namespace Vulkan::FfxRuntime

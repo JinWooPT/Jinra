@@ -3,9 +3,15 @@
 
 #pragma once
 
+#include "common/settings_enums.h"
+
 namespace VideoCommon {
 
 enum class OcarinaUpscaleBackend { Native, Fsr, Dlss };
+
+constexpr bool IsOcarinaFsr(Settings::OotAntiAliasing mode) {
+    return mode == Settings::OotAntiAliasing::Fsr31 || mode == Settings::OotAntiAliasing::Fsr4;
+}
 
 constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(bool fsr_enabled, bool dlss_enabled,
                                                     bool dlss_available) {

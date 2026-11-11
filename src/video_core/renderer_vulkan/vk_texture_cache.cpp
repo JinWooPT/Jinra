@@ -1992,7 +1992,10 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
             .barrier_aspect = ImageAspectMask(view.format),
         };
     };
-    const VkExtent2D extent = dst_framebuffer->RenderArea();
+    const auto dlss_settings = Settings::GetNvidiaDlssRuntimeSettings();
+    const bool native_resolution = dlss_settings.quality == Settings::NvidiaDlssQuality::Native;
+    const VkExtent2D extent = native_resolution ? VkExtent2D{render_size[0], render_size[1]}
+                                                : dst_framebuffer->RenderArea();
     bool upscaled{};
     try {
         upscaled = dlss_upscaler->Upscale({
@@ -2008,7 +2011,7 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
             .reset = reset,
-        });
+        }, dlss_settings);
     } catch (const vk::Exception& exception) {
         LOG_WARNING(Render_Vulkan, "NVIDIA DLSS evaluation unavailable ({}); using FSR 3.1",
                     exception.what());
@@ -2018,7 +2021,8 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
         return false;
     }
     DrawUpscaledOutput(dst_framebuffer, dlss_upscaler->OutputView(), dlss_upscaler->OutputImage(),
-                       dlss_upscaler->PointSampler());
+                       native_resolution ? dlss_upscaler->LinearSampler()
+                                         : dlss_upscaler->PointSampler());
     static bool logged{};
     if (!logged) {
         logged = true;

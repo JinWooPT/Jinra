@@ -18,6 +18,7 @@
 #include "common/common_types.h"
 #include "common/literals.h"
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include <ranges>
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/vulkan_common/unbacked_fallback.h"
@@ -303,9 +304,14 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         }
     }
     if (result != VK_SUCCESS) {
-        failed_images.fetch_add(1, std::memory_order_relaxed);
-        static u32 failed_logged{};
-        if (failed_logged++ < 32) {
+        const auto failed_count = failed_images.fetch_add(1, std::memory_order_relaxed);
+        if (failed_count == 0) {
+            if (const auto commit_room = Common::GetSystemCommitRoom()) {
+                LOG_WARNING(Render_Vulkan, "Host memory: {} MiB of commit left", *commit_room >> 20);
+            }
+            LogMemoryStatistics(device);
+        }
+        if (failed_count < 32) {
             LOG_ERROR(Render_Vulkan, "Image {}x{}x{} ({} levels, {} layers, format {}) failed: {}",
                       ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
                       ci.arrayLayers, static_cast<u32>(ci.format), static_cast<int>(result));

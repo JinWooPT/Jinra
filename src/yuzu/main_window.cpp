@@ -49,6 +49,10 @@
 #include "yuzu/game/shader_sync.h"
 #include "yuzu/nup_dialogs.h"
 #include "yuzu/jinra_home.h"
+#ifdef JINRA_NX_TOOLS
+#include "core/file_sys/registered_cache.h"
+#include "yuzu/nx_tools.h"
+#endif
 
 #include "applets/qt_amiibo_settings.h"
 #include "applets/qt_controller.h"
@@ -1014,13 +1018,15 @@ void MainWindow::InitializeWidgets() {
     game_fps_label = new QLabel();
     game_fps_label->setToolTip(tr("How many frames per second the game is currently displaying. "
                                   "This will vary from game to game and scene to scene."));
+    dlss_status_label = new QLabel();
+    dlss_status_label->setToolTip(tr("Active NVIDIA DLSS mode and requested model preset."));
     emu_frametime_label = new QLabel();
     emu_frametime_label->setToolTip(
         tr("Time taken to emulate a Switch frame, not counting framelimiting or v-sync. For "
            "full-speed emulation this should be at most 16.67 ms."));
 
     for (auto& label : {shader_building_label, res_scale_label, emu_speed_label, game_fps_label,
-                        emu_frametime_label}) {
+                        dlss_status_label, emu_frametime_label}) {
         label->setVisible(false);
         label->setFrameStyle(QFrame::NoFrame);
         label->setContentsMargins(4, 0, 4, 0);
@@ -1544,6 +1550,27 @@ void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::ExtractNupRequested, this, &MainWindow::OnGameListExtractNup);
     connect(game_list, &GameList::EditNupMetadataRequested, this,
             &MainWindow::OnGameListEditNupMetadata);
+#ifdef JINRA_NX_TOOLS
+    nx_tools = new NxTools(QtCommon::vfs, this);
+    connect(nx_tools, &NxTools::RunningChanged, game_list, &GameList::SetNxToolRunning);
+    connect(nx_tools, &NxTools::ArchivesChanged, this, &MainWindow::OnGameListRefresh);
+    connect(nx_tools, &NxTools::MetadataWriteFinished, this, [this] {
+        nx_metadata_write_in_progress = false;
+        if (!close_pending) {
+            QtCommon::Game::ResetMetadata(false);
+            game_list->SetScanEnabled(true);
+            game_list->PopulateAsync(UISettings::values.game_dirs);
+        }
+    });
+    connect(game_list, &GameList::ConvertToNxRequested, this,
+            [this](const std::string& path) { OnGameListNxTool(path, &NxTools::ConvertToNx); });
+    connect(game_list, &GameList::AddToNxRequested, this,
+            [this](const std::string& path) { OnGameListNxTool(path, &NxTools::AddToNx); });
+    connect(game_list, &GameList::RemoveFromNxRequested, this,
+            [this](const std::string& path) { OnGameListNxTool(path, &NxTools::RemoveFromNx); });
+    connect(game_list, &GameList::EditNxMetadataRequested, this,
+            &MainWindow::OnGameListEditNxMetadata);
+#endif
     connect(game_list, &GameList::CopyTIDRequested, this, &MainWindow::OnGameListCopyTID);
     connect(game_list, &GameList::CreateShortcut, this, &MainWindow::OnGameListCreateShortcut);
     connect(game_list, &GameList::AddDirectory, this, &MainWindow::OnGameListAddDirectory);
@@ -2042,6 +2069,13 @@ bool MainWindow::SelectAndSetCurrentUser(
 
 void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletParameters params,
                           StartGameType type) {
+#ifdef JINRA_NX_TOOLS
+    if (nx_metadata_write_in_progress) {
+        QMessageBox::information(this, tr("NX Archive"),
+                                 tr("Wait for the NX metadata edit to finish before starting a game."));
+        return;
+    }
+#endif
     if (nup_running && filename.toStdString() == nup_source_path) {
         QMessageBox::information(this, tr("Conversion in Progress"),
                                  tr("This game cannot be started while its dump is being "
@@ -2246,6 +2280,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     frame_gen_status_button->setDisabled(true);
     frame_gen_state = VideoCore::FrameGenState::Pending;
     frame_gen_frames = 0;
+    dlss_evaluations = 0;
     frame_gen_generating = false;
     refresh_button->setDisabled(true);
     SetFPSSuffix();
@@ -2464,6 +2499,7 @@ void MainWindow::OnEmulationStopped() {
     res_scale_label->setVisible(false);
     emu_speed_label->setVisible(false);
     game_fps_label->setVisible(false);
+    dlss_status_label->hide();
     emu_frametime_label->setVisible(false);
     renderer_status_button->setEnabled(!UISettings::values.has_broken_vulkan);
     frame_gen_status_button->setEnabled(true);
@@ -4309,6 +4345,47 @@ void MainWindow::OnGameListRefresh() {
     SetFirmwareVersion();
 }
 
+#ifdef JINRA_NX_TOOLS
+void MainWindow::OnGameListEditNxMetadata(const std::string& game_path) {
+    const auto can_edit = [this] {
+        if (boot_in_progress || close_pending || nx_metadata_write_in_progress) {
+            return false;
+        }
+        if (emulation_running || QtCommon::system->IsPoweredOn()) {
+            QMessageBox::information(this, tr("NX Archive"),
+                                     tr("Stop emulation before editing NX metadata."));
+            return false;
+        }
+        return true;
+    };
+    if (!can_edit()) {
+        return;
+    }
+    nx_tools->EditNxMetadata(game_path, [this, &can_edit] {
+        if (!can_edit()) {
+            return false;
+        }
+        nx_metadata_write_in_progress = true;
+        game_list->SetScanEnabled(false);
+        // The manual provider keeps NX sessions alive through registered updates and DLC.
+        QtCommon::provider->ClearAllEntries();
+        return true;
+    });
+}
+
+void MainWindow::OnGameListNxTool(const std::string& game_path,
+                                  void (NxTools::*tool)(const std::string&)) {
+    // An archive edited in place must not be read by a running game.
+    if (emulation_running && tool != &NxTools::ConvertToNx &&
+        current_game_path == QString::fromStdString(game_path)) {
+        QMessageBox::information(this, tr("NX Archive"),
+                                 tr("Stop the game before changing its NX archive."));
+        return;
+    }
+    (nx_tools->*tool)(game_path);
+}
+#endif
+
 void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
     if (nup_running)
         return;
@@ -4956,7 +5033,44 @@ void MainWindow::UpdateStatusBar() {
 
     emu_frametime_label->setText(tr("Frame: %1 ms").arg(results.frametime * 1000.0, 0, 'f', 2));
 
-    const auto frame_gen = QtCommon::system->GPU().Renderer().GetFrameGenStatus();
+    const auto& renderer = QtCommon::system->GPU().Renderer();
+    const auto dlss = renderer.GetDlssStatus();
+    const bool dlss_active = dlss.evaluations > dlss_evaluations;
+    dlss_evaluations = dlss.evaluations;
+    if (dlss_active) {
+        const auto mode_text = [this](Settings::NvidiaDlssQuality mode) {
+            using Quality = Settings::NvidiaDlssQuality;
+            switch (mode) {
+            case Quality::Native:
+                return QStringLiteral("DLAA");
+            case Quality::Quality:
+                return tr("Quality");
+            case Quality::Balanced:
+                return tr("Balanced");
+            case Quality::Performance:
+                return tr("Performance");
+            case Quality::UltraPerformance:
+                return tr("Ultra Performance");
+            case Quality::Automatic:
+                return tr("Automatic");
+            }
+            return QString{};
+        };
+        const auto preset = dlss.preset == Settings::NvidiaDlssPreset::NvidiaDefault
+                                ? tr("NVIDIA default")
+                                : QString::fromStdString(
+                                      std::string{Settings::CanonicalizeEnum(dlss.preset)});
+        auto text = tr("DLSS %1 %2", "Active DLSS mode and model preset")
+                        .arg(mode_text(dlss.mode), preset);
+        if (dlss.requested != Settings::NvidiaDlssQuality::Automatic &&
+            dlss.requested != dlss.mode) {
+            text += tr(" (%1 unavailable)").arg(mode_text(dlss.requested));
+        }
+        dlss_status_label->setText(text);
+    }
+    dlss_status_label->setVisible(dlss_active);
+
+    const auto frame_gen = renderer.GetFrameGenStatus();
     frame_gen_generating = frame_gen.generated_frames > frame_gen_frames;
     frame_gen_frames = frame_gen.generated_frames;
     frame_gen_state = frame_gen.state;

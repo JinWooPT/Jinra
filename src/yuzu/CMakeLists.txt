@@ -84,6 +84,8 @@ add_executable(yuzu
     configuration/configure_general.ui
     configuration/configure_graphics.cpp
     configuration/configure_graphics.h
+    configuration/amd_fsr4_panel.cpp
+    configuration/amd_fsr4_panel.h
     configuration/nvidia_dlss_panel.cpp
     configuration/nvidia_dlss_panel.h
     configuration/configure_graphics.ui
@@ -501,4 +503,10 @@ endif()
 # Remember that the linker is incredibly stupid.
 target_link_libraries(yuzu PRIVATE OpenSSL::SSL OpenSSL::Crypto SDL3::SDL3)
 
+# NX archive conversion and editing (nx_tools.cpp) runs nxformat in the process, linked statically.
+if (TARGET nxformat::static_nozstd)
+    target_sources(yuzu PRIVATE nx_tools.h nx_tools.cpp)
+    target_link_libraries(yuzu PRIVATE nxformat::static_nozstd)
+    target_compile_definitions(yuzu PRIVATE JINRA_NX_TOOLS)
+endif()
 create_target_directory_groups(yuzu)

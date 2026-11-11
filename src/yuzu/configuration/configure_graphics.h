@@ -26,6 +26,7 @@ class QPushButton;
 class QEvent;
 class QObject;
 class QComboBox;
+class AmdFsr4Panel;
 
 namespace Settings {
 enum class NvdecEmulation : u32;
@@ -71,6 +72,7 @@ private:
     void UpdateBackgroundColorButton(QColor color);
     void UpdateAPILayout();
     void UpdateDeviceSelection(int device);
+    void UpdateAmdFsr4Visibility();
 
     void RetrieveVulkanDevices();
 
@@ -110,4 +112,6 @@ private:
     QWidget* api_widget;
     QComboBox* aspect_ratio_combobox;
     QComboBox* resolution_combobox;
+    QComboBox* oot_aa_combobox{};
+    AmdFsr4Panel* amd_fsr4_panel{};
 };

@@ -55,6 +55,12 @@ VK_DEFINE_HANDLE(VmaPool)
 
 #define FOR_EACH_VK_FEATURE_1_4(FEATURE)
 
+#if defined(_WIN32) && defined(VK_EXT_shader_float8)
+#define FOR_EACH_VK_FSR4_FEATURE(FEATURE) FEATURE(EXT, ShaderFloat8, SHADER_FLOAT8, shader_float8)
+#else
+#define FOR_EACH_VK_FSR4_FEATURE(FEATURE)
+#endif
+
 // Define all features which may be used by the implementation and require an extension here.
 #define FOR_EACH_VK_FEATURE_EXT(FEATURE)                                                           \
     FEATURE(EXT, BorderColorSwizzle, BORDER_COLOR_SWIZZLE, border_color_swizzle)                   \
@@ -74,6 +80,7 @@ VK_DEFINE_HANDLE(VmaPool)
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
+    FOR_EACH_VK_FSR4_FEATURE(FEATURE)                                                              \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
     FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \

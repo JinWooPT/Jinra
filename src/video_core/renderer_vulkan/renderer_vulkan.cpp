@@ -34,6 +34,9 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/renderer_vulkan/vk_streamline_dlss.h"
+#endif
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/vulkan_common/vulkan_debug_callback.h"
@@ -137,6 +140,7 @@ try
     , dld()
 #ifdef EGLANTINE_STREAMLINE
     , streamline_started(Streamline::Start())
+    , dlss_evaluation_base(StreamlineDlssUpscaler::Status().evaluations)
 #endif
     // Create raw Vulkan instance first
     , instance(CreateInstance(*library,
@@ -419,5 +423,13 @@ void RendererVulkan::RenderAppletCaptureLayer(
     blit_applet.DrawToFrame(device, rasterizer, &applet_frame, capture_layers, VideoCore::Capture::Layout, 1,
                             CaptureFormat);
 }
+
+#ifdef EGLANTINE_STREAMLINE
+VideoCore::DlssStatus RendererVulkan::GetDlssStatus() const {
+    auto status = StreamlineDlssUpscaler::Status();
+    status.evaluations -= dlss_evaluation_base;
+    return status;
+}
+#endif
 
 } // namespace Vulkan

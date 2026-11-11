@@ -23,6 +23,7 @@ namespace FileSys {
 class ExternalContentProvider;
 class CNMT;
 class NCA;
+class NupContainer;
 class NSP;
 class XCI;
 enum class NCAContentType : u8;
@@ -268,6 +269,7 @@ public:
                              u32 version, const std::string& version_string, VirtualFile file);
     bool AddEntriesFromContainer(VirtualFile file, bool only_content = false,
                                  std::optional<u64> base_program_id = std::nullopt);
+    bool AddNupAddOns(NupContainer& nup, std::optional<u64> base_program_id);
     void ClearAllEntries();
 
     void Refresh() override;

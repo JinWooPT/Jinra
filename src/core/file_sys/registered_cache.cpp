@@ -21,7 +21,9 @@
 #include "core/file_sys/common_funcs.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
+#include "core/file_sys/decrypted_nca.h"
 #include "core/file_sys/nca_metadata.h"
+#include "core/file_sys/nup_container.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/submission_package.h"
@@ -1295,6 +1297,10 @@ void ManualContentProvider::AddEntryWithVersion(TitleType title_type, ContentRec
 
 bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_content,
                                                     std::optional<u64> base_program_id) {
+    if (NupContainer::IsNupFile(file)) {
+        NupContainer nup{file};
+        return AddNupAddOns(nup, base_program_id);
+    }
     const auto nsp = OpenContainerAsNsp(file, Loader::FileType::Unknown);
     if (!nsp) {
         return false;
@@ -1317,6 +1323,40 @@ bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_
                 AddEntry(title_type, content_type, title_id, entry_file);
             }
         });
+}
+
+bool ManualContentProvider::AddNupAddOns(NupContainer& nup, std::optional<u64> base_program_id) {
+    if (nup.GetStatus() != Loader::ResultStatus::Success) {
+        return false;
+    }
+    if (base_program_id) {
+        *base_program_id = GetBaseTitleID(*base_program_id);
+    }
+    const auto& packages = nup.GetPackages();
+    std::map<u64, std::pair<u32, VirtualDir>> latest;
+    for (std::size_t i = 0; i < packages.size(); ++i) {
+        const auto& package = packages[i];
+        if (package.kind != NupContainer::PackageKind::Addon ||
+            (base_program_id && GetBaseTitleID(package.title_id) != *base_program_id)) {
+            continue;
+        }
+        const auto it = latest.find(package.title_id);
+        if (it != latest.end() && it->second.first >= package.version) {
+            continue;
+        }
+        if (auto romfs = nup.GetRomFSDir(i)) {
+            latest.insert_or_assign(package.title_id, std::pair{package.version, std::move(romfs)});
+        }
+    }
+
+    bool added = false;
+    for (const auto& [title_id, entry] : latest) {
+        if (auto nca = BuildAddOnContentNca(title_id, CreateRomFS(entry.second))) {
+            AddEntry(TitleType::AOC, ContentRecordType::Data, title_id, std::move(nca));
+            added = true;
+        }
+    }
+    return added;
 }
 
 void ManualContentProvider::ClearAllEntries() {

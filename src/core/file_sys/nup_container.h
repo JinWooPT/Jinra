@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -188,8 +189,12 @@ private:
     bool Parse();
     bool ParseMeta(PackageInfo& package);
     bool ValidateDirTree() const;
-    void BuildDirTree(u32 dir_index, VectorVfsDirectory& out);
-    VirtualDir BuildPackageDir(u32 dir_index);
+    VirtualFile OpenFileAs(std::size_t file_index, const std::string& name);
+    std::optional<bool> HasZstdMagic(std::size_t file_index) const;
+    std::optional<std::size_t> FindTextureStandIn(std::size_t damaged,
+                                                  std::span<const u32> siblings) const;
+    void BuildDirTree(u32 dir_index, VectorVfsDirectory& out, bool serve_stand_ins);
+    VirtualDir BuildPackageDir(u32 dir_index, bool serve_stand_ins);
     std::vector<u8> ReadExtentRaw(const FileNode& node) const;
 
     VirtualFile file;

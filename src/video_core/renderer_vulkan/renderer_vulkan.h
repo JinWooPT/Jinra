@@ -67,6 +67,10 @@ public:
 #endif
     }
 
+#ifdef EGLANTINE_STREAMLINE
+    [[nodiscard]] VideoCore::DlssStatus GetDlssStatus() const override;
+#endif
+
     // Enhanced platform-specific initialization
     void InitializePlatformSpecific();
 
@@ -97,6 +101,7 @@ private:
     vk::InstanceDispatch dld;
 #ifdef EGLANTINE_STREAMLINE
     bool streamline_started; ///< NVIDIA Streamline starts before the instance.
+    const u64 dlss_evaluation_base;
 #endif
 
     // Keep original handles for compatibility with existing code

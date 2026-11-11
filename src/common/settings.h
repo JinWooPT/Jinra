@@ -66,6 +66,8 @@ SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
 SWITCHABLE(OotRefreshCap, false);
+SWITCHABLE(NvidiaDlssQuality, false);
+SWITCHABLE(NvidiaDlssPreset, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -401,6 +403,12 @@ struct Values {
                                                        true};
     // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS.
     SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
+    SwitchableSetting<NvidiaDlssQuality> nvidia_dlss_quality{
+        linkage, NvidiaDlssQuality::Automatic, "nvidia_dlss_quality", Category::Renderer,
+        Specialization::Default, true, true};
+    SwitchableSetting<NvidiaDlssPreset> nvidia_dlss_preset{
+        linkage, NvidiaDlssPreset::M, "nvidia_dlss_preset", Category::Renderer,
+        Specialization::Default, true, true};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",
@@ -1019,6 +1027,14 @@ struct Values {
 };
 
 extern Values values;
+
+struct NvidiaDlssRuntimeSettings {
+    NvidiaDlssQuality quality = NvidiaDlssQuality::Automatic;
+    NvidiaDlssPreset preset = NvidiaDlssPreset::M;
+};
+
+void RefreshNvidiaDlssRuntimeSettings();
+NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings();
 
 constexpr u32 MIN_FRAME_GEN_MULTIPLIER = 2;
 constexpr u32 MAX_FRAME_GEN_MULTIPLIER = 4;

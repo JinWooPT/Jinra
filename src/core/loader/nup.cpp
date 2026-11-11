@@ -12,6 +12,7 @@
 #include "core/file_sys/nup_container.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/patch_manager.h"
+#include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/vfs/vfs_vector.h"
@@ -194,18 +195,6 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
                 meta.localized_icons.front().second, "icon.dat");
         }
     }
-
-    const auto addon_count = std::count_if(nup->GetPackages().begin(), nup->GetPackages().end(),
-                                           [](const auto& package) {
-                                               return package.kind ==
-                                                      NupContainer::PackageKind::Addon;
-                                           });
-    if (addon_count > 0) {
-        LOG_WARNING(Loader,
-                    "NUP container has {} add-on content package(s); AoC mounting is not "
-                    "supported yet",
-                    addon_count);
-    }
 }
 
 AppLoader_NUP::~AppLoader_NUP() = default;
@@ -230,6 +219,12 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
         return result;
     }
 
+    if (const auto* slot = system.GetContentProviderUnion().GetSlotProvider(
+            FileSys::ContentProviderUnionSlot::FrontendManual)) {
+        auto& provider = *const_cast<FileSys::ManualContentProvider*>(
+            static_cast<const FileSys::ManualContentProvider*>(slot));
+        provider.AddNupAddOns(*nup, base_title_id);
+    }
     system.GetFileSystemController().RegisterProcess(
         process.GetProcessId(), base_title_id,
         std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),

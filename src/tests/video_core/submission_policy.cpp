@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <bit>
 #include <limits>
 #include <string_view>
 #include <vector>
@@ -7,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/renderer_vulkan/submission_policy.h"
+#include "video_core/renderer_vulkan/upload_batch.h"
 
 namespace {
 
@@ -143,4 +145,28 @@ TEST_CASE("Changing the active native policy preserves recorded work",
     REQUIRE(counter == 31);
     REQUIRE(Advance(counter, true, false) == Action::Dispatch);
     REQUIRE(counter == 32);
+}
+
+TEST_CASE("Vulkan upload batches preserve dependencies between copies", "[video_core][upload-batch]") {
+    using Vulkan::UploadBatch;
+    const auto staging = std::bit_cast<VkBuffer>(u64{1});
+    const auto first = std::bit_cast<VkBuffer>(u64{2});
+    const auto second = std::bit_cast<VkBuffer>(u64{3});
+    const VkBufferCopy original{0, 8, 8};
+    const VkBufferCopy overlapping{8, 12, 8};
+    const VkBufferCopy adjacent{8, 16, 8};
+
+    UploadBatch batch;
+    batch.Add(staging, first, {&original, 1});
+    CHECK_FALSE(batch.CanAdd(staging, first, {&overlapping, 1}));
+    CHECK_FALSE(batch.CanAdd(first, second, {&adjacent, 1}));
+    CHECK_FALSE(batch.CanAdd(second, staging, {&adjacent, 1}));
+    REQUIRE(batch.CanAdd(staging, first, {&adjacent, 1}));
+    batch.Add(staging, first, {&adjacent, 1});
+    REQUIRE(batch.groups.size() == 1);
+    CHECK(batch.groups.front().count == 2);
+    CHECK(batch.CanAdd(staging, second, {&overlapping, 1}));
+
+    const std::vector<VkBufferCopy> over_capacity(UploadBatch::MaxCopies);
+    CHECK_FALSE(batch.CanAdd(staging, second, over_capacity));
 }

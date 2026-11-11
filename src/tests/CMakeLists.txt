@@ -41,11 +41,14 @@ add_executable(tests
     video_core/fast_fusion_surface_store.cpp
     video_core/fast_fusion_byte_store.cpp
     video_core/ocarina_upscale.cpp
+    video_core/fsr4_support.cpp
     video_core/vk_byte_addressed_shadow.cpp
     video_core/global_memory_coherence.cpp
     video_core/storage_buffer_pointer_tracking.cpp
     video_core/storage_buffer_control_flow.cpp
     core/nup_validation.cpp
+    core/nx_archive.cpp
+    frontend_common/nx_archive.cpp
     input_common/calibration_lifetime.cpp
     video_core/ampere_logged_numeric.cpp
     video_core/ampere_logged_textures.cpp
@@ -124,6 +127,7 @@ add_executable(tests
     common/fs_iterate.cpp
     common/game_presets.cpp
     common/host_memory.cpp
+    video_core/host_memory_limit.cpp
     common/host_memory_failure.cpp
     common/host_memory_test_access.h
     core/host_memory_failure.cpp
@@ -190,6 +194,9 @@ if (TARGET dynarmic::dynarmic)
     target_sources(tests PRIVATE core/window_trace.cpp)
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
 endif()
+
+target_compile_definitions(tests PRIVATE
+    JINRA_NX_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/core/nx_fixtures")
 
 add_test(NAME tests COMMAND tests)
 

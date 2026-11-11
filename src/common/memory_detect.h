@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include "common/common_types.h"
 
 namespace Common {
@@ -17,5 +19,8 @@ struct MemoryInfo {
  * @return Reference to a MemoryInfo struct with the physical and swap memory sizes in bytes
  */
 [[nodiscard]] const MemoryInfo& GetMemInfo();
+
+/// Bytes still available under the Windows system commit limit.
+[[nodiscard]] std::optional<u64> GetSystemCommitRoom();
 
 } // namespace Common

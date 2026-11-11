@@ -12,6 +12,7 @@
 #include <QComboBox>
 #include <QIcon>
 #include <QLabel>
+#include <QListView>
 #include <QLineEdit>
 #include <QPixmap>
 #include <QPushButton>
@@ -33,6 +34,7 @@
 #include "qt_common/config/uisettings.h"
 #include "qt_common/util/vk.h"
 #include "ui_configure_graphics.h"
+#include "yuzu/configuration/amd_fsr4_panel.h"
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_graphics.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
@@ -202,6 +204,7 @@ void ConfigureGraphics::UpdateDeviceSelection(int device) {
     if (GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan) {
         vulkan_device = device;
     }
+    UpdateAmdFsr4Visibility();
 }
 
 ConfigureGraphics::~ConfigureGraphics() = default;
@@ -220,6 +223,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     std::map<u32, QWidget*> hold_graphics;
     std::vector<QWidget*> hold_api;
     QCheckBox* frame_gen_checkbox = nullptr;
+    QCheckBox* nvidia_dlss_checkbox = nullptr;
 
     for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
 #ifndef HAS_RESHADE
@@ -229,7 +233,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 #endif
 #ifndef EGLANTINE_STREAMLINE
         // Only builds with NVIDIA Streamline (Windows) can use it.
-        if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
+        if (setting->Id() == Settings::values.nvidia_dlss.Id() ||
+            setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
+            setting->Id() == Settings::values.nvidia_dlss_preset.Id()) {
             continue;
         }
 #endif
@@ -251,6 +257,12 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         if (!widget->Valid()) {
             widget->deleteLater();
             continue;
+        }
+
+        if (nvidia_dlss_checkbox && (setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
+                                     setting->Id() == Settings::values.nvidia_dlss_preset.Id())) {
+            widget->setVisible(nvidia_dlss_checkbox->isChecked());
+            connect(nvidia_dlss_checkbox, &QCheckBox::toggled, widget, &QWidget::setVisible);
         }
 
         if (setting->Id() == Settings::values.renderer_backend.Id()) {
@@ -332,6 +344,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 #endif
 #ifdef EGLANTINE_STREAMLINE
         } else if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
+            nvidia_dlss_checkbox = widget->checkbox;
             // NVIDIA's files and a download button under the checkbox.
             QWidget* group = new QWidget(this);
             QVBoxLayout* group_layout = new QVBoxLayout(group);
@@ -344,6 +357,21 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             connect(widget->checkbox, &QCheckBox::toggled, panel, &QWidget::setVisible);
             hold_graphics.emplace(setting->Id(), group);
 #endif
+        } else if (setting->Id() == Settings::values.oot_anti_aliasing.Id() &&
+                   widget->combobox != nullptr) {
+            // AMD FSR 4 is offered only for GPUs it runs on; AMD's files and a download button sit
+            // under the choice while it's picked.
+            QWidget* group = new QWidget(this);
+            QVBoxLayout* group_layout = new QVBoxLayout(group);
+            group_layout->setContentsMargins(0, 0, 0, 0);
+            group_layout->setSpacing(2);
+            group_layout->addWidget(widget);
+            oot_aa_combobox = widget->combobox;
+            amd_fsr4_panel = new AmdFsr4Panel(group);
+            group_layout->addWidget(amd_fsr4_panel);
+            connect(oot_aa_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                    [this](int) { UpdateAmdFsr4Visibility(); });
+            hold_graphics.emplace(setting->Id(), group);
         } else if (setting->Id() == Settings::values.frame_gen.Id()) {
             frame_gen_checkbox = widget->checkbox;
             hold_graphics.emplace(setting->Id(), widget);
@@ -459,6 +487,8 @@ void ConfigureGraphics::ApplyConfiguration() {
 
     UpdateVsyncSetting();
 
+    Settings::RefreshNvidiaDlssRuntimeSettings();
+
     Settings::values.vulkan_device.SetGlobal(true);
     auto const index = Settings::EnumMetadata<Settings::RendererBackend>::Index();
     if (Settings::IsConfiguringGlobal() ||
@@ -517,6 +547,31 @@ void ConfigureGraphics::UpdateAPILayout() {
     if (is_vulkan && int(vulkan_device) < vulkan_device_combobox->count()) {
         vulkan_device_combobox->setCurrentIndex(vulkan_device);
     }
+    UpdateAmdFsr4Visibility();
+}
+
+void ConfigureGraphics::UpdateAmdFsr4Visibility() {
+    if (oot_aa_combobox == nullptr || amd_fsr4_panel == nullptr) {
+        return;
+    }
+    // AMD's FSR 4 runtime is Windows-only and runs on the GPUs IsFsr4CapableGpu names.
+#ifdef _WIN32
+    const int device = vulkan_device_combobox ? vulkan_device_combobox->currentIndex() : -1;
+    const bool capable = GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan &&
+                         device >= 0 && static_cast<size_t>(device) < records.size() &&
+                         records[device].fsr4_capable;
+#else
+    constexpr bool capable = false;
+#endif
+    const int fsr4_row =
+        oot_aa_combobox->findData(static_cast<u32>(Settings::OotAntiAliasing::Fsr4));
+    const bool fsr4_picked = fsr4_row >= 0 && oot_aa_combobox->currentIndex() == fsr4_row;
+    // Hiding the row keeps the combobox's rows in step with the setting's values. A saved FSR 4
+    // choice on another GPU stays visible (FSR 3.1 runs in its place).
+    if (auto* view = qobject_cast<QListView*>(oot_aa_combobox->view()); view && fsr4_row >= 0) {
+        view->setRowHidden(fsr4_row, !capable && !fsr4_picked);
+    }
+    amd_fsr4_panel->setVisible(capable && fsr4_picked);
 }
 
 void ConfigureGraphics::RetrieveVulkanDevices() {

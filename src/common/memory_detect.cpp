@@ -4,6 +4,7 @@
 #ifdef _WIN32
 // clang-format off
 #include <windows.h>
+#include <psapi.h>
 #include <sysinfoapi.h>
 // clang-format on
 #else
@@ -67,6 +68,17 @@ static MemoryInfo Detect() {
 const MemoryInfo& GetMemInfo() {
     static MemoryInfo mem_info = Detect();
     return mem_info;
+}
+
+std::optional<u64> GetSystemCommitRoom() {
+#ifdef _WIN32
+    PERFORMANCE_INFORMATION info{};
+    if (K32GetPerformanceInfo(&info, sizeof(info))) {
+        const auto used = info.CommitTotal < info.CommitLimit ? info.CommitTotal : info.CommitLimit;
+        return static_cast<u64>(info.CommitLimit - used) * info.PageSize;
+    }
+#endif
+    return std::nullopt;
 }
 
 } // namespace Common
