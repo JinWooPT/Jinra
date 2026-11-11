@@ -28,6 +28,15 @@ namespace Service {
     return (std::max)(vblank_interval, limited_interval);
 }
 
+[[nodiscard]] inline std::chrono::nanoseconds OotHighRefreshOverride(
+    std::uint32_t swap_interval, std::uint32_t refresh_rate, bool video_active,
+    std::chrono::nanoseconds gameplay_interval, std::uint32_t fps_limit) {
+    if (video_active || swap_interval != 1 || refresh_rate < 60) {
+        return {};
+    }
+    return PacedInterval(gameplay_interval, fps_limit);
+}
+
 class Nx2PresentPacer {
 public:
     using Clock = std::chrono::steady_clock;

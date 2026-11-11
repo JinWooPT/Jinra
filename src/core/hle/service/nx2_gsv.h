@@ -1608,6 +1608,7 @@ struct Nx2NativeObjects {
     std::map<u32, Memory> memories;
     std::map<u32, Image> images;
     std::optional<VideoTrace> last_video_write;
+    std::atomic<u32> active_video_sessions{};
     u32 next_memory{1};
     u32 next_image{1};
 };
@@ -2124,7 +2125,15 @@ private:
             process != nullptr && process->GetProgramId() == Settings::OcarinaOfTimeProgramId
                 ? process->GetOotSpeedScaleAddress()
                 : 0;
-        const bool high_refresh = oot_speed_scale != 0 && swap_interval == 1 && refresh_rate >= 60;
+        const bool oot_video_pacing =
+            oot_speed_scale != 0 &&
+            m_objects->active_video_sessions.load(std::memory_order_relaxed) != 0;
+        if (std::exchange(m_oot_video_pacing, oot_video_pacing) != oot_video_pacing) {
+            LOG_INFO(Service, "Ocarina of Time frame pacing: {} (guest {} Hz, swap interval {})",
+                     oot_video_pacing ? "using guest timing during video playback"
+                                      : "video playback ended",
+                     refresh_rate, swap_interval);
+        }
         std::chrono::nanoseconds oot_interval{};
         if (oot_speed_scale != 0) {
             // The patch derives the game's step from elapsed time. Apply deliberate speed changes
@@ -2136,12 +2145,11 @@ private:
             if (memory.Read32(oot_speed_scale) != bits) {
                 memory.Write32(oot_speed_scale, bits);
             }
-            if (high_refresh) {
-                oot_interval = PacedInterval(
-                    std::chrono::nanoseconds{speed_limited ? Settings::OotHighRefreshPeriodNs()
-                                                           : 1'000'000'000LL / 240},
-                    fps_limit);
-            }
+            oot_interval = OotHighRefreshOverride(
+                swap_interval, refresh_rate, oot_video_pacing,
+                std::chrono::nanoseconds{speed_limited ? Settings::OotHighRefreshPeriodNs()
+                                                       : 1'000'000'000LL / 240},
+                fps_limit);
         }
         if (oot_speed_scale != 0 ||
             m_vsync->override_period_ns.load(std::memory_order_relaxed) != 0) {
@@ -2159,7 +2167,7 @@ private:
             100'000'000'000LL * swap_interval / refresh_rate /
             (speed_limited && oot_speed_scale == 0 ? speed_limit : 100)};
         const auto interval =
-            high_refresh ? oot_interval : PacedInterval(vblank_interval, fps_limit);
+            oot_interval.count() != 0 ? oot_interval : PacedInterval(vblank_interval, fps_limit);
         if (trace) {
             m_frame_trace.target_ms = std::chrono::duration<double, std::milli>(interval).count();
         }
@@ -2700,7 +2708,8 @@ private:
                             vsync_state->trace_min_gap.reset();
                         }
                     }
-                    return override_ns > 0 ? std::optional{interval} : std::nullopt;
+                    // An empty result would retain the last period after an override ends.
+                    return interval;
                 });
             system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
         }
@@ -2723,6 +2732,7 @@ private:
     };
     std::shared_ptr<VsyncState> m_vsync = std::make_shared<VsyncState>();
     std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
+    bool m_oot_video_pacing{};
     u64 m_presents{};
     u64 m_shown_layout{}; // image and crop size last logged
     std::shared_ptr<std::atomic<bool>> m_capture_pending = std::make_shared<std::atomic<bool>>(false);
@@ -2798,6 +2808,7 @@ public:
             m_cv.notify_all();
             m_worker.join();
         }
+        SetVideoPlaybackActive(false);
         // The ready timer runs on the HostTiming thread: clear its event under its lock first.
         {
             std::scoped_lock lk{m_ready->mutex};
@@ -3106,6 +3117,9 @@ private:
         const auto input_size = input.data.size();
         {
             std::scoped_lock lk{m_mutex};
+            if (input_size != 0) {
+                SetVideoPlaybackActive(true);
+            }
             m_inputs.Push(std::move(input));
             m_stream_ended = false;
             m_end_queued |= end;
@@ -3152,6 +3166,7 @@ private:
             // Only Stop: Bananza flushes (8) after its movies end and treats every completed
             // fence as a frame to acquire.
             if (ctx.GetCommand() == 207) {
+                SetVideoPlaybackActive(false);
                 CompleteHandedFences();
             }
         }
@@ -3174,9 +3189,23 @@ private:
             if (Nx2VideoSyncTraceEnabled()) {
                 TraceEnd(", finalize");
             }
+            SetVideoPlaybackActive(false);
             CompleteHandedFences();
         }
         TipcReplyWords(ctx, {});
+    }
+
+    // Keep movie pacing until Stop or Finalize. A seek can flush without ending playback.
+    // Called with m_mutex held or after the session has stopped.
+    void SetVideoPlaybackActive(bool active) {
+        if (std::exchange(m_video_active, active) == active) {
+            return;
+        }
+        if (active) {
+            m_objects->active_video_sessions.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            m_objects->active_video_sessions.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
 
     // Advances the decoder's syncpoint to the last value handed out (m_mutex held).
@@ -3898,6 +3927,7 @@ private:
     u32 m_sync_movies{};               ///< Movies the trace has seen in this session
     bool m_stream_ended{};             ///< End-of-stream frame handed out, nothing submitted since
     bool m_end_queued{};
+    bool m_video_active{};
     bool m_flush{};
     bool m_quit{};
     std::thread m_worker;

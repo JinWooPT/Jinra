@@ -45,6 +45,17 @@ TEST_CASE("NX2 interval decreases apply to the current present", "[core][nx2_pre
     REQUIRE(pacer.Advance(step.deadline + 1ms, OneVblank).deadline == step.deadline + OneVblank);
 }
 
+TEST_CASE("Ocarina of Time high refresh yields to movie timing", "[core][nx2_present_pacer]") {
+    using Service::OotHighRefreshOverride;
+    constexpr auto MonitorInterval = 4'166'666ns;
+    REQUIRE(OotHighRefreshOverride(1, 60, false, MonitorInterval, 0) == MonitorInterval);
+    REQUIRE(OotHighRefreshOverride(1, 60, true, MonitorInterval, 0) == 0ns);
+    REQUIRE(OotHighRefreshOverride(1, 60, false, MonitorInterval, 60) == OneVblank);
+    REQUIRE(OotHighRefreshOverride(1, 60, true, MonitorInterval, 60) == 0ns);
+    REQUIRE(OotHighRefreshOverride(2, 60, false, MonitorInterval, 0) == 0ns);
+    REQUIRE(OotHighRefreshOverride(1, 30, false, MonitorInterval, 0) == 0ns);
+}
+
 TEST_CASE("NX2 interval increases apply to the current present", "[core][nx2_present_pacer]") {
     Pacer pacer;
     pacer.Advance(Start, OneVblank);
