@@ -373,8 +373,11 @@ TEST_CASE("Ocarina high refresh is opt-in and reports only a complete applied pa
           "[patch_manager]") {
     constexpr auto ScaleOffset = DynamicRoutineOffset + 0x88;
     constexpr auto WaterHookOffset = sizeof(Loader::NSOHeader) + 0x475F8;
+    constexpr auto DynamicWaterRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46E90;
     constexpr u32 WaterOriginal = 0x1E380009;
     constexpr u32 WaterHook = 0x14EFFB26;
+    constexpr u32 DynamicWaterHook = 0x14EFFE26;
+    constexpr std::string_view WaterRipples = "Water ripples at any frame rate (built-in)";
     auto& enabled = Settings::values.oot_high_refresh;
     struct RestoreSetting {
         bool previous;
@@ -392,8 +395,37 @@ TEST_CASE("Ocarina high refresh is opt-in and reports only a complete applied pa
     enabled.SetValue(false);
     const auto baseline = manager.PatchNSO(nso, "main", &scale_offset);
     REQUIRE(scale_offset == 0);
-    REQUIRE(WordAt(baseline, WaterHookOffset) == WaterOriginal);
+    REQUIRE(WordAt(baseline, DynamicCallOffset) == DynamicCallInstruction);
+    REQUIRE(WordAt(baseline, WaterHookOffset) == DynamicWaterHook);
+    REQUIRE(WordAt(baseline, DynamicWaterRoutineOffset) == 0xB00092C9);
+    REQUIRE(WordAt(baseline, DynamicWaterRoutineOffset + 124) == 0x171001BC);
     REQUIRE(WordAt(baseline, ScaleOffset) == 0);
+
+    SECTION("Disabling the water add-on keeps normal Dynamic FPS") {
+        Settings::values.disabled_addons[OcarinaTitleId] = {std::string{WaterRipples}};
+        const auto patched = manager.PatchNSO(nso, "main", &scale_offset);
+        CHECK(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
+        CHECK(WordAt(patched, WaterHookOffset) == WaterOriginal);
+        CHECK(WordAt(patched, DynamicWaterRoutineOffset) == 0);
+        return;
+    }
+    SECTION("Without an FPS patch, the water add-on leaves the original code") {
+        Settings::values.disabled_addons[OcarinaTitleId] = {std::string{DynamicFps}};
+        const auto patched = manager.PatchNSO(nso, "main", &scale_offset);
+        CHECK(WordAt(patched, DynamicCallOffset) == DynamicOriginalInstruction);
+        CHECK(WordAt(patched, WaterHookOffset) == WaterOriginal);
+        CHECK(WordAt(patched, DynamicWaterRoutineOffset) == 0);
+        return;
+    }
+    SECTION("A user mod can occupy the normal ripple routine without disabling Dynamic FPS") {
+        const auto word = std::bit_cast<std::array<u8, sizeof(u32)>>(NopInstruction);
+        context.AddUserPatch(word, DynamicWaterRoutineOffset);
+        const auto patched = manager.PatchNSO(nso, "main", &scale_offset);
+        CHECK(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
+        CHECK(WordAt(patched, WaterHookOffset) == WaterOriginal);
+        CHECK(WordAt(patched, DynamicWaterRoutineOffset) == NopInstruction);
+        return;
+    }
 
     enabled.SetValue(true);
     SECTION("The matching build gets both hooks and the initial scale") {
@@ -404,6 +436,7 @@ TEST_CASE("Ocarina high refresh is opt-in and reports only a complete applied pa
         CHECK(WordAt(patched, DynamicRoutineOffset + 0x78) == 0x1E230848);
         CHECK(WordAt(patched, WaterHookOffset) == WaterHook);
         CHECK(WordAt(patched, DynamicRoutineOffset + 0x10C) == 0x171004BC);
+        CHECK(WordAt(patched, DynamicWaterRoutineOffset) == 0);
     }
     SECTION("A conflicting ripple hook leaves the user mod and the previous Dynamic FPS patch") {
         const auto word = std::bit_cast<std::array<u8, sizeof(u32)>>(NopInstruction);

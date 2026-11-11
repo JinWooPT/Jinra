@@ -132,9 +132,25 @@ constexpr std::array HIGH_REFRESH_RECORDS{
     BuiltinPatchRecord{OOT_ROUTINE_OFFSET, HIGH_REFRESH_CAVE, {}, true},
     BuiltinPatchRecord{OOT_RIPPLE_OFFSET, WATER_HOOK, WATER_ORIGINAL},
 };
+
+// Fritchii v5.8 also carries fractional ripple steps in Dark's normal Dynamic FPS mode.
+// Keep this routine in the later padding used by Fritchii, away from other mods' code.
+constexpr size_t DYNAMIC_RIPPLE_ROUTINE_OFFSET = 0x3C46E90;
+constexpr std::array<u8, 4> DYNAMIC_RIPPLE_HOOK{0x26, 0xFE, 0xEF, 0x14};
+constexpr auto DYNAMIC_RIPPLE_ROUTINE = [] {
+    auto routine = WATER_ACCUMULATOR;
+    constexpr std::array<u8, 4> resume{0xBC, 0x01, 0x10, 0x17}; // b main+0x475FC
+    std::ranges::copy(resume, routine.end() - resume.size());
+    return routine;
+}();
+constexpr std::array DYNAMIC_RIPPLE_RECORDS{
+    BuiltinPatchRecord{OOT_RIPPLE_OFFSET, DYNAMIC_RIPPLE_HOOK, WATER_ORIGINAL},
+    BuiltinPatchRecord{DYNAMIC_RIPPLE_ROUTINE_OFFSET, DYNAMIC_RIPPLE_ROUTINE, {}, true},
+};
 constexpr std::string_view OOT_BUILD_ID = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348";
 constexpr std::string_view DYNAMIC_FPS_NAME = "Dynamic FPS by Dark (built-in)";
 constexpr std::string_view HIGH_REFRESH_NAME = "High refresh rate (built-in, experimental)";
+constexpr std::string_view DYNAMIC_RIPPLE_NAME = "Water ripples at any frame rate (built-in)";
 
 constexpr std::array BUILTIN_PATCHES{
     // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
@@ -163,6 +179,15 @@ constexpr std::array BUILTIN_PATCHES{
         .records = DYNAMIC_FPS_RECORDS,
         .state_offset = 0x4E9FE00,
         .state_size = 16,
+    },
+    BuiltinPatch{
+        .name = DYNAMIC_RIPPLE_NAME,
+        .title_id = Settings::OcarinaOfTimeProgramId,
+        .module = "main",
+        .build_id = OOT_BUILD_ID,
+        .records = DYNAMIC_RIPPLE_RECORDS,
+        .state_offset = 0x4E9FE00,
+        .state_size = 0xA0,
     },
 };
 
@@ -592,9 +617,10 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
     bool high_refresh_applied = false;
     for (const auto& patch : BUILTIN_PATCHES) {
         const bool high_refresh = patch.name == HIGH_REFRESH_NAME;
+        const bool dynamic_ripple = patch.name == DYNAMIC_RIPPLE_NAME;
         if (patch.title_id != title_id || patch.module != name ||
             (high_refresh && !Settings::values.oot_high_refresh.GetValue()) ||
-            (high_refresh_applied && patch.name == DYNAMIC_FPS_NAME)) {
+            (high_refresh_applied && (patch.name == DYNAMIC_FPS_NAME || dynamic_ripple))) {
             continue;
         }
         if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
@@ -647,16 +673,19 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }();
         const auto call_offset = sizeof(Loader::NSOHeader) + HIGH_REFRESH_RECORDS[0].module_offset;
         const auto cave_offset = sizeof(Loader::NSOHeader) + OOT_ROUTINE_OFFSET;
-        const bool standalone_dark =
-            high_refresh && fits(out, HIGH_REFRESH_RECORDS[0].module_offset,
-                                 DYNAMIC_FPS_CALL.size()) &&
-            fits(out, OOT_ROUTINE_OFFSET, HIGH_REFRESH_CAVE.size()) &&
+        const bool known_dark =
+            (high_refresh || dynamic_ripple) &&
+            fits(out, HIGH_REFRESH_RECORDS[0].module_offset, DYNAMIC_FPS_CALL.size()) &&
+            fits(out, OOT_ROUTINE_OFFSET, original_dark.size()) &&
             std::ranges::equal(DYNAMIC_FPS_CALL,
                                std::span{out}.subspan(call_offset, DYNAMIC_FPS_CALL.size())) &&
             (std::ranges::equal(original_dark,
                                 std::span{out}.subspan(cave_offset, original_dark.size())) ||
              std::ranges::equal(DYNAMIC_FPS_ROUTINE,
                                 std::span{out}.subspan(cave_offset, original_dark.size())));
+        if (dynamic_ripple && !known_dark) {
+            continue;
+        }
         bool apply = true;
         for (const auto& record : patch.records) {
             if (!fits(nso, record.module_offset, record.bytes.size()) ||
@@ -691,7 +720,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
                 break;
             }
             size_t verified_prefix = 0;
-            if (standalone_dark) {
+            if (high_refresh && known_dark) {
                 if (record.module_offset == HIGH_REFRESH_RECORDS[0].module_offset) {
                     verified_prefix = DYNAMIC_FPS_CALL.size();
                 } else if (record.module_offset == OOT_ROUTINE_OFFSET) {

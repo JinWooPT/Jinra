@@ -76,6 +76,19 @@ Normal and an unscaled counter are prerequisites for evaluating its timing;
 the Add-On does not change global clock behavior or automatically override
 the user's settings. Correct gameplay speed with the Add-On is unverified.
 
+## Water ripples
+
+The default-on `Water ripples at any frame rate (built-in)` add-on applies to the
+same game build when the recognized Dynamic FPS routine is active. It carries
+fractional simulation steps between frames for each water object. Its separate
+executable padding and BSS checks let the FPS patch continue if a user mod
+occupies the ripple routine or the extra state. High refresh mode retains its
+own ripple correction.
+
+The Dynamic FPS adaptation follows
+[Fritchii v5.8](https://github.com/Frizti/Fritchii/commit/063dbb741fc42a666bc658404b3ead3860b85b7b)
+and the investigation in [Lichii #1180](https://github.com/zortos293/Lichii/pull/1180).
+
 ## Tests
 
 The `[patch_manager]` tests call production `PatchManager::PatchNSO` with

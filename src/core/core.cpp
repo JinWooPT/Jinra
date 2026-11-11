@@ -256,14 +256,15 @@ struct System::Impl {
             return;
         }
 
-        auto settings_service =
-            system.ServiceManager().GetService<Service::Set::ISystemSettingsServer>("set:sys",
-                                                                                    true);
-        auto static_service_a =
-            system.ServiceManager().GetService<Service::Glue::Time::StaticService>("time:a", true);
-
-        auto static_service_s =
-            system.ServiceManager().GetService<Service::PSC::Time::StaticService>("time:s", true);
+        // During loading the guest services may not be running yet. They read the current
+        // settings on startup, so applying settings can return without waiting for them.
+        auto& services = system.ServiceManager();
+        auto settings_service = services.GetService<Service::Set::ISystemSettingsServer>("set:sys");
+        auto static_service_a = services.GetService<Service::Glue::Time::StaticService>("time:a");
+        auto static_service_s = services.GetService<Service::PSC::Time::StaticService>("time:s");
+        if (!settings_service || !static_service_a || !static_service_s) {
+            return;
+        }
 
         std::shared_ptr<Service::PSC::Time::SystemClock> user_clock;
         static_service_a->GetStandardUserSystemClock(&user_clock);
