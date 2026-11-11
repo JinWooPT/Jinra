@@ -19,9 +19,14 @@ public:
     void SetModel(GameListModel* model);
     void ApplyFilter(const QString& edit_filter_text, GameListModel* model);
     void UpdateIconSize();
+    void SetHomeMode(bool enabled);
 
     QModelIndex indexAt(const QPoint& point) const override;
 
+protected:
+    void resizeEvent(QResizeEvent* event) override;
+
 private:
     GameCard* m_gameCard = nullptr;
+    bool home_mode{};
 };

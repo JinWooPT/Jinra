@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <QCoreApplication>
 #include <QIcon>
 #include "common/logging.h"
 #include "common/settings.h"
@@ -34,78 +35,127 @@
 #include "yuzu/configuration/configure_web.h"
 #include "yuzu/hotkeys.h"
 
-ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
+ConfigurationPages::ConfigurationPages(QWidget* parent, HotkeyRegistry& registry_,
+                                       InputCommon::InputSubsystem* input_subsystem_,
+                                       std::vector<VkDeviceInfo::Record>& vk_device_records_,
+                                       Core::System& system_, bool enable_web_config_)
+    : QObject(parent), registry(registry_), system(system_), input_subsystem(input_subsystem_),
+      vk_device_records(vk_device_records_), enable_web_config(enable_web_config_),
+      staging{std::make_unique<QWidget>(parent)},
+      builder{std::make_unique<ConfigurationShared::Builder>(staging.get(),
+                                                             !system_.IsPoweredOn())} {
+    // Some settings call setVisible() before they are added to a page.
+    staging->hide();
+    Settings::SetConfiguringGlobal(true);
+}
+
+QList<QWidget*> ConfigurationPages::LoadCategory(int category) {
+    auto* owner = staging.get();
+    switch (category) {
+    case 0:
+        if (!general_tab) {
+            general_tab = std::make_unique<ConfigureGeneral>(system, nullptr, *builder, owner);
+            hotkeys_tab = std::make_unique<ConfigureHotkeys>(system.HIDCore(), owner);
+            ui_tab = std::make_unique<ConfigureUi>(system, owner);
+            web_tab = std::make_unique<ConfigureWeb>(owner);
+            debug_tab_tab = std::make_unique<ConfigureDebugTab>(system, owner);
+            if (screenshot_info) {
+                ui_tab->UpdateScreenshotInfo(screenshot_info->first, screenshot_info->second);
+            }
+            web_tab->SetWebServiceConfigEnabled(enable_web_config);
+            hotkeys_tab->Populate(registry);
+            general_tab->SetResetCallback([this] { emit ResetRequested(); });
+            connect(ui_tab.get(), &ConfigureUi::LanguageChanged, this, [this](const QString& locale) {
+                emit LanguageChanged(locale);
+                UISettings::values.is_game_list_reload_pending = true;
+                ApplyConfiguration();
+            });
+            connect(general_tab.get(), &ConfigureGeneral::ExternalContentDirsChanged, this,
+                    &ConfigurationPages::ExternalContentDirsChanged);
+        }
+        return {general_tab.get(), hotkeys_tab.get(), ui_tab.get(), web_tab.get(),
+                debug_tab_tab.get()};
+    case 1:
+        if (!system_tab) {
+            system_tab = std::make_unique<ConfigureSystem>(system, nullptr, *builder, owner);
+            profile_tab = std::make_unique<ConfigureProfileManager>(system, owner);
+            network_tab = std::make_unique<ConfigureNetwork>(system, owner);
+            filesystem_tab = std::make_unique<ConfigureFilesystem>(owner);
+            applets_tab = std::make_unique<ConfigureApplets>(system, nullptr, *builder, owner);
+        }
+        return {system_tab.get(), profile_tab.get(), network_tab.get(), filesystem_tab.get(),
+                applets_tab.get()};
+    case 2:
+        if (!cpu_tab) {
+            cpu_tab = std::make_unique<ConfigureCpu>(system, nullptr, *builder, owner);
+        }
+        return {cpu_tab.get()};
+    case 3:
+        if (!graphics_tab) {
+            graphics_advanced_tab =
+                std::make_unique<ConfigureGraphicsAdvanced>(system, nullptr, *builder, owner);
+            graphics_extensions_tab =
+                std::make_unique<ConfigureGraphicsExtensions>(system, nullptr, *builder, owner);
+            graphics_tab = std::make_unique<ConfigureGraphics>(
+                system, vk_device_records, [this] { graphics_advanced_tab->ExposeComputeOption(); },
+                [this](Settings::AspectRatio ratio, Settings::ResolutionSetup setup) {
+                    screenshot_info.emplace(ratio, setup);
+                    if (ui_tab) {
+                        ui_tab->UpdateScreenshotInfo(ratio, setup);
+                    }
+                },
+                nullptr, *builder, owner);
+        }
+        return {graphics_tab.get(), graphics_advanced_tab.get(), graphics_extensions_tab.get()};
+    case 4:
+        if (!audio_tab) {
+            audio_tab = std::make_unique<ConfigureAudio>(system, nullptr, *builder, owner);
+        }
+        return {audio_tab.get()};
+    case 5:
+        if (!input_tab) {
+            input_tab = std::make_unique<ConfigureInput>(system, owner);
+            input_tab->Initialize(input_subsystem);
+            if (home_layout) {
+                input_tab->UseHomeLayout();
+            }
+            input_tab->hide();
+        }
+        return input_tab->GetSubTabs();
+    default:
+        return {};
+    }
+}
+
+ConfigurationPages::~ConfigurationPages() = default;
+
+ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry,
                                  InputCommon::InputSubsystem* input_subsystem,
                                  std::vector<VkDeviceInfo::Record>& vk_device_records,
-                                 Core::System& system_, bool enable_web_config)
-    : QDialog(parent), ui{std::make_unique<Ui::ConfigureDialog>()}, registry(registry_),
-      system{system_},
-      builder{std::make_unique<ConfigurationShared::Builder>(this, !system_.IsPoweredOn())},
-      applets_tab{std::make_unique<ConfigureApplets>(system_, nullptr, *builder, this)},
-      audio_tab{std::make_unique<ConfigureAudio>(system_, nullptr, *builder, this)},
-      cpu_tab{std::make_unique<ConfigureCpu>(system_, nullptr, *builder, this)},
-      debug_tab_tab{std::make_unique<ConfigureDebugTab>(system_, this)},
-      filesystem_tab{std::make_unique<ConfigureFilesystem>(this)},
-      general_tab{std::make_unique<ConfigureGeneral>(system_, nullptr, *builder, this)},
-      graphics_advanced_tab{
-          std::make_unique<ConfigureGraphicsAdvanced>(system_, nullptr, *builder, this)},
-      graphics_extensions_tab{
-          std::make_unique<ConfigureGraphicsExtensions>(system_, nullptr, *builder, this)},
-      ui_tab{std::make_unique<ConfigureUi>(system_, this)},
-      graphics_tab{std::make_unique<ConfigureGraphics>(
-          system_, vk_device_records, [&]() { graphics_advanced_tab->ExposeComputeOption(); },
-          [this](Settings::AspectRatio ratio, Settings::ResolutionSetup setup) {
-              ui_tab->UpdateScreenshotInfo(ratio, setup);
-          },
-          nullptr, *builder, this)},
-      hotkeys_tab{std::make_unique<ConfigureHotkeys>(system_.HIDCore(), this)},
-      input_tab{std::make_unique<ConfigureInput>(system_, this)},
-      network_tab{std::make_unique<ConfigureNetwork>(system_, this)},
-      profile_tab{std::make_unique<ConfigureProfileManager>(system_, this)},
-      system_tab{std::make_unique<ConfigureSystem>(system_, nullptr, *builder, this)},
-      web_tab{std::make_unique<ConfigureWeb>(this)} {
-    Settings::SetConfiguringGlobal(true);
-
+                                 Core::System& system, bool enable_web_config)
+    : QDialog(parent), ui{std::make_unique<Ui::ConfigureDialog>()},
+      settings(this, registry, input_subsystem, vk_device_records, system, enable_web_config) {
     ui->setupUi(this);
     setWindowTitle(QStringLiteral("Jinra — Settings"));
     setWindowIcon(QIcon(QStringLiteral(":/img/jinra.ico")));
     ui->selectorList->setMinimumWidth(140);
     ui->selectorList->setMaximumWidth(160);
 
-    ui->tabWidget->addTab(applets_tab.get(), tr("Applets"));
-    ui->tabWidget->addTab(audio_tab.get(), tr("Audio"));
-    ui->tabWidget->addTab(cpu_tab.get(), tr("CPU"));
-    ui->tabWidget->addTab(debug_tab_tab.get(), tr("Debug"));
-    ui->tabWidget->addTab(filesystem_tab.get(), tr("Filesystem"));
-    ui->tabWidget->addTab(general_tab.get(), tr("General"));
-    ui->tabWidget->addTab(graphics_tab.get(), tr("Graphics"));
-    ui->tabWidget->addTab(graphics_advanced_tab.get(), tr("GraphicsAdvanced"));
-    ui->tabWidget->addTab(graphics_extensions_tab.get(), tr("GraphicsExtra"));
-    ui->tabWidget->addTab(hotkeys_tab.get(), tr("Hotkeys"));
-    ui->tabWidget->addTab(input_tab.get(), tr("Controls"));
-    ui->tabWidget->addTab(profile_tab.get(), tr("Profiles"));
-    ui->tabWidget->addTab(network_tab.get(), tr("Network"));
-    ui->tabWidget->addTab(system_tab.get(), tr("System"));
-    ui->tabWidget->addTab(ui_tab.get(), tr("Game List"));
-    ui->tabWidget->addTab(web_tab.get(), tr("Web"));
-
-    web_tab->SetWebServiceConfigEnabled(enable_web_config);
-    hotkeys_tab->Populate(registry);
-
-    input_tab->Initialize(input_subsystem);
-
-    general_tab->SetResetCallback([&] { this->close(); });
-
-    SetConfiguration();
+    for (int category = 0; category < ConfigurationPages::CategoryCount; ++category) {
+        for (auto* page : settings.LoadCategory(category)) {
+            ui->tabWidget->addTab(page, page->accessibleName());
+        }
+    }
     PopulateSelectionList();
 
     connect(ui->tabWidget, &QTabWidget::currentChanged, this, [this](int index) {
         if (index != -1) {
-            debug_tab_tab->SetCurrentIndex(0);
+            settings.ResetDebugTab();
         }
     });
-    connect(ui_tab.get(), &ConfigureUi::LanguageChanged, this, &ConfigureDialog::OnLanguageChanged);
-    connect(general_tab.get(), &ConfigureGeneral::ExternalContentDirsChanged, this,
+    connect(&settings, &ConfigurationPages::LanguageChanged, this, &ConfigureDialog::LanguageChanged);
+    connect(&settings, &ConfigurationPages::ResetRequested, this, &QDialog::reject);
+    connect(&settings, &ConfigurationPages::ExternalContentDirsChanged, this,
             &ConfigureDialog::ExternalContentDirsChanged);
     connect(ui->selectorList, &QListWidget::itemSelectionChanged, this,
             &ConfigureDialog::UpdateVisibleTabs);
@@ -129,25 +179,34 @@ void ConfigureDialog::SelectCategory(int index) {
     ui->selectorList->setCurrentRow(std::clamp(index, 0, ui->selectorList->count() - 1));
 }
 
-void ConfigureDialog::SetConfiguration() {}
-
 void ConfigureDialog::ApplyConfiguration() {
-    general_tab->ApplyConfiguration();
-    ui_tab->ApplyConfiguration();
-    system_tab->ApplyConfiguration();
-    profile_tab->ApplyConfiguration();
-    filesystem_tab->ApplyConfiguration();
-    input_tab->ApplyConfiguration();
-    hotkeys_tab->ApplyConfiguration(registry);
-    cpu_tab->ApplyConfiguration();
-    graphics_tab->ApplyConfiguration();
-    graphics_advanced_tab->ApplyConfiguration();
-    graphics_extensions_tab->ApplyConfiguration();
-    audio_tab->ApplyConfiguration();
-    debug_tab_tab->ApplyConfiguration();
-    web_tab->ApplyConfiguration();
-    network_tab->ApplyConfiguration();
-    applets_tab->ApplyConfiguration();
+    settings.ApplyConfiguration();
+}
+
+void ConfigurationPages::ApplyConfiguration() {
+    const auto apply = [](const auto& tab) {
+        if (tab) {
+            tab->ApplyConfiguration();
+        }
+    };
+    apply(general_tab);
+    apply(ui_tab);
+    apply(system_tab);
+    apply(profile_tab);
+    apply(filesystem_tab);
+    apply(input_tab);
+    if (hotkeys_tab) {
+        hotkeys_tab->ApplyConfiguration(registry);
+    }
+    apply(cpu_tab);
+    apply(graphics_tab);
+    apply(graphics_advanced_tab);
+    apply(graphics_extensions_tab);
+    apply(audio_tab);
+    apply(debug_tab_tab);
+    apply(web_tab);
+    apply(network_tab);
+    apply(applets_tab);
     system.ApplySettings();
     Settings::LogSettings();
 }
@@ -178,41 +237,39 @@ void ConfigureDialog::HandleApplyButtonClicked() {
     ApplyConfiguration();
 }
 
-Q_DECLARE_METATYPE(QList<QWidget*>);
-
-void ConfigureDialog::PopulateSelectionList() {
-    const std::array<std::pair<QString, QList<QWidget*>>, 6> items{
-        {{tr("General"),
-          {general_tab.get(), hotkeys_tab.get(), ui_tab.get(), web_tab.get(), debug_tab_tab.get()}},
-         {tr("System"),
-          {system_tab.get(), profile_tab.get(), network_tab.get(), filesystem_tab.get(),
-           applets_tab.get()}},
-         {tr("CPU"), {cpu_tab.get()}},
-         {tr("Graphics"),
-          {graphics_tab.get(), graphics_advanced_tab.get(), graphics_extensions_tab.get()}},
-         {tr("Audio"), {audio_tab.get()}},
-         {tr("Controls"), input_tab->GetSubTabs()}},
-    };
-
-    [[maybe_unused]] const QSignalBlocker blocker(ui->selectorList);
-
-    ui->selectorList->clear();
-    for (const auto& entry : items) {
-        auto* const item = new QListWidgetItem(entry.first);
-        item->setData(Qt::UserRole, QVariant::fromValue(entry.second));
-
-        ui->selectorList->addItem(item);
+void ConfigurationPages::ResetDebugTab() {
+    if (debug_tab_tab) {
+        debug_tab_tab->SetCurrentIndex(0);
     }
 }
 
-void ConfigureDialog::OnLanguageChanged(const QString& locale) {
-    emit LanguageChanged(locale);
-    //  Reloading the game list is needed to force retranslation.
-    UISettings::values.is_game_list_reload_pending = true;
-    // first apply the configuration, and then restore the display
-    ApplyConfiguration();
-    RetranslateUI();
-    SetConfiguration();
+std::array<QString, ConfigurationPages::CategoryCount> ConfigurationPages::CategoryTitles() {
+    const auto name = [](const char* text) {
+        return QCoreApplication::translate("ConfigureDialog", text);
+    };
+    return {
+        name(QT_TRANSLATE_NOOP("ConfigureDialog", "General")),
+        name(QT_TRANSLATE_NOOP("ConfigureDialog", "System")),
+        name(QT_TRANSLATE_NOOP("ConfigureDialog", "CPU")),
+        name(QT_TRANSLATE_NOOP("ConfigureDialog", "Graphics")),
+        name(QT_TRANSLATE_NOOP("ConfigureDialog", "Audio")),
+        name(QT_TRANSLATE_NOOP("ConfigureDialog", "Controls")),
+    };
+}
+
+Q_DECLARE_METATYPE(QList<QWidget*>);
+
+void ConfigureDialog::PopulateSelectionList() {
+    [[maybe_unused]] const QSignalBlocker blocker(ui->selectorList);
+
+    ui->selectorList->clear();
+    const auto categories = ConfigurationPages::CategoryTitles();
+    for (int category = 0; category < ConfigurationPages::CategoryCount; ++category) {
+        auto* const item = new QListWidgetItem(categories[category]);
+        item->setData(Qt::UserRole, QVariant::fromValue(settings.LoadCategory(category)));
+
+        ui->selectorList->addItem(item);
+    }
 }
 
 void ConfigureDialog::UpdateVisibleTabs() {

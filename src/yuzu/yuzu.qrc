@@ -10,6 +10,21 @@ SPDX-License-Identifier: GPL-2.0-or-later
         <file alias="icon.png">../../dist/jinra.png</file>
         <file alias="style.qss">jinra.qss</file>
     </qresource>
+    <qresource prefix="/jinra/avatars">
+        <file alias="kitty.png">../../dist/jinra-avatars/kitty.png</file>
+        <file alias="cinna.png">../../dist/jinra-avatars/cinna.png</file>
+        <file alias="kuromi.png">../../dist/jinra-avatars/kuromi.png</file>
+        <file alias="mel.png">../../dist/jinra-avatars/mel.png</file>
+        <file alias="hangy.png">../../dist/jinra-avatars/hangy.png</file>
+        <file alias="retsuko.png">../../dist/jinra-avatars/retsuko.png</file>
+        <file alias="badtz.png">../../dist/jinra-avatars/badtz.png</file>
+        <file alias="choco.png">../../dist/jinra-avatars/choco.png</file>
+        <file alias="kero.png">../../dist/jinra-avatars/kero.png</file>
+        <file alias="pom.png">../../dist/jinra-avatars/pom.png</file>
+        <file alias="poch.png">../../dist/jinra-avatars/poch.png</file>
+        <file alias="peck.png">../../dist/jinra-avatars/peck.png</file>
+        <file alias="tux.png">../../dist/jinra-avatars/tux.png</file>
+    </qresource>
     <qresource prefix="/img">
         <file alias="jinra.ico">../../dist/jinra.ico</file>
     </qresource>

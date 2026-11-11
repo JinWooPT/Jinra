@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+
 #include "qt_common/config/uisettings.h"
 #include "qt_common/game_list/model.h"
 #include "yuzu/game/common.h"
@@ -53,6 +55,17 @@ void GameCarousel::ApplyFilter(const QString& edit_filter_text, GameListModel* m
 }
 
 void GameCarousel::UpdateIconSize() {
+    if (home_mode) {
+        const int height = viewport()->height();
+        const int cover = std::clamp(std::min(viewport()->width() / 6, height - 105), 100, 340);
+        const int caption = std::clamp(cover / 3, 62, 102);
+        const QSize card(cover, cover + caption);
+        const QSize cell(cover + 42, std::max(height, card.height() + 12));
+        m_gameCard->setSize(cell, card, 0, 0);
+        setGridSize(cell);
+        viewport()->update();
+        return;
+    }
     const u32 icon_size = UISettings::values.game_icon_size.GetValue();
 
     int heightMargin = 0;
@@ -95,6 +108,24 @@ void GameCarousel::UpdateIconSize() {
 
         setUpdatesEnabled(true);
     }
+}
+
+void GameCarousel::SetHomeMode(bool enabled) {
+    if (home_mode == enabled)
+        return;
+    home_mode = enabled;
+    m_gameCard->SetHomeMode(enabled);
+    setObjectName(enabled ? QStringLiteral("JinraHomeCarousel") : QString{});
+    setFrameShape(enabled ? QFrame::NoFrame : QFrame::StyledPanel);
+    setHorizontalScrollBarPolicy(enabled ? Qt::ScrollBarAlwaysOff : Qt::ScrollBarAsNeeded);
+    UpdateIconSize();
+    viewport()->update();
+}
+
+void GameCarousel::resizeEvent(QResizeEvent* event) {
+    QListView::resizeEvent(event);
+    if (home_mode)
+        UpdateIconSize();
 }
 
 QModelIndex GameCarousel::indexAt(const QPoint& point) const {

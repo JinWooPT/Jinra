@@ -49,11 +49,13 @@ public:
 
     // Updates input on scheduled interval
     void UpdateInput();
+    void SetCompactLayout();
 
 protected:
     void paintEvent(QPaintEvent* event) override;
 
 private:
+    bool compact_layout{};
     enum class Direction : std::size_t {
         None,
         Up,

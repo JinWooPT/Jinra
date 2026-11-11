@@ -58,6 +58,7 @@ public:
 
     /// Save all button configurations to settings file.
     void ApplyConfiguration();
+    void UseHomeLayout();
 
     /// Set the connection state checkbox (used to sync state).
     void ConnectPlayer(bool connected);

@@ -961,6 +961,10 @@ void MainWindow::InitializeWidgets() {
     jinra_home = new JinraHome(game_list, game_list_placeholder, input_subsystem.get(), this);
     ui->horizontalLayout->addWidget(jinra_home);
     connect(jinra_home, &JinraHome::AddDirectory, this, &MainWindow::OnGameListAddDirectory);
+    connect(jinra_home, &JinraHome::InstallContentRequested, this, &MainWindow::OnMenuInstallToNAND);
+    connect(jinra_home, &JinraHome::HomeChromeChanged, this,
+            [this](bool active) { ui->menubar->setVisible(!active); });
+    ui->menubar->setVisible(!jinra_home->IsHomeChromeActive());
     connect(jinra_home, &JinraHome::BootRequested, this, [this](const QString& path) {
         BootGameFromList(path, StartGameType::Normal);
     });
@@ -968,9 +972,11 @@ void MainWindow::InitializeWidgets() {
         OnGameListOpenPerGameProperties(path.toStdString());
     });
     connect(jinra_home, &JinraHome::ConfigureRequested, this, [this](int category) {
-        jinra_configuration_category = category;
-        OnConfigure();
-        jinra_home->ReloadSettings();
+        if (jinra_home->IsHomeChromeActive()) {
+            OpenHomeSettings(category);
+        } else {
+            OpenDesktopSettings(category);
+        }
     });
     connect(jinra_home, &JinraHome::LanguageRequested, this, &MainWindow::OnLanguageChanged);
     connect(jinra_home, &JinraHome::SaveSettings, this, [this] {
@@ -3768,15 +3774,26 @@ void MainWindow::ToggleShowGameName() {
     game_list->RefreshGameDirectory();
 }
 
-void MainWindow::OnConfigure() {
-    const auto old_theme = UISettings::values.theme;
-    const bool old_discord_presence = UISettings::values.enable_discord_presence.GetValue();
-    const auto old_language_index = Settings::values.language_index.GetValue();
-    const bool old_gamemode = UISettings::values.enable_gamemode.GetValue();
+struct MainWindow::ConfigurationSnapshot {
+    std::string theme = UISettings::values.theme;
+    bool discord_presence = UISettings::values.enable_discord_presence.GetValue();
+    Settings::Language language_index = Settings::values.language_index.GetValue();
+    bool gamemode = UISettings::values.enable_gamemode.GetValue();
 #ifdef __unix__
-    const bool old_force_x11 = UISettings::values.gui_force_x11.GetValue();
+    bool force_x11 = UISettings::values.gui_force_x11.GetValue();
 #endif
+};
 
+void MainWindow::OnConfigure() {
+    if (jinra_home->IsHomeChromeActive()) {
+        OpenHomeSettings(0);
+    } else {
+        OpenDesktopSettings(0);
+    }
+}
+
+void MainWindow::OpenDesktopSettings(int category) {
+    const ConfigurationSnapshot previous;
     Settings::SetConfiguringGlobal(true);
     ConfigureDialog configure_dialog(this, hotkey_registry, input_subsystem.get(),
                                      vk_device_records, *QtCommon::system,
@@ -3786,8 +3803,7 @@ void MainWindow::OnConfigure() {
     connect(&configure_dialog, &ConfigureDialog::ExternalContentDirsChanged, this,
             &MainWindow::OnGameListRefresh);
 
-    configure_dialog.SelectCategory(jinra_configuration_category);
-    jinra_configuration_category = 0;
+    configure_dialog.SelectCategory(category);
     const auto result = configure_dialog.exec();
     if (result != QDialog::Accepted && !UISettings::values.configuration_applied &&
         !UISettings::values.reset_to_defaults) {
@@ -3799,7 +3815,29 @@ void MainWindow::OnConfigure() {
         // This is here to avoid applying changes if the user hit Apply, made some changes, then hit
         // Cancel
         configure_dialog.ApplyConfiguration();
-    } else if (UISettings::values.reset_to_defaults) {
+    }
+    FinishConfiguration(previous);
+}
+
+void MainWindow::OpenHomeSettings(int category) {
+    const ConfigurationSnapshot previous;
+    Settings::SetConfiguringGlobal(true);
+    auto settings = std::make_unique<ConfigurationPages>(
+        jinra_home, hotkey_registry, input_subsystem.get(), vk_device_records, *QtCommon::system,
+        !multiplayer_state->IsHostingPublicRoom());
+    connect(settings.get(), &ConfigurationPages::LanguageChanged, this,
+            &MainWindow::OnLanguageChanged);
+    connect(settings.get(), &ConfigurationPages::ExternalContentDirsChanged, this,
+            &MainWindow::OnGameListRefresh);
+    jinra_home->ShowSettings(std::move(settings), category, [this, previous](bool accepted) {
+        if (accepted || UISettings::values.reset_to_defaults) {
+            FinishConfiguration(previous);
+        }
+    });
+}
+
+void MainWindow::FinishConfiguration(const ConfigurationSnapshot& previous) {
+    if (UISettings::values.reset_to_defaults) {
         LOG_INFO(Frontend, "Resetting all settings to defaults");
         if (!Common::FS::RemoveFile(config->GetConfigFilePath())) {
             LOG_WARNING(Frontend, "Failed to remove configuration file");
@@ -3833,17 +3871,17 @@ void MainWindow::OnConfigure() {
     }
     InitializeHotkeys();
 
-    if (UISettings::values.theme != old_theme) {
+    if (UISettings::values.theme != previous.theme) {
         UpdateUITheme();
     }
-    if (UISettings::values.enable_discord_presence.GetValue() != old_discord_presence) {
+    if (UISettings::values.enable_discord_presence.GetValue() != previous.discord_presence) {
         SetDiscordEnabled(UISettings::values.enable_discord_presence.GetValue());
     }
-    if (UISettings::values.enable_gamemode.GetValue() != old_gamemode) {
+    if (UISettings::values.enable_gamemode.GetValue() != previous.gamemode) {
         SetGamemodeEnabled(UISettings::values.enable_gamemode.GetValue());
     }
 #ifdef __unix__
-    if (UISettings::values.gui_force_x11.GetValue() != old_force_x11) {
+    if (UISettings::values.gui_force_x11.GetValue() != previous.force_x11) {
         GraphicsBackend::SetForceX11(UISettings::values.gui_force_x11.GetValue());
     }
 #endif
@@ -3855,7 +3893,7 @@ void MainWindow::OnConfigure() {
     emit UpdateThemedIcons();
 
     const auto reload = UISettings::values.is_game_list_reload_pending.exchange(false);
-    if (reload || Settings::values.language_index.GetValue() != old_language_index) {
+    if (reload || Settings::values.language_index.GetValue() != previous.language_index) {
         game_list->PopulateAsync(UISettings::values.game_dirs);
     }
 
@@ -3888,6 +3926,7 @@ void MainWindow::OnConfigure() {
     UpdateStatusButtons();
     controller_dialog->refreshConfiguration();
     QtCommon::system->ApplySettings();
+    jinra_home->ReloadSettings();
 }
 
 void MainWindow::OnConfigureTas() {
@@ -4071,6 +4110,9 @@ void MainWindow::OnConfigurePerGame() {
 void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_name) {
     Settings::SetConfiguringGlobal(false);
     ConfigurePerGame dialog(this, title_id, file_name, vk_device_records, *QtCommon::system);
+    if (jinra_home->IsHomeChromeActive()) {
+        dialog.setStyleSheet(jinra_home->styleSheet());
+    }
     dialog.LoadFromFile(Core::GetGameFileFromPath(QtCommon::vfs, file_name));
 
     const auto result = dialog.exec();
@@ -5003,7 +5045,6 @@ void MainWindow::UpdateStatusBar() {
     auto& shader_notify = QtCommon::system->GPU().ShaderNotify();
     const int shaders_building = shader_notify.ShadersBuilding();
 
-    emit statsUpdated(results, shader_notify);
 
     if (shaders_building > 0) {
         shader_building_label->setText(tr("Building: %n shader(s)", "", shaders_building));
@@ -5034,6 +5075,9 @@ void MainWindow::UpdateStatusBar() {
     emu_frametime_label->setText(tr("Frame: %1 ms").arg(results.frametime * 1000.0, 0, 'f', 2));
 
     const auto& renderer = QtCommon::system->GPU().Renderer();
+    if (perf_overlay && perf_overlay->isVisible()) {
+        perf_overlay->UpdateStats(results, shaders_building, renderer.GetVideoMemoryUsage());
+    }
     const auto dlss = renderer.GetDlssStatus();
     const bool dlss_active = dlss.evaluations > dlss_evaluations;
     dlss_evaluations = dlss.evaluations;

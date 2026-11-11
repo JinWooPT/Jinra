@@ -48,6 +48,26 @@ QWidget#JinraControllerArt { background: transparent; }
 QPushButton#JinraFilter { background: transparent; border: none; padding: 5px 15px; min-height: 20px; color: #9db1cc; }
 QPushButton#JinraFilter:checked { background: #114c7d; color: #ffffff; }
 QPushButton#JinraFilter:hover { background: #182f49; }
+QWidget#JinraCollections { background: #141e30; border: 1px solid #283a54; border-radius: 22px; }
+QWidget#JinraCollections QPushButton#JinraFilter { padding: 9px 18px; min-width: 104px; min-height: 22px; border-radius: 17px; font-size: 12pt; }
+QWidget#JinraCollections QPushButton#JinraFilter:checked { background: #087fe5; color: #ffffff; }
+QWidget#JinraCollections QPushButton#JinraFilter:focus { border: 1px solid #35d9ed; }
+QLabel#JinraHomeClock { color: #e6edf7; font-size: 11pt; font-weight: 600; }
+QToolButton#JinraHomeTool, QToolButton#JinraHomeRound, QToolButton#JinraHomeRoundPrimary {
+    background: #141e30; border: 1px solid #283a54; margin: 0; padding: 0;
+}
+QToolButton#JinraHomeTool { border-radius: 17px; }
+QToolButton#JinraHomeRound, QToolButton#JinraHomeRoundPrimary { border-radius: 39px; }
+QToolButton#JinraHomeRoundPrimary { background: #087fe5; border-color: #278dff; }
+QToolButton#JinraHomeTool:hover, QToolButton#JinraHomeRound:hover { background: #192f49; }
+QToolButton#JinraHomeRoundPrimary:hover, QToolButton#JinraHomeTool:checked { background: #124b7d; }
+QToolButton#JinraHomeTool:focus, QToolButton#JinraHomeRound:focus,
+QToolButton#JinraHomeRoundPrimary:focus, QPushButton#JinraHomePill:focus { border-color: #35d9ed; }
+QToolButton#JinraHomeRound:disabled { background: #10182a; border-color: #1b2a41; }
+QPushButton#JinraHomePill { background: #141e30; border: 1px solid #354863; border-image: none; border-radius: 20px; padding: 7px 15px; min-height: 24px; font-size: 11pt; }
+QPushButton#JinraHomePill[primary="true"] { background: #087fe5; border-color: #278dff; color: white; font-weight: 600; }
+QPushButton#JinraHomePill:hover { background: #124b7d; }
+QPushButton#JinraHomePill:disabled, QPushButton#JinraHomePill[primary="true"]:disabled { background: #121c2c; color: #61748e; border-color: #273449; }
 QStatusBar::item { border: none; background: transparent; }
 QStatusBar QPushButton { min-height: 16px; max-height: 18px; padding: 2px 9px; font-size: 8pt; border: none; border-radius: 3px; background: transparent; }
 QStatusBar QPushButton:hover { background: #243951; }
@@ -60,3 +80,72 @@ QDialog QTabBar::tab { padding: 6px 12px; margin: 2px; }
 QDialog QHeaderView::section { padding: 6px; }
 QDialog QCheckBox { spacing: 7px; padding: 2px; }
 QDialog QCheckBox::indicator { width: 15px; height: 15px; }
+QToolButton#JinraHomeProfile { background: #141e30; border: 1px solid #354863; border-radius: 27px; margin: 0; padding: 0; }
+QToolButton#JinraHomeProfile:hover, QToolButton#JinraHomeProfile:focus { border-color: #35d9ed; }
+QToolButton#JinraHomeTool::menu-indicator { image: none; }
+QPushButton#JinraHomeSetting { min-height: 54px; padding: 12px 18px; text-align: left; border-radius: 13px; font-size: 12pt; }
+QPushButton#JinraHomeSetting:focus { border-color: #35d9ed; }
+QSlider#JinraHomeVolume::groove:horizontal { height: 6px; border: none; border-radius: 3px; background: #24334b; }
+QSlider#JinraHomeVolume::sub-page:horizontal { border: none; border-radius: 3px; background: #087fe5; }
+QSlider#JinraHomeVolume::add-page:horizontal { border: none; border-radius: 3px; background: #24334b; }
+QSlider#JinraHomeVolume::handle:horizontal { width: 16px; margin: -5px 0; border: none; border-radius: 8px; background: #35d9ed; }
+QFrame#JinraSettingsRail, QFrame#JinraSettingsPanel {
+    background: #101a2c; border: 1px solid #263750; border-radius: 18px;
+}
+QFrame#JinraSettingsRail QWidget, QFrame#JinraSettingsPanel QWidget { background: transparent; }
+QLabel#JinraSettingsSection { color: #f3f8ff; font-size: 19pt; font-weight: 600; }
+QPushButton#JinraSettingsCategory {
+    color: #b3c5dc; background: transparent; border: 1px solid transparent; border-radius: 12px;
+    margin: 0; padding: 8px 12px; min-height: 25px; text-align: left; font-size: 11pt;
+}
+QPushButton#JinraSettingsCategory:hover { color: #f3f8ff; background: #172941; }
+QPushButton#JinraSettingsCategory:checked { color: #f3f8ff; background: #164672; border-color: #287cb5; }
+QPushButton#JinraSettingsCategory:focus { border-color: #35d9ed; }
+QTabBar#JinraSettingsTabs::tab {
+    background: #18273d; color: #a9bbd3; border: 1px solid #2a3d57;
+    border-radius: 11px; padding: 6px 12px; margin: 0 6px 0 0;
+}
+QTabBar#JinraSettingsTabs::tab:selected { background: #087fe5; border-color: #278dff; color: white; }
+QScrollArea#JinraSettingsScroll { border: none; background: transparent; }
+QScrollArea#JinraSettingsScroll QScrollBar:vertical { width: 8px; margin: 0; border: none; }
+QScrollArea#JinraSettingsScroll QScrollBar:horizontal { height: 8px; margin: 0; border: none; }
+QScrollArea#JinraSettingsScroll QScrollBar::handle:horizontal,
+QScrollArea#JinraSettingsScroll QScrollBar::handle:vertical {
+    background: #3b5878; border: none; border-radius: 4px; min-height: 24px; min-width: 24px;
+}
+QScrollArea#JinraSettingsScroll QScrollBar::add-line,
+QScrollArea#JinraSettingsScroll QScrollBar::sub-line { width: 0; height: 0; border: none; }
+QScrollArea#JinraSettingsScroll QScrollBar::add-page,
+QScrollArea#JinraSettingsScroll QScrollBar::sub-page { background: #101a2c; border: none; }
+QScrollArea#JinraSettingsScroll::corner { background: #101a2c; }
+QFrame#JinraSettingsPanel QGroupBox {
+    background: #131f32; border: 1px solid #283b54; border-radius: 13px;
+    margin-top: 16px; padding-top: 10px;
+}
+QFrame#JinraSettingsPanel QGroupBox::title {
+    subcontrol-origin: margin; left: 8px; padding: 0 6px; color: #a4d3f6; font-weight: 600;
+}
+QFrame#JinraSettingsPanel QComboBox, QFrame#JinraSettingsPanel QLineEdit,
+QFrame#JinraSettingsPanel QSpinBox, QFrame#JinraSettingsPanel QDoubleSpinBox {
+    background: #0c1526; border-radius: 7px; padding: 4px 8px; min-height: 19px;
+}
+QFrame#JinraSettingsPanel QPushButton { background: #1b2d46; border-radius: 8px; padding: 5px 9px; }
+QFrame#JinraSettingsPanel QPushButton:hover { border-color: #35d9ed; }
+QFrame#JinraSettingsPanel QPushButton:disabled { background: #111c2e; }
+QFrame#JinraSettingsPanel QAbstractItemView { background: #111c2e; border-radius: 8px; }
+QFrame#JinraSettingsPanel QSlider::groove:horizontal { height: 6px; border: none; border-radius: 3px; background: #263750; }
+QFrame#JinraSettingsPanel QSlider::sub-page:horizontal { border: none; border-radius: 3px; background: #087fe5; }
+QFrame#JinraSettingsPanel QSlider::add-page:horizontal { border: none; border-radius: 3px; background: #263750; }
+QFrame#JinraSettingsPanel QSlider::handle:horizontal { width: 14px; margin: -4px 0; border: none; border-radius: 7px; background: #35d9ed; }
+QFrame#JinraSettingsVolumeRow {
+    background: #15243a; border: 1px solid #283b54; border-radius: 11px; min-height: 34px;
+}
+QDialog#JinraAvatarDialog QPushButton { border-radius: 10px; padding: 7px 13px; }
+QDialog#JinraAvatarDialog QPushButton:checked { background: #124b7d; border-color: #278dff; }
+QDialog#JinraAvatarDialog QPushButton:focus { border-color: #35d9ed; }
+QLabel#JinraAvatarPreview { background: #141e30; border: 1px solid #283a54; border-radius: 18px; }
+QListWidget#JinraAvatarCards { background: #0e1728; border: 1px solid #283a54; border-radius: 14px; padding: 8px; }
+QListWidget#JinraAvatarCards::item { background: #17243a; border: 1px solid #283a54; border-radius: 12px; color: #e6edf7; padding: 3px; }
+QListWidget#JinraAvatarCards::item:selected { background: #183953; border: 2px solid #35d9ed; }
+QListView#JinraHomeCarousel, QListView#JinraHomeCarousel::item { background: #0b1020; border: none; outline: none; }
+QLabel#JinraHomeDockLabel { color: #a9bbd3; font-size: 10pt; }

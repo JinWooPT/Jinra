@@ -225,11 +225,22 @@ void PlayerControlPreview::UpdateInput() {
     }
 }
 
+void PlayerControlPreview::SetCompactLayout() {
+    compact_layout = true;
+    setFixedHeight(220);
+}
+
 void PlayerControlPreview::paintEvent(QPaintEvent* event) {
     QFrame::paintEvent(event);
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
     const QPointF center = rect().center();
+    if (compact_layout) {
+        const auto scale = std::min({1.0, width() / 560.0, height() / 420.0});
+        p.translate(center);
+        p.scale(scale, scale);
+        p.translate(-center);
+    }
 
     switch (controller_type) {
     case Core::HID::NpadStyleIndex::Handheld:

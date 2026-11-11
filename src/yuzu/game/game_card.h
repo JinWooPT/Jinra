@@ -24,12 +24,16 @@ public:
 
     QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex& index) const override;
     void setSize(const QSize& newSize, const QSize& contentSize, const int padding, const int columns);
+    void SetHomeMode(bool enabled) { home_mode = enabled; }
 
 private:
     static constexpr int cardMargin = 8;
+    void PaintHomeCard(QPainter* painter, const QStyleOptionViewItem& option,
+                       const QModelIndex& index, const QRect& card) const;
 
     QSize m_size;
     QSize m_contentSize;
-    int m_padding;
-    int m_columns;
+    int m_padding{};
+    int m_columns{};
+    bool home_mode{};
 };

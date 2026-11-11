@@ -840,6 +840,19 @@ ConfigureInputPlayer::~ConfigureInputPlayer() {
     }
 }
 
+void ConfigureInputPlayer::UseHomeLayout() {
+    ui->comboDevices->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    ui->comboDevices->setMinimumContentsLength(14);
+    ui->comboProfiles->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    ui->comboProfiles->setMinimumContentsLength(10);
+    ui->main->setSpacing(12);
+    ui->top->setSpacing(8);
+    ui->bottom->layout()->removeWidget(ui->bottomMiddle);
+    ui->main->insertWidget(1, ui->bottomMiddle);
+    ui->bottom->layout()->setSpacing(10);
+    ui->controllerFrame->SetCompactLayout();
+}
+
 void ConfigureInputPlayer::ApplyConfiguration() {
     if (player_index == 0) {
         auto* emulated_controller_p1 =

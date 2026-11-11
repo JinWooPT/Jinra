@@ -4,24 +4,30 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <utility>
 #include <QApplication>
 #include <QButtonGroup>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDirIterator>
 #include <QEvent>
+#include <QFile>
 #include <QFormLayout>
 #include <QFrame>
 #include <QGridLayout>
 #include <QKeySequence>
 #include <QLabel>
 #include <QLocale>
+#include <QMenu>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSignalBlocker>
+#include <QSlider>
 #include <QStackedWidget>
+#include <QTabBar>
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -30,7 +36,9 @@
 #include "input_common/main.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/game_list/game_list_p.h"
+#include "yuzu/configuration/configure_dialog.h"
 #include "yuzu/game/game_list.h"
+#include "yuzu/jinra_avatar.h"
 
 namespace {
 QIcon NavigationIcon(int index) {
@@ -64,7 +72,7 @@ QIcon NavigationIcon(int index) {
         p.drawLine(4, 12, 8, 12);
         p.drawEllipse(QPointF(17, 10), 0.8, 0.8);
         p.drawEllipse(QPointF(19, 13), 0.8, 0.8);
-    } else {
+    } else if (index == 3) {
         QPolygonF gear;
         for (int i = 0; i < 32; ++i) {
             double a = i * 3.141592653589793 / 16;
@@ -73,8 +81,98 @@ QIcon NavigationIcon(int index) {
         }
         p.drawPolygon(gear);
         p.drawEllipse(QPointF(12, 12), 3, 3);
+    } else if (index == 4) {
+        p.drawLine(6, 12, 18, 12);
+        p.drawLine(12, 6, 12, 18);
+    } else if (index == 5) {
+        p.drawEllipse(QPointF(10, 10), 5, 5);
+        p.drawLine(14, 14, 20, 20);
+    } else if (index == 6) {
+        p.drawArc(QRectF(5, 5, 14, 14), 120 * 16, 300 * 16);
+        p.drawLine(12, 3, 12, 11);
+    } else if (index == 7) {
+        p.drawRoundedRect(QRectF(4, 7, 16, 13), 2, 2);
+        p.drawLine(4, 10, 20, 10);
+        p.drawLine(10, 14, 14, 14);
+    } else if (index == 8) {
+        p.drawEllipse(QPointF(12, 8), 3, 3);
+        p.drawArc(QRectF(5, 13, 14, 10), 0, 180 * 16);
+    } else if (index == 9) {
+        QPainterPath folder;
+        folder.moveTo(4, 18);
+        folder.lineTo(4, 6);
+        folder.lineTo(10, 6);
+        folder.lineTo(12, 8);
+        folder.lineTo(20, 8);
+        folder.lineTo(20, 18);
+        folder.closeSubpath();
+        p.drawPath(folder);
+    } else if (index == 10) {
+        for (int y : {6, 12, 18}) {
+            p.drawLine(4, y, 20, y);
+            const int x = y == 12 ? 8 : 15;
+            p.drawLine(x, y - 2, x, y + 2);
+        }
+    } else if (index == 11) {
+        p.drawLine(12, 4, 12, 15);
+        p.drawLine(8, 11, 12, 15);
+        p.drawLine(12, 15, 16, 11);
+        p.drawLine(5, 15, 5, 20);
+        p.drawLine(5, 20, 19, 20);
+        p.drawLine(19, 20, 19, 15);
+    } else if (index == 12) {
+        p.drawRoundedRect(QRectF(6, 6, 12, 12), 2, 2);
+        p.drawRect(QRectF(9, 9, 6, 6));
+        for (int pin : {8, 12, 16}) {
+            p.drawLine(pin, 3, pin, 6);
+            p.drawLine(pin, 18, pin, 21);
+            p.drawLine(3, pin, 6, pin);
+            p.drawLine(18, pin, 21, pin);
+        }
+    } else if (index == 13) {
+        p.drawPolygon(QPolygonF{{3, 9}, {7, 9}, {12, 5}, {12, 19}, {7, 15}, {3, 15}});
+        p.drawArc(QRectF(9, 7, 11, 10), -60 * 16, 120 * 16);
+        p.drawArc(QRectF(8, 4, 16, 16), -60 * 16, 120 * 16);
+    } else if (index == 14) {
+        p.drawPolyline(QPolygonF{{3, 11}, {12, 3.5}, {21, 11}});
+        p.drawPolyline(QPolygonF{{5.5, 9}, {5.5, 20}, {18.5, 20}, {18.5, 9}});
+        p.drawPolyline(QPolygonF{{10, 20}, {10, 14}, {14, 14}, {14, 20}});
     }
     return QIcon(pixmap);
+}
+
+QIcon HomeKeycap(const QString& key) {
+    QPixmap icon(48, 48);
+    icon.fill(Qt::transparent);
+    QPainter painter(&icon);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor("#0b1020"));
+    painter.drawEllipse(icon.rect());
+    auto font = painter.font();
+    font.setPixelSize(24);
+    font.setBold(true);
+    QPainterPath glyph;
+    glyph.addText(QPointF{}, font, key);
+    const QPointF center(icon.width() / 2.0, icon.height() / 2.0);
+    glyph.translate(center - glyph.boundingRect().center());
+    painter.fillPath(glyph, QColor("#e6edf7"));
+    painter.end();
+    icon.setDevicePixelRatio(2);
+    return QIcon(icon);
+}
+
+QToolButton* HomeTool(int icon, const QString& label, const char* style, int size) {
+    auto* button = new QToolButton;
+    button->setIcon(NavigationIcon(icon));
+    const int edge = size >= 70 ? 29 : 23;
+    button->setIconSize(QSize(edge, edge));
+    button->setFixedSize(size, size);
+    button->setObjectName(QLatin1String(style));
+    button->setAccessibleName(label);
+    button->setToolTip(label);
+    button->setCursor(Qt::PointingHandCursor);
+    return button;
 }
 
 QLabel* Label(const QString& text, const char* name, QWidget* parent = nullptr) {
@@ -195,7 +293,7 @@ JinraHome::JinraHome(GameList* games_, QWidget* empty_library, InputCommon::Inpu
     auto* root = new QHBoxLayout(this);
     root->setContentsMargins(0, 0, 0, 0);
     root->setSpacing(0);
-    auto* sidebar = new QFrame;
+    sidebar = new QFrame;
     sidebar->setObjectName(QStringLiteral("JinraSidebar"));
     sidebar->setFixedWidth(170);
     auto* side = new QVBoxLayout(sidebar);
@@ -239,39 +337,67 @@ JinraHome::JinraHome(GameList* games_, QWidget* empty_library, InputCommon::Inpu
     pages->addWidget(CreateGraphics());
     pages->addWidget(CreateControls());
     pages->addWidget(CreateSystem());
+    connect(pages, &QStackedWidget::currentChanged, this, [this] {
+        emit HomeChromeChanged(IsHomeChromeActive());
+        RefreshControllers();
+    });
     navigation[0]->setChecked(true);
     controller_timer = new QTimer(this);
     controller_timer->setInterval(500);
     connect(controller_timer, &QTimer::timeout, this, &JinraHome::RefreshControllers);
     controller_timer->start();
     connect(games, &GameList::GameHighlighted, this, &JinraHome::SelectGame);
+    connect(games, &GameList::GameChosen, this, [this] {
+        if (IsHomeChromeActive())
+            home_audio.Play(JinraHomeAudio::Cue::Confirm);
+    });
     connect(games, &GameList::PopulatingCompleted, this, &JinraHome::SelectFirstGame);
+    connect(games, &GameList::DesktopModeRequested, this, [this] { SetHomeLayout(false); });
     ReloadSettings();
     Retranslate();
+    SetHomeLayout(true);
+    QTimer::singleShot(250, this, [this] {
+        if (isVisible() && IsHomeChromeActive())
+            home_audio.Play(JinraHomeAudio::Cue::Startup);
+    });
 }
 
 QWidget* JinraHome::CreateLibrary(QWidget* empty_library) {
     auto* page = new QWidget;
     auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(26, 22, 26, 18);
+    layout->setContentsMargins(32, 24, 32, 25);
     layout->setSpacing(18);
-    auto* header = new QHBoxLayout;
+    desktop_header = new QWidget;
+    auto* header = new QHBoxLayout(desktop_header);
+    header->setContentsMargins(0, 0, 0, 0);
     headings[0] = Label({}, "JinraHeading");
     header->addWidget(headings[0]);
     header->addStretch();
-    auto* search = games->TakeSearchField();
-    search->setMaximumWidth(350);
-    search->setMinimumWidth(220);
-    header->addWidget(search);
+    library_search = games->TakeSearchField();
+    library_search->setMaximumWidth(350);
+    library_search->setMinimumWidth(220);
+    desktop_search_layout = new QHBoxLayout;
+    desktop_search_layout->addWidget(library_search);
+    header->addLayout(desktop_search_layout);
     auto* add = new QPushButton(tr("Add folder"));
     add->setObjectName(QStringLiteral("JinraSecondary"));
     connect(add, &QPushButton::clicked, this, &JinraHome::AddDirectory);
     header->addWidget(add);
-    layout->addLayout(header);
-    auto* filters = new QHBoxLayout;
+    auto* show_home = new QPushButton(tr("Home mode"));
+    connect(show_home, &QPushButton::clicked, this, [this] { SetHomeLayout(true); });
+    header->addWidget(show_home);
+    CreateHomeChrome();
+    layout->addWidget(desktop_header);
+    layout->addWidget(home_header);
+    collection_row = new QHBoxLayout;
+    collection_tabs = new QWidget;
+    collection_tabs->setObjectName(QStringLiteral("JinraCollections"));
+    auto* filters = new QHBoxLayout(collection_tabs);
+    filters->setContentsMargins(4, 4, 4, 4);
+    filters->setSpacing(3);
     auto* collection_group = new QButtonGroup(this);
     const std::array<QString, 3> collections{tr("All games"), tr("Recent"), tr("Favorites")};
-    for (int i = 0; i < 3; ++i) {
+    for (int i : {0, 2, 1}) {
         auto* b = new QPushButton(collections[i]);
         b->setObjectName(QStringLiteral("JinraFilter"));
         b->setCheckable(true);
@@ -279,16 +405,44 @@ QWidget* JinraHome::CreateLibrary(QWidget* empty_library) {
         filters->addWidget(b);
         if (i == 0)
             b->setChecked(true);
+        ConnectHomeSound(b, JinraHomeAudio::Cue::Confirm);
         connect(b, &QPushButton::clicked, this, [this, i] { games->SetCollectionFilter(i); });
     }
-    filters->addStretch();
-    layout->addLayout(filters);
+    home_sort_button = HomeTool(10, tr("Sort games"), "JinraHomeTool", 54);
+    auto* sort_menu = new QMenu(home_sort_button);
+    sort_menu->addAction(tr("Title A–Z"), games, [this] { games->SortHomeGames(Qt::AscendingOrder); });
+    sort_menu->addAction(tr("Title Z–A"), games, [this] { games->SortHomeGames(Qt::DescendingOrder); });
+    home_sort_button->setMenu(sort_menu);
+    home_sort_button->setPopupMode(QToolButton::InstantPopup);
+    collection_row->addWidget(home_sort_button);
+    collection_row->addWidget(collection_tabs);
+    home_search_button = HomeTool(5, tr("Search games"), "JinraHomeTool", 54);
+    home_search_button->setCheckable(true);
+    ConnectHomeSound(home_search_button, JinraHomeAudio::Cue::Confirm);
+    collection_row->addWidget(home_search_button);
+    layout->addLayout(collection_row);
+    home_search = new QWidget;
+    home_search_layout = new QHBoxLayout(home_search);
+    home_search_layout->setContentsMargins(0, 0, 0, 0);
+    home_search_layout->setAlignment(Qt::AlignHCenter);
+    layout->addWidget(home_search);
+    connect(home_search_button, &QToolButton::toggled, this, [this](bool open) {
+        home_search->setVisible(open);
+        if (open) {
+            library_search->show();
+            games->SetFilterFocus();
+        } else {
+            games->ClearFilter();
+            games->FocusLibrary();
+        }
+    });
     auto* content = new QHBoxLayout;
     auto* list = new QVBoxLayout;
     list->addWidget(games, 1);
     list->addWidget(empty_library, 1);
     content->addLayout(list, 1);
     auto* detail = new QFrame;
+    library_detail = detail;
     detail->setObjectName(QStringLiteral("JinraCard"));
     detail->setFixedWidth(245);
     auto* d = new QVBoxLayout(detail);
@@ -324,7 +478,10 @@ QWidget* JinraHome::CreateLibrary(QWidget* empty_library) {
     layout->addLayout(content, 1);
     library_status = Label({}, "JinraMuted");
     layout->addWidget(library_status);
+    layout->addWidget(home_footer);
     connect(games, &GameList::FilterCountChanged, this, [this](int visible, int total) {
+        home_count->setText(visible != total ? tr("%1 of %2 games").arg(visible).arg(total)
+                                             : total == 1 ? tr("1 game") : tr("%1 games").arg(total));
         library_status->setText(
             tr("%1 of %2 games  ·  %3  ·  %4  ·  %5")
                 .arg(visible)
@@ -334,6 +491,449 @@ QWidget* JinraHome::CreateLibrary(QWidget* empty_library) {
                      memory ? memory->currentText() : QStringLiteral("12 GB")));
     });
     return page;
+}
+
+void JinraHome::CreateHomeChrome() {
+    home_header = new QWidget;
+    auto* header = new QHBoxLayout(home_header);
+    header->setContentsMargins(4, 2, 4, 4);
+    header->setSpacing(14);
+    auto* logo = new QLabel;
+    logo->setFixedSize(53, 53);
+    logo->setScaledContents(true);
+    logo->setPixmap(QPixmap(QStringLiteral(":/jinra/icon.png")));
+    header->addWidget(logo);
+    header->addWidget(Label(QStringLiteral("Jinra"), "JinraBrand"));
+    auto* add = HomeTool(4, tr("Add folder"), "JinraHomeTool", 54);
+    ConnectHomeSound(add, JinraHomeAudio::Cue::Confirm);
+    connect(add, &QToolButton::clicked, this, &JinraHome::AddDirectory);
+    header->addWidget(add);
+    header->addStretch();
+    home_profile = HomeTool(8, tr("Profile"), "JinraHomeProfile", 54);
+    ConnectHomeSound(home_profile, JinraHomeAudio::Cue::Confirm);
+    connect(home_profile, &QToolButton::clicked, this, [this] {
+        JinraAvatarDialog dialog(this);
+        dialog.exec();
+        RefreshHomeProfile();
+    });
+    header->addWidget(home_profile);
+    RefreshHomeProfile();
+    home_clock = Label({}, "JinraHomeClock");
+    header->addWidget(home_clock);
+    auto* controller = new QLabel;
+    controller->setPixmap(NavigationIcon(2).pixmap(QSize(21, 21)));
+    header->addWidget(controller);
+    home_controllers = Label({}, "JinraMuted");
+    header->addWidget(home_controllers);
+    auto* desktop = HomeTool(1, tr("Desktop mode"), "JinraHomeTool", 54);
+    connect(desktop, &QToolButton::clicked, this, [this] { SetHomeLayout(false); });
+    header->addWidget(desktop);
+    auto* exit = HomeTool(6, tr("Exit Jinra"), "JinraHomeTool", 54);
+    connect(exit, &QToolButton::clicked, this, [this] { window()->close(); });
+    header->addWidget(exit);
+
+    home_footer = new QWidget;
+    auto* footer = new QVBoxLayout(home_footer);
+    footer->setContentsMargins(0, 0, 0, 0);
+    footer->setSpacing(21);
+    auto* dock = new QHBoxLayout;
+    dock->setAlignment(Qt::AlignHCenter);
+    dock->setSpacing(24);
+    const auto dock_button = [this, dock](int icon, const QString& text, const char* style) {
+        auto* column = new QVBoxLayout;
+        column->setSpacing(6);
+        auto* button = HomeTool(icon, text, style, 78);
+        ConnectHomeSound(button, JinraHomeAudio::Cue::Confirm);
+        column->addWidget(button, 0, Qt::AlignHCenter);
+        auto* label = Label(text, "JinraHomeDockLabel");
+        label->setAlignment(Qt::AlignCenter);
+        column->addWidget(label);
+        dock->addLayout(column);
+        return button;
+    };
+    auto* content = dock_button(11, tr("Install content"), "JinraHomeRound");
+    connect(content, &QToolButton::clicked, this, &JinraHome::InstallContentRequested);
+    home_save_data = dock_button(7, tr("Save data"), "JinraHomeRound");
+    connect(home_save_data, &QToolButton::clicked, games, &GameList::OpenSelectedSaveData);
+    home_game_settings = dock_button(9, tr("Game settings"), "JinraHomeRound");
+    connect(home_game_settings, &QToolButton::clicked, this, [this] { properties->click(); });
+    auto* controls = dock_button(2, tr("Controls"), "JinraHomeRound");
+    connect(controls, &QToolButton::clicked, this, [this] { emit ConfigureRequested(5); });
+    auto* system = dock_button(1, tr("System"), "JinraHomeRound");
+    connect(system, &QToolButton::clicked, this, [this] { emit ConfigureRequested(1); });
+    auto* graphics = dock_button(10, tr("Graphics"), "JinraHomeRound");
+    connect(graphics, &QToolButton::clicked, this, [this] { emit ConfigureRequested(3); });
+    auto* settings = dock_button(3, tr("Settings"), "JinraHomeRoundPrimary");
+    connect(settings, &QToolButton::clicked, this, [this] { emit ConfigureRequested(0); });
+    footer->addLayout(dock);
+
+    auto* shortcuts = new QHBoxLayout;
+    auto* count_left = Label({}, "JinraMuted");
+    home_count = count_left;
+    count_left->setMinimumWidth(100);
+    shortcuts->addWidget(count_left, 1);
+    home_options = new QPushButton(tr("Options"));
+    auto* desktop_mode = new QPushButton(tr("Desktop mode"));
+    home_play = new QPushButton(tr("Play"));
+    for (auto* button : {home_options, desktop_mode, home_play}) {
+        button->setObjectName(QStringLiteral("JinraHomePill"));
+        button->setIconSize(QSize(23, 23));
+        shortcuts->addWidget(button);
+    }
+    home_options->setIcon(HomeKeycap(QStringLiteral("+")));
+    desktop_mode->setIcon(HomeKeycap(QStringLiteral("B")));
+    home_play->setIcon(HomeKeycap(QStringLiteral("A")));
+    home_play->setProperty("primary", true);
+    home_play->setEnabled(false);
+    home_options->setEnabled(false);
+    home_save_data->setEnabled(false);
+    home_game_settings->setEnabled(false);
+    auto* spacer = new QWidget;
+    spacer->setMinimumWidth(100);
+    shortcuts->addWidget(spacer, 1);
+    ConnectHomeSound(home_options, JinraHomeAudio::Cue::Confirm);
+    connect(home_options, &QPushButton::clicked, games, &GameList::OpenSelectedGameMenu);
+    connect(home_play, &QPushButton::clicked, games, &GameList::PlaySelectedGame);
+    connect(desktop_mode, &QPushButton::clicked, this, [this] { SetHomeLayout(false); });
+    footer->addLayout(shortcuts);
+}
+
+void JinraHome::ConnectHomeSound(QAbstractButton* button, JinraHomeAudio::Cue cue) {
+    connect(button, &QAbstractButton::clicked, this, [this, cue] {
+        if (IsHomeChromeActive())
+            home_audio.Play(cue);
+    });
+}
+
+void JinraHome::RefreshHomeProfile() {
+    const auto profile = JinraAvatarDialog::ActiveProfile();
+    QPixmap icon(80, 80);
+    icon.fill(Qt::transparent);
+    QPainter painter(&icon);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform);
+    QPainterPath circle;
+    circle.addEllipse(QRectF(0, 0, 80, 80));
+    painter.setClipPath(circle);
+    const auto size = profile.image.size().scaled(76, 76, Qt::KeepAspectRatio);
+    QRect target(QPoint{}, size);
+    target.moveCenter(QPoint{40, 40});
+    painter.drawPixmap(target, profile.image, profile.image.rect());
+    painter.end();
+    icon.setDevicePixelRatio(2);
+    home_profile->setIcon(QIcon(icon));
+    home_profile->setIconSize(QSize(38, 38));
+    home_profile->setToolTip(tr("Edit profile · %1").arg(profile.name));
+    home_profile->setAccessibleName(home_profile->toolTip());
+}
+
+class JinraHomeSettings final : public QWidget {
+    Q_DECLARE_TR_FUNCTIONS(JinraHomeSettings)
+
+public:
+    JinraHomeSettings(std::unique_ptr<ConfigurationPages> configuration, JinraHomeAudio& audio,
+                      int first_category, std::function<void(bool)> finished, QWidget* parent)
+        : QWidget(parent), settings(std::move(configuration)), home_audio(audio),
+          original_volume(audio.Volume()), on_finished(std::move(finished)) {
+        setObjectName(QStringLiteral("JinraHomeSettings"));
+        settings->UseHomeLayout();
+        auto* outer = new QVBoxLayout(this);
+        outer->setContentsMargins(28, 20, 28, 20);
+        outer->setSpacing(16);
+
+        auto* header = new QHBoxLayout;
+        back = new QPushButton;
+        back->setObjectName(QStringLiteral("JinraHomePill"));
+        back->setIcon(NavigationIcon(14));
+        back->setIconSize(QSize(23, 23));
+        header->addWidget(back);
+        header->addStretch();
+        title = Label({}, "JinraHeading");
+        header->addWidget(title);
+        header->addStretch();
+        auto* logo = new QLabel;
+        logo->setPixmap(QPixmap(QStringLiteral(":/jinra/icon.png")));
+        logo->setScaledContents(true);
+        logo->setFixedSize(40, 40);
+        header->addWidget(logo);
+        outer->addLayout(header);
+
+        auto* body = new QHBoxLayout;
+        body->setSpacing(18);
+        auto* rail = new QFrame;
+        rail->setObjectName(QStringLiteral("JinraSettingsRail"));
+        rail->setFixedWidth(170);
+        auto* rail_layout = new QVBoxLayout(rail);
+        rail_layout->setContentsMargins(10, 10, 10, 10);
+        rail_layout->setSpacing(7);
+        auto* group = new QButtonGroup(this);
+
+        auto* panel = new QFrame;
+        panel->setObjectName(QStringLiteral("JinraSettingsPanel"));
+        auto* panel_layout = new QVBoxLayout(panel);
+        panel_layout->setContentsMargins(18, 16, 18, 12);
+        panel_layout->setSpacing(12);
+        section_title = Label({}, "JinraSettingsSection");
+        panel_layout->addWidget(section_title);
+        tabs = new QTabBar;
+        tabs->setObjectName(QStringLiteral("JinraSettingsTabs"));
+        tabs->setExpanding(false);
+        tabs->setDrawBase(false);
+        tabs->setUsesScrollButtons(true);
+        panel_layout->addWidget(tabs);
+        volume_row = CreateVolumeRow();
+        panel_layout->addWidget(volume_row);
+        category_pages = new QStackedWidget;
+        category_pages->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+        panel_layout->addWidget(category_pages, 1);
+
+        const auto titles = ConfigurationPages::CategoryTitles();
+        constexpr std::array<int, ConfigurationPages::CategoryCount> icons{3, 1, 12, 10, 13, 2};
+        for (int category = 0; category < ConfigurationPages::CategoryCount; ++category) {
+            auto* button = new QPushButton(NavigationIcon(icons[category]), titles[category]);
+            button->setObjectName(QStringLiteral("JinraSettingsCategory"));
+            button->setIconSize(QSize(24, 24));
+            button->setCheckable(true);
+            group->addButton(button, category);
+            rail_layout->addWidget(button);
+            category_buttons[category] = button;
+
+            auto* stack = new QStackedWidget;
+            auto* waiting = Label(tr("Loading settings…"), "JinraMuted");
+            waiting->setAlignment(Qt::AlignCenter);
+            stack->addWidget(waiting);
+            subpages[category] = stack;
+            category_pages->addWidget(stack);
+        }
+        rail_layout->addStretch();
+        body->addWidget(rail);
+        body->addWidget(panel, 1);
+        outer->addLayout(body, 1);
+
+        auto* footer = new QHBoxLayout;
+        footer->addStretch();
+        discard = new QPushButton;
+        discard->setObjectName(QStringLiteral("JinraHomePill"));
+        save = new QPushButton;
+        save->setObjectName(QStringLiteral("JinraHomePill"));
+        save->setProperty("primary", true);
+        footer->addWidget(discard);
+        footer->addWidget(save);
+        outer->addLayout(footer);
+
+        connect(group, &QButtonGroup::idClicked, this, [this](int category) {
+            home_audio.Play(JinraHomeAudio::Cue::Navigate);
+            SelectCategory(category);
+        });
+        connect(tabs, &QTabBar::currentChanged, this, [this](int index) {
+            if (index >= 0) {
+                subpages[current_category]->setCurrentIndex(index);
+                settings->ResetDebugTab();
+                home_audio.Play(JinraHomeAudio::Cue::Navigate);
+            }
+        });
+        connect(back, &QPushButton::clicked, this, &JinraHomeSettings::Discard);
+        connect(discard, &QPushButton::clicked, this, &JinraHomeSettings::Discard);
+        connect(save, &QPushButton::clicked, this, [this] { Finish(true); });
+        connect(settings.get(), &ConfigurationPages::ResetRequested, this, &JinraHomeSettings::Discard);
+        Retranslate();
+        SelectCategory(std::clamp(first_category, 0, ConfigurationPages::CategoryCount - 1));
+        category_buttons[current_category]->setFocus(Qt::OtherFocusReason);
+    }
+
+    void Discard() {
+        Finish(false);
+    }
+
+protected:
+    void changeEvent(QEvent* event) override {
+        QWidget::changeEvent(event);
+        if (event->type() == QEvent::LanguageChange) {
+            QTimer::singleShot(0, this, [this] { Retranslate(); });
+        }
+    }
+
+private:
+    QWidget* CreateVolumeRow() {
+        auto* row = new QFrame;
+        row->setObjectName(QStringLiteral("JinraSettingsVolumeRow"));
+        auto* layout = new QHBoxLayout(row);
+        layout->setContentsMargins(14, 6, 14, 6);
+        volume_label = Label({}, "JinraHomeDockLabel");
+        layout->addWidget(volume_label);
+        volume = new QSlider(Qt::Horizontal);
+        volume->setObjectName(QStringLiteral("JinraHomeVolume"));
+        volume->setRange(0, 100);
+        volume->setValue(original_volume);
+        layout->addWidget(volume, 1);
+        volume_percent = Label({}, "JinraMuted");
+        volume_percent->setMinimumWidth(40);
+        volume_percent->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        layout->addWidget(volume_percent);
+        connect(volume, &QSlider::valueChanged, this, [this](int percent) {
+            home_audio.SetVolume(percent, false);
+            volume_percent->setText(tr("%1%").arg(percent));
+        });
+        connect(volume, &QSlider::sliderReleased, this, [this] {
+            home_audio.Play(JinraHomeAudio::Cue::Notice);
+        });
+        return row;
+    }
+
+    void SelectCategory(int category) {
+        current_category = category;
+        category_buttons[category]->setChecked(true);
+        category_pages->setCurrentIndex(category);
+        section_title->setText(category_buttons[category]->text());
+        volume_row->setVisible(category == 4);
+        UpdateTabs();
+        if (loaded_pages[category].isEmpty()) {
+            QTimer::singleShot(16, this, [this, category] {
+                if (current_category == category && on_finished && loaded_pages[category].isEmpty()) {
+                    LoadCategory(category);
+                }
+            });
+        }
+    }
+
+    void LoadCategory(int category) {
+        auto* stack = subpages[category];
+        auto* waiting = stack->widget(0);
+        loaded_pages[category] = settings->LoadCategory(category);
+        for (auto* page : loaded_pages[category]) {
+            auto* scroll = new QScrollArea;
+            scroll->setObjectName(QStringLiteral("JinraSettingsScroll"));
+            scroll->setWidgetResizable(true);
+            scroll->setFrameShape(QFrame::NoFrame);
+            scroll->setWidget(page);
+            stack->addWidget(scroll);
+        }
+        stack->removeWidget(waiting);
+        waiting->deleteLater();
+        UpdateTabs();
+    }
+
+    void UpdateTabs() {
+        const auto& pages = loaded_pages[current_category];
+        const QSignalBlocker blocker(tabs);
+        while (tabs->count() != 0) {
+            tabs->removeTab(tabs->count() - 1);
+        }
+        for (auto* page : pages) {
+            tabs->addTab(page->accessibleName());
+        }
+        tabs->setVisible(pages.size() > 1);
+        tabs->setCurrentIndex(subpages[current_category]->currentIndex());
+    }
+
+    void Retranslate() {
+        title->setText(tr("Settings"));
+        back->setText(tr("Back to Home"));
+        discard->setText(tr("Discard changes"));
+        save->setText(tr("Save changes"));
+        volume_label->setText(tr("Home sound volume"));
+        volume->setAccessibleName(volume_label->text());
+        volume_percent->setText(tr("%1%").arg(volume->value()));
+        const auto titles = ConfigurationPages::CategoryTitles();
+        for (int i = 0; i < ConfigurationPages::CategoryCount; ++i) {
+            category_buttons[i]->setText(titles[i]);
+        }
+        if (current_category >= 0) {
+            section_title->setText(titles[current_category]);
+            const auto& pages = loaded_pages[current_category];
+            for (int i = 0; i < tabs->count(); ++i) {
+                tabs->setTabText(i, pages[i]->accessibleName());
+            }
+        }
+    }
+
+    void Finish(bool accepted) {
+        if (!on_finished) {
+            return;
+        }
+        if (accepted) {
+            settings->ApplyConfiguration();
+        }
+        home_audio.SetVolume(accepted ? volume->value() : original_volume, accepted);
+        home_audio.Play(accepted ? JinraHomeAudio::Cue::Confirm : JinraHomeAudio::Cue::Back);
+        std::exchange(on_finished, {})(accepted);
+    }
+
+    std::unique_ptr<ConfigurationPages> settings;
+    JinraHomeAudio& home_audio;
+    const int original_volume;
+    std::function<void(bool)> on_finished;
+    std::array<QPushButton*, ConfigurationPages::CategoryCount> category_buttons{};
+    std::array<QStackedWidget*, ConfigurationPages::CategoryCount> subpages{};
+    std::array<QList<QWidget*>, ConfigurationPages::CategoryCount> loaded_pages{};
+    QStackedWidget* category_pages{};
+    QTabBar* tabs{};
+    QPushButton* back{};
+    QPushButton* discard{};
+    QPushButton* save{};
+    QLabel* title{};
+    QLabel* section_title{};
+    QWidget* volume_row{};
+    QLabel* volume_label{};
+    QLabel* volume_percent{};
+    QSlider* volume{};
+    int current_category{-1};
+};
+
+void JinraHome::ShowSettings(std::unique_ptr<ConfigurationPages> settings, int category,
+                             std::function<void(bool)> finished) {
+    home_settings = new JinraHomeSettings(
+        std::move(settings), home_audio, category,
+        [this, finished = std::move(finished)](bool accepted) {
+            auto* view = std::exchange(home_settings, nullptr);
+            pages->setCurrentIndex(0);
+            pages->removeWidget(view);
+            view->deleteLater();
+            finished(accepted);
+            games->FocusLibrary();
+        },
+        pages);
+    pages->addWidget(home_settings);
+    pages->setCurrentWidget(home_settings);
+}
+
+void JinraHome::SetHomeLayout(bool enabled) {
+    if (home_layout != enabled && isVisible() && !emulating)
+        home_audio.Play(enabled ? JinraHomeAudio::Cue::Confirm : JinraHomeAudio::Cue::Back);
+    home_layout = enabled;
+    QFile stylesheet(QStringLiteral(":/jinra/style.qss"));
+    setStyleSheet(enabled && stylesheet.open(QIODevice::ReadOnly)
+                      ? QString::fromUtf8(stylesheet.readAll()) : QString{});
+    setAttribute(Qt::WA_StyledBackground, enabled);
+    sidebar->setVisible(!enabled);
+    desktop_header->setVisible(!enabled);
+    home_header->setVisible(enabled);
+    home_footer->setVisible(enabled);
+    library_detail->setVisible(!enabled);
+    library_status->setVisible(!enabled);
+    home_search_button->setVisible(enabled);
+    home_sort_button->setVisible(enabled);
+    collection_row->setAlignment(enabled ? Qt::AlignHCenter : Qt::AlignLeft);
+    if (enabled) {
+        home_search_layout->addWidget(library_search);
+        if (games->HasSearchFilter())
+            home_search_button->setChecked(true);
+        home_search->setVisible(home_search_button->isChecked());
+    } else {
+        desktop_search_layout->addWidget(library_search);
+        library_search->setVisible(UISettings::values.show_filter_bar.GetValue());
+        home_search->hide();
+    }
+    games->SetHomeMode(enabled);
+    if (enabled)
+        games->FocusLibrary();
+    emit HomeChromeChanged(IsHomeChromeActive());
+    RefreshControllers();
+}
+
+bool JinraHome::IsHomeChromeActive() const {
+    return home_layout && !emulating &&
+           (pages->currentIndex() == 0 || pages->currentWidget() == home_settings);
 }
 
 QWidget* JinraHome::CreateGraphics() {
@@ -556,6 +1156,9 @@ void JinraHome::ApplySettings() {
 void JinraHome::SetEmulating(bool running) {
     emulating = running;
     if (running) {
+        if (home_settings) {
+            home_settings->Discard();
+        }
         controller_timer->stop();
         pages->setCurrentIndex(0);
         navigation[0]->setChecked(true);
@@ -565,11 +1168,17 @@ void JinraHome::SetEmulating(bool running) {
     }
     for (int i = 1; i < 4; ++i)
         navigation[i]->setEnabled(!running);
+    emit HomeChromeChanged(IsHomeChromeActive());
 }
 
 void JinraHome::SelectGame(const QModelIndex& index) {
     const auto item = index.siblingAtColumn(0);
-    if (!item.isValid() || item.data(GameListItemPath::FullPathRole).toString().isEmpty()) {
+    const bool has_game = item.isValid() && !item.data(GameListItemPath::FullPathRole).toString().isEmpty();
+    home_play->setEnabled(has_game);
+    home_options->setEnabled(has_game);
+    home_game_settings->setEnabled(has_game);
+    home_save_data->setEnabled(has_game && item.data(GameListItemPath::ProgramIdRole).toULongLong() != 0);
+    if (!has_game) {
         selected_game = QPersistentModelIndex();
         detail_title->setText(tr("Select a game"));
         detail_status->setText(tr("Choose a game from the library."));
@@ -578,6 +1187,8 @@ void JinraHome::SelectGame(const QModelIndex& index) {
         properties->setEnabled(false);
         return;
     }
+    if (selected_game.isValid() && selected_game != item && isVisible() && IsHomeChromeActive())
+        home_audio.Play(JinraHomeAudio::Cue::Navigate);
     selected_game = item;
     detail_title->setText(item.data(GameListItemPath::TitleRole).toString());
     const auto image = item.data(Qt::DecorationRole).value<QPixmap>();
@@ -594,6 +1205,8 @@ void JinraHome::SelectGame(const QModelIndex& index) {
 }
 
 void JinraHome::SelectFirstGame() {
+    if (home_layout)
+        return;
     auto* model = games->GetModel();
     std::function<bool(const QModelIndex&)> visit = [&](const QModelIndex& parent) {
         for (int i = 0; i < model->rowCount(parent); ++i) {
@@ -616,19 +1229,31 @@ void JinraHome::SelectFirstGame() {
 }
 
 void JinraHome::RefreshControllers() {
-    if (!controller_view || !isVisible() || emulating || pages->currentIndex() != 2)
+    if (!controller_view || !isVisible() || emulating)
         return;
-    auto devices = input->GetInputDevices();
+    const auto page = pages->currentIndex();
+    const bool library_home = page == 0 && home_layout;
+    if (page != 2 && !library_home)
+        return;
+    const auto devices = input->GetInputDevices();
     const Common::ParamPackage* active = nullptr;
     u64 newest{};
+    int connected = 0;
     for (const auto& device : devices) {
         if (device.Get("engine", "") != "sdl" || device.Get("guid2", "") != "")
             continue;
+        ++connected;
         const auto activity = QString::fromStdString(device.Get("last_active", "0")).toULongLong();
         if (!active || activity > newest) {
             active = &device;
             newest = activity;
         }
+    }
+    if (library_home) {
+        home_clock->setText(QLocale().toString(QTime::currentTime(), QLocale::ShortFormat));
+        home_controllers->setText(connected == 1 ? tr("1 controller")
+                                                  : tr("%1 controllers").arg(connected));
+        return;
     }
     const auto name = active ? QString::fromStdString(active->Get("display", "Controller"))
                              : tr("No controller connected");

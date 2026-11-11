@@ -9,6 +9,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "common/common_funcs.h"
@@ -53,6 +54,11 @@ struct DlssStatus {
     Settings::NvidiaDlssPreset preset{};
 };
 
+struct VideoMemoryUsage {
+    u64 bytes{};
+    bool shared{};
+};
+
 struct RendererSettings {
     // Screenshot
     std::atomic<bool> screenshot_requested{false};
@@ -88,6 +94,10 @@ public:
 
     [[nodiscard]] virtual DlssStatus GetDlssStatus() const {
         return {};
+    }
+
+    [[nodiscard]] virtual std::optional<VideoMemoryUsage> GetVideoMemoryUsage() const {
+        return std::nullopt;
     }
 
     [[nodiscard]] const RendererDeviceInfo& GetDeviceInfo() const {

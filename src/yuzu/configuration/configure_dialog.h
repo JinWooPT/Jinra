@@ -6,9 +6,13 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <vector>
 #include <QDialog>
+#include <QList>
 #include "configuration/shared_widget.h"
 #include "qt_common/config/shared_translation.h"
 #include "qt_common/util/vk.h"
@@ -45,42 +49,38 @@ namespace Ui {
 class ConfigureDialog;
 }
 
-class ConfigureDialog : public QDialog {
+class ConfigurationPages final : public QObject {
     Q_OBJECT
 
 public:
-    explicit ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
-                             InputCommon::InputSubsystem* input_subsystem,
-                             std::vector<VkDeviceInfo::Record>& vk_device_records,
-                             Core::System& system_, bool enable_web_config = true);
-    ~ConfigureDialog() override;
+    static constexpr int CategoryCount = 6;
 
+    ConfigurationPages(QWidget* parent, HotkeyRegistry& registry_,
+                       InputCommon::InputSubsystem* input_subsystem,
+                       std::vector<VkDeviceInfo::Record>& vk_device_records,
+                       Core::System& system_, bool enable_web_config);
+    ~ConfigurationPages() override;
     void ApplyConfiguration();
-    void SelectCategory(int index);
-
-private slots:
-    void OnLanguageChanged(const QString& locale);
+    void UseHomeLayout() { home_layout = true; }
+    static std::array<QString, CategoryCount> CategoryTitles();
+    QList<QWidget*> LoadCategory(int category);
+    void ResetDebugTab();
 
 signals:
     void LanguageChanged(const QString& locale);
     void ExternalContentDirsChanged();
+    void ResetRequested();
 
 private:
-    void changeEvent(QEvent* event) override;
-    void RetranslateUI();
-
-    void HandleApplyButtonClicked();
-
-    void SetConfiguration();
-    void UpdateVisibleTabs();
-    void PopulateSelectionList();
-
-    std::unique_ptr<Ui::ConfigureDialog> ui;
     HotkeyRegistry& registry;
-
     Core::System& system;
+    InputCommon::InputSubsystem* input_subsystem;
+    std::vector<VkDeviceInfo::Record>& vk_device_records;
+    const bool enable_web_config;
+    bool home_layout{};
+    std::unique_ptr<QWidget> staging;
     std::unique_ptr<ConfigurationShared::Builder> builder;
-    std::vector<ConfigurationShared::Tab*> tab_group;
+    std::optional<std::pair<Settings::AspectRatio, Settings::ResolutionSetup>> screenshot_info;
 
     std::unique_ptr<ConfigureApplets> applets_tab;
     std::unique_ptr<ConfigureAudio> audio_tab;
@@ -98,4 +98,32 @@ private:
     std::unique_ptr<ConfigureProfileManager> profile_tab;
     std::unique_ptr<ConfigureSystem> system_tab;
     std::unique_ptr<ConfigureWeb> web_tab;
+};
+
+class ConfigureDialog : public QDialog {
+    Q_OBJECT
+
+public:
+    explicit ConfigureDialog(QWidget* parent, HotkeyRegistry& registry,
+                             InputCommon::InputSubsystem* input_subsystem,
+                             std::vector<VkDeviceInfo::Record>& vk_device_records,
+                             Core::System& system, bool enable_web_config = true);
+    ~ConfigureDialog() override;
+
+    void ApplyConfiguration();
+    void SelectCategory(int index);
+
+signals:
+    void LanguageChanged(const QString& locale);
+    void ExternalContentDirsChanged();
+
+private:
+    void changeEvent(QEvent* event) override;
+    void RetranslateUI();
+    void HandleApplyButtonClicked();
+    void UpdateVisibleTabs();
+    void PopulateSelectionList();
+
+    std::unique_ptr<Ui::ConfigureDialog> ui;
+    ConfigurationPages settings;
 };

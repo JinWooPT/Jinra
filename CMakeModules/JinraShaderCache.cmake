@@ -151,6 +151,10 @@ function(jinra_shader_cache_fingerprint output)
         "video_core/renderer_vulkan/vk_scheduler.cpp|77281f5e9012425fc6ff1aec321827f9e71b02c8ec8e218ab3776b87d5b420d7|1d4c895019166543c8b3dbb817bb0c080a077425717d3719bde8f3acb6a5e403"
         "video_core/renderer_vulkan/vk_scheduler.h|e38312ab6de784ef85dc4c5da9392f18fb1b362e3dacb1a2238d77c62548d337|189fc1292cb37fdf43d4648cc7bd31cd32359c8c230ce1ef647c1500907861e1"
         "video_core/renderer_vulkan/vk_rasterizer.cpp|0e4f5d7c36cb8e4f754e73b22c3ae2e12f4bcfe5613490bfd387658f1ceb7d8e|aa020eb3032e480193e0c778907809e0211c3f7df90c29f36f82fdec0c41c2cd"
+        # The overlay only reads the driver memory counter. Shader generation is unchanged.
+        "video_core/renderer_base.h|c0135f5262c7e7d34c18a66759183111fbb2fae0d8711827a86db50fee24a7ea|87a16906f8383efd71ef4ae047b538347a18ca4574bf41571f72ccf2b632d55f"
+        "video_core/renderer_vulkan/renderer_vulkan.h|5eca448a57608f269c64c4eef98b24b9508e6c854bedf01dc213db7108327fc0|19fc581a7cd08d6213271bbd2670f32dd0ab45adee7e6b854b39d34633bb6ff7"
+        "video_core/renderer_vulkan/renderer_vulkan.cpp|4f41f01a81d4144c1d6db10b66ca376c45f67308895519e18947b428ccea60a6|72777b1d2dfeb396c04eeb7d59481bca9b617332251b59eeb5742784e1537995"
         "video_core/renderer_vulkan/upload_batch.h|4fd31e6eb1b06fd884445402d2f09f96874b878e796f13f0bf3a9f4ad47a1437|host-only"
     )
         string(REPLACE "|" ";" revision "${revision}")

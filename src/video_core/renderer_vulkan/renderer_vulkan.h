@@ -59,6 +59,8 @@ public:
         return device.GetDriverName();
     }
 
+    [[nodiscard]] std::optional<VideoCore::VideoMemoryUsage> GetVideoMemoryUsage() const override;
+
     [[nodiscard]] VideoCore::FrameGenStatus GetFrameGenStatus() const override {
 #ifdef HAS_LSFG
         return frame_gen.CurrentStatus();

@@ -424,6 +424,22 @@ void RendererVulkan::RenderAppletCaptureLayer(
                             CaptureFormat);
 }
 
+std::optional<VideoCore::VideoMemoryUsage> RendererVulkan::GetVideoMemoryUsage() const {
+    if (!device.CanReportMemoryUsage()) {
+        return std::nullopt;
+    }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    const auto properties = device.GetPhysical().GetMemoryProperties(&budget).memoryProperties;
+    u64 bytes{};
+    for (u32 i = 0; i < properties.memoryHeapCount; ++i) {
+        if (properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            bytes += budget.heapUsage[i];
+        }
+    }
+    return VideoCore::VideoMemoryUsage{bytes, device.IsIntegrated()};
+}
+
 #ifdef EGLANTINE_STREAMLINE
 VideoCore::DlssStatus RendererVulkan::GetDlssStatus() const {
     auto status = StreamlineDlssUpscaler::Status();

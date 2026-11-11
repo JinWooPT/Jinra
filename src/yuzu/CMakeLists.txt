@@ -254,8 +254,10 @@ add_executable(yuzu
     configuration/system/profile_avatar_dialog.h configuration/system/profile_avatar_dialog.cpp
     configuration/addon/mod_select_dialog.h configuration/addon/mod_select_dialog.cpp configuration/addon/mod_select_dialog.ui
 
-    render/performance_overlay.h render/performance_overlay.cpp render/performance_overlay.ui
+    render/performance_overlay.h render/performance_overlay.cpp
     jinra_home.cpp jinra_home.h
+    jinra_home_audio.cpp jinra_home_audio.h
+    jinra_avatar.cpp jinra_avatar.h
     updater/jinra_release.h updater/jinra_release.cpp
     updater/jinra_updater.h updater/jinra_updater.cpp
     game/common.h
@@ -430,7 +432,7 @@ endif()
 
 target_link_libraries(yuzu PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(yuzu PRIVATE common core input_common frontend_common network video_core qt_common)
-target_link_libraries(yuzu PRIVATE Boost::headers Qt6::Widgets Qt6::Charts Qt6::Concurrent Qt6::Network)
+target_link_libraries(yuzu PRIVATE Boost::headers Qt6::Widgets Qt6::Concurrent Qt6::Network)
 # Unpacks NVIDIA's files from the Streamline release (nvidia_dlss_panel.cpp).
 target_link_libraries(yuzu PRIVATE ZLIB::ZLIB)
 if (WIN32)

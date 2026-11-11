@@ -68,7 +68,10 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
          {static_cast<QAbstractItemView*>(tree_view), static_cast<QAbstractItemView*>(grid_view),
           static_cast<QAbstractItemView*>(carousel_view)}) {
         connect(view->selectionModel(), &QItemSelectionModel::currentChanged, this,
-                [this](const QModelIndex& index) { emit GameHighlighted(index); });
+                [this, view](const QModelIndex& index) {
+                    if (view == m_currentView)
+                        emit GameHighlighted(index);
+                });
     }
 
     controller_navigation = new ControllerNavigation(system.HIDCore(), this);
@@ -90,7 +93,7 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
                 if (system.IsPoweredOn()) {
                     return;
                 }
-                if (!this->isActiveWindow()) {
+                if (!isVisible() || !isActiveWindow() || QApplication::activePopupWidget()) {
                     return;
                 }
                 QKeyEvent* event = new QKeyEvent(QEvent::KeyPress, key, Qt::NoModifier);
@@ -129,6 +132,7 @@ void GameList::SetupViews() {
     tree_view = new GameTree(this);
     grid_view = new GameGrid(this);
     carousel_view = new GameCarousel(this);
+    carousel_view->installEventFilter(this);
 
     tree_view->SetModel(item_model);
     grid_view->SetModel(item_model);
@@ -142,6 +146,10 @@ QString GameList::GetLastFilterResultItem() const {
 QWidget* GameList::TakeSearchField() {
     layout->removeWidget(search_field);
     return search_field;
+}
+
+bool GameList::HasSearchFilter() const {
+    return !search_field->filterText().isEmpty();
 }
 
 void GameList::SetCollectionFilter(int collection) {
@@ -209,7 +217,8 @@ void GameList::UnloadController() {
 }
 
 void GameList::ResetViewMode() {
-    const auto mode = UISettings::values.game_list_mode.GetValue();
+    const auto mode = home_mode ? Settings::GameListMode::CarouselView
+                                : UISettings::values.game_list_mode.GetValue();
     game_list_mode = mode;
 
     if (m_currentView)
@@ -276,6 +285,56 @@ void GameList::ResetViewMode() {
     }
 }
 
+void GameList::SetHomeMode(bool enabled) {
+    if (home_mode == enabled)
+        return;
+    home_mode = enabled;
+    carousel_view->SetHomeMode(enabled);
+    ResetViewMode();
+    if (!m_populating) {
+        if (enabled) {
+            SortHomeGames(home_sort_order);
+            return;
+        }
+        item_model->sort(tree_view->header()->sortIndicatorSection(),
+                         tree_view->header()->sortIndicatorOrder());
+        OnTextChanged(search_field->filterText());
+    }
+}
+
+void GameList::FocusLibrary() {
+    m_currentView->setFocus();
+}
+
+void GameList::PlaySelectedGame() {
+    const auto index = m_currentView->currentIndex();
+    if (index.isValid())
+        ValidateEntry(index);
+}
+
+void GameList::OpenSelectedGameMenu() {
+    const auto index = m_currentView->currentIndex();
+    if (!index.isValid())
+        return;
+    m_currentView->scrollTo(index);
+    PopupContextMenu(m_currentView->visualRect(index).center());
+}
+
+void GameList::OpenSelectedSaveData() {
+    const auto index = m_currentView->currentIndex().siblingAtColumn(0);
+    const auto id = index.data(GameListItemPath::ProgramIdRole).toULongLong();
+    if (id != 0) {
+        emit OpenFolderRequested(id, GameListOpenTarget::SaveData,
+                                 index.data(GameListItemPath::FullPathRole).toString().toStdString());
+    }
+}
+
+void GameList::SortHomeGames(Qt::SortOrder order) {
+    home_sort_order = order;
+    item_model->sort(0, order);
+    OnTextChanged(search_field->filterText());
+}
+
 void GameList::OnTextChanged(const QString& new_text) {
     const QString edit_filter_text = new_text.toLower();
 
@@ -326,6 +385,8 @@ void GameList::OnTextChanged(const QString& new_text) {
         m_currentView->setCurrentIndex(first_visible);
         if (!first_visible.isValid())
             emit GameHighlighted({});
+    } else if (home_mode) {
+        emit GameHighlighted(current);
     }
     search_field->setFilterResult(visible, total);
     emit FilterCountChanged(visible, total);
@@ -410,13 +471,19 @@ void GameList::OnPopulatingCompleted(const QStringList& watch_list) {
     }
 
     search_field->setFilterResult(children_total, children_total);
-    if (children_total > 0) {
+    if (home_mode) {
+        FocusLibrary();
+    } else if (children_total > 0) {
         search_field->setFocus();
     }
 
     // TODO: carousel/grid impl.
-    item_model->sort(tree_view->header()->sortIndicatorSection(),
-                     tree_view->header()->sortIndicatorOrder());
+    if (home_mode) {
+        item_model->sort(0, home_sort_order);
+    } else {
+        item_model->sort(tree_view->header()->sortIndicatorSection(),
+                         tree_view->header()->sortIndicatorOrder());
+    }
 
     OnTextChanged(search_field->filterText());
     emit PopulatingCompleted();
@@ -830,13 +897,28 @@ void GameList::SetupScrollAnimation() {
 
     setup(vertical_scroll, grid_view->verticalScrollBar());
     setup(horizontal_scroll, grid_view->horizontalScrollBar());
+    setup(horizontal_scroll, carousel_view->horizontalScrollBar());
 }
 
 bool GameList::eventFilter(QObject* obj, QEvent* event) {
+    if (!m_currentView)
+        return QWidget::eventFilter(obj, event);
+    if (obj == carousel_view && home_mode && event->type() == QEvent::KeyPress) {
+        const auto key = static_cast<QKeyEvent*>(event)->key();
+        if (key == Qt::Key_Escape) {
+            emit DesktopModeRequested();
+            return true;
+        }
+        if (key == Qt::Key_Menu) {
+            OpenSelectedGameMenu();
+            return true;
+        }
+    }
     if (obj == m_currentView->viewport() && event->type() == QEvent::Wheel) {
         QWheelEvent* wheelEvent = static_cast<QWheelEvent*>(event);
 
-        bool horizontal = wheelEvent->modifiers() & Qt::ShiftModifier;
+        const bool horizontal = m_currentView == carousel_view ||
+                                (wheelEvent->modifiers() & Qt::ShiftModifier);
 
         int deltaX = wheelEvent->angleDelta().x();
         int deltaY = wheelEvent->angleDelta().y();

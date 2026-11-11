@@ -222,8 +222,6 @@ signals:
     void SigInterrupt();
     void sizeChanged(const QSize& size);
     void positionChanged(const QPoint& pos);
-    void statsUpdated(const Core::PerfStatsResults& results,
-                      const VideoCore::ShaderNotify& shaders);
 
 public slots:
     void OnLoadComplete();
@@ -377,6 +375,8 @@ private slots:
     void OnMenuInstallToNAND();
     void OnMenuRecentFile();
     void OnConfigure();
+    void OpenDesktopSettings(int category);
+    void OpenHomeSettings(int category);
     void OnConfigureTas();
     void OnDecreaseVolume();
     void OnIncreaseVolume();
@@ -528,7 +528,8 @@ private:
 
     GameListPlaceholder* game_list_placeholder = nullptr;
     JinraHome* jinra_home = nullptr;
-    int jinra_configuration_category = 0;
+    struct ConfigurationSnapshot;
+    void FinishConfiguration(const ConfigurationSnapshot& previous);
 
     std::vector<VkDeviceInfo::Record> vk_device_records;
 

@@ -72,6 +72,7 @@ public:
     QString GetLastFilterResultItem() const;
     void ClearFilter();
     QWidget* TakeSearchField();
+    bool HasSearchFilter() const;
     void SetCollectionFilter(int collection);
     void SetFilterFocus();
     void SetFilterVisible(bool visibility);
@@ -89,6 +90,12 @@ public:
     void UnloadController();
 
     void ResetViewMode();
+    void SetHomeMode(bool enabled);
+    void FocusLibrary();
+    void PlaySelectedGame();
+    void OpenSelectedGameMenu();
+    void OpenSelectedSaveData();
+    void SortHomeGames(Qt::SortOrder order);
 
 public slots:
     void SetNupConversionRunning(bool running);
@@ -99,6 +106,7 @@ public slots:
     void OnPopulate();
 
 signals:
+    void DesktopModeRequested();
     void GameHighlighted(const QModelIndex& index);
     void FilterCountChanged(int visible, int total);
     void BootGame(const QString& game_path, StartGameType type);
@@ -183,6 +191,8 @@ private:
     QString filtered_game_path;
     bool m_isTreeMode = true;
     bool m_populating = false;
+    bool home_mode{};
+    Qt::SortOrder home_sort_order{Qt::AscendingOrder};
     bool nup_conversion_running{};
     bool nx_tool_running{};
     QAbstractItemView* m_currentView = nullptr;

@@ -51,6 +51,7 @@ public:
     void ApplyConfiguration();
 
     QList<QWidget*> GetSubTabs() const;
+    void UseHomeLayout();
 
 private:
     void changeEvent(QEvent* event) override;

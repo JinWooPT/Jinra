@@ -11,8 +11,9 @@
 # Jinra
 
 Jinra is an experimental fork of [Eden-NS2](https://github.com/0x2593/Eden-NS2).
-The desktop interface includes a game library, per-game settings, controller
-layouts for Xbox and DualSense, and a Windows update checker.
+Jinra starts in Home, with a game library, favorites, recent games, and
+dedicated screens for graphics, system, audio, and controls. Select
+**Desktop mode** to use the desktop library and menu bar.
 
 ## Windows downloads
 
@@ -24,6 +25,9 @@ compiler optimizations. Installed editions receive updates for their own edition
 For a portable install, extract the entire archive and run Jinra. It stores
 saves and settings in the user directory beside the application. Installer
 upgrades preserve that directory. Use your own game dumps and system files.
+
+To check for an update from Home, select **Desktop mode**, then
+**Help → Check for updates**.
 
 ## 1.0.0
 
@@ -63,6 +67,11 @@ Existing profiles keep their names, preferences, and save associations.
 
 ## Interface
 
+Home includes profile names and avatars, and a sound volume control under
+**Settings → Audio**. Use **View → Show Performance Overlay** or **Ctrl+V**
+to show FPS, frame time, process RAM, and GPU memory where the Vulkan driver
+reports it.
+
 The following screenshots show the Jinra interface from an earlier preview.
 
 ![Jinra library with Donkey Kong Bananza selected](docs/jinra/screenshots/library.jpg)
@@ -73,3 +82,4 @@ The following screenshots show the Jinra interface from an earlier preview.
 
 See the [build guide](docs/Build.md) and [Windows packaging notes](dist/windows/README.md).
 See [LICENSE.txt](LICENSE.txt) and [LICENSES](LICENSES) for applicable terms.
+The Hello Kitty Island Adventure avatar artwork is credited to SANRIO and Sunblink.
