@@ -73,6 +73,7 @@ private:
     void UpdateAPILayout();
     void UpdateDeviceSelection(int device);
     void UpdateAmdFsr4Visibility();
+    void ImportLosslessDll();
 
     void RetrieveVulkanDevices();
 

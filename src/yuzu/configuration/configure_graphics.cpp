@@ -4,20 +4,28 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <filesystem>
 #include <functional>
+#include <system_error>
 #include <vector>
 #include <QBoxLayout>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
+#include <QDir>
+#include <QFile>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QIcon>
 #include <QLabel>
 #include <QListView>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QPixmap>
 #include <QPushButton>
 #include <QSlider>
 #include <QStringLiteral>
+#include <QTemporaryDir>
 #include <QtCore/qobjectdefs.h>
 #include <qabstractbutton.h>
 #include <qboxlayout.h>
@@ -28,12 +36,14 @@
 #include <vulkan/vulkan_core.h>
 
 #include "common/common_types.h"
+#include "common/fs/path_util.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/util/vk.h"
 #include "ui_configure_graphics.h"
+#include "video_core/frame_gen/lossless_dll.h"
 #include "yuzu/configuration/amd_fsr4_panel.h"
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_graphics.h"
@@ -372,6 +382,33 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             connect(oot_aa_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
                     [this](int) { UpdateAmdFsr4Visibility(); });
             hold_graphics.emplace(setting->Id(), group);
+#ifdef HAS_LSFG
+        } else if (setting->Id() == Settings::values.frame_gen_type.Id() &&
+                   widget->combobox != nullptr) {
+            auto* group = new QWidget(this);
+            auto* layout = new QVBoxLayout(group);
+            layout->setContentsMargins(0, 0, 0, 0);
+            layout->addWidget(widget);
+
+            auto* import_button = new QPushButton(tr("Import Lossless.dll..."), group);
+            import_button->setObjectName(QStringLiteral("import_lossless_dll"));
+            const bool game_running = system.IsPoweredOn();
+            import_button->setEnabled(!game_running);
+            import_button->setToolTip(game_running ? tr("Stop the game before importing Lossless.dll.")
+                                                  : tr("Install the DLL for all games."));
+            layout->addWidget(import_button, 0, Qt::AlignRight);
+
+            auto* type = widget->combobox;
+            const auto update_visibility = [type, import_button] {
+                import_button->setVisible(
+                    type->currentData() == static_cast<u32>(Settings::FrameGenType::Lsfg));
+            };
+            connect(type, &QComboBox::currentIndexChanged, import_button, update_visibility);
+            connect(import_button, &QPushButton::clicked, this,
+                    &ConfigureGraphics::ImportLosslessDll);
+            update_visibility();
+            hold_graphics.emplace(setting->Id(), group);
+#endif
         } else if (setting->Id() == Settings::values.frame_gen.Id()) {
             frame_gen_checkbox = widget->checkbox;
             hold_graphics.emplace(setting->Id(), widget);
@@ -573,6 +610,55 @@ void ConfigureGraphics::UpdateAmdFsr4Visibility() {
     }
     amd_fsr4_panel->setVisible(capable && fsr4_picked);
 }
+
+#ifdef HAS_LSFG
+void ConfigureGraphics::ImportLosslessDll() {
+    const auto title = tr("Import Lossless.dll");
+    const auto source = QFileDialog::getOpenFileName(
+        this, title, {}, tr("Lossless Scaling library (Lossless.dll)"));
+    if (source.isEmpty()) {
+        return;
+    }
+    if (system.IsPoweredOn()) {
+        QMessageBox::warning(this, title, tr("Stop the game before importing Lossless.dll."));
+        return;
+    }
+
+    const auto destination = VideoCore::FrameGen::GetLosslessDllPath();
+    const auto directory =
+        QString::fromStdString(Common::FS::PathToUTF8String(destination.parent_path()));
+    if (!QDir{}.mkpath(directory)) {
+        QMessageBox::warning(this, title, tr("Could not open the Jinra lossless folder."));
+        return;
+    }
+
+    QTemporaryDir staging(QDir(directory).filePath(QStringLiteral("import-XXXXXX")));
+    const QFileInfo staged(staging.filePath(QStringLiteral("Lossless.dll")));
+    if (!staging.isValid() || !QFile::copy(source, staged.filePath())) {
+        QMessageBox::warning(this, title, tr("Could not copy the selected file."));
+        return;
+    }
+    if (VideoCore::FrameGen::ValidateLosslessDll(staged.filesystemFilePath()) !=
+        VideoCore::FrameGen::LosslessStatus::Ok) {
+        QMessageBox::warning(
+            this, title,
+            tr("The selected file could not be read or is missing the required LSFG shaders. "
+               "Select Lossless.dll from your Lossless Scaling installation."));
+        return;
+    }
+
+    // Replace the installed DLL only after validating the copy on the same filesystem.
+    std::error_code error;
+    std::filesystem::rename(staged.filesystemFilePath(), destination, error);
+    if (error) {
+        QMessageBox::warning(this, title, tr("Could not save Lossless.dll in the Jinra data folder."));
+        return;
+    }
+
+    QMessageBox::information(this, title,
+                             tr("Lossless.dll installed. Select Vulkan and start the game to use LSFG."));
+}
+#endif
 
 void ConfigureGraphics::RetrieveVulkanDevices() {
     vulkan_devices.clear();
