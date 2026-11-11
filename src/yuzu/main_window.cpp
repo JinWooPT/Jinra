@@ -3574,6 +3574,13 @@ void MainWindow::ShowFullscreen() {
             window->showFullScreen();
             return;
         }
+#ifdef _WIN32
+        // Let Windows activate the borderless game window before restoring its tool window.
+        const bool restore_overlay = window == this && perf_overlay && perf_overlay->isVisible();
+        if (restore_overlay) {
+            perf_overlay->hide();
+        }
+#endif
         window->hide();
         window->setWindowFlags(window->windowFlags() | Qt::FramelessWindowHint);
         const auto screen_geometry = GuessCurrentScreen(window)->geometry();
@@ -3581,6 +3588,11 @@ void MainWindow::ShowFullscreen() {
                             screen_geometry.height() + 1);
         window->raise();
         window->showNormal();
+#ifdef _WIN32
+        if (restore_overlay) {
+            perf_overlay->show();
+        }
+#endif
     };
 
     if (ui->action_Single_Window_Mode->isChecked()) {
