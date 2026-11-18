@@ -37,9 +37,6 @@ public:
     FileType GetFileType() const override {
         return FileType::NUP;
     }
-    std::optional<u32> GetContentVersion() const override {
-        return content_version;
-    }
 
     LoadResult Load(Kernel::KProcess& process, Core::System& system) override;
 
@@ -63,7 +60,6 @@ private:
     u64 base_title_id{};
     std::string display_title;
     std::string display_version;
-    std::optional<u32> content_version;
     bool has_program{};
 };
 

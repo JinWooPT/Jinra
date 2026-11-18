@@ -1,9 +1,9 @@
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <functional>
@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/fritchii_page_flags.h"
 #include "core/device_memory_manager.h"
 
 namespace Core {
@@ -73,16 +74,41 @@ public:
         std::scoped_lock gather_lk(gather_guard);
         {
             std::scoped_lock lk(guard);
+            // Nothing collected (front_buffer is always empty here): nothing to take, and no
+            // clear for the store memo to hear of. A Collect landing after this look is the next
+            // gather's, as if this one had run just before it (the exchange below races it the
+            // same way); `current` already holds the empty word NothingCollected relies on.
+            if (!IsValid(current.load(std::memory_order_acquire).address) && back_buffer.empty()) {
+                return;
+            }
+            // FRITCHII_STORE_MEMO: the collected writes are taken here (g_store_memo_epoch).
+            const Common::StoreMemoClear clear{Common::StoreMemoGatherGen};
             TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
             front_buffer.swap(back_buffer);
             if (IsValid(t.address)) {
                 front_buffer.emplace_back(t);
             }
         }
+        // FRITCHII_WRITE_REMARK: the collected writes are taken, and their pages read from guest
+        // memory after this; a write whose mark was taken and whose bytes may not have landed yet
+        // sees the move after its store and marks again (Core::g_pages_tracked_generation).
+        g_pages_tracked_generation.fetch_add(1, std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         for (auto& transform : front_buffer) {
             ForEachRun(transform, callback);
         }
         front_buffer.clear();
+    }
+
+    /// FRITCHII_GATHER_EMPTY_TEST: true when no collected write waits for a gather, without a lock.
+    /// Only Gather stores the empty word, in the locked section that also takes back_buffer;
+    /// every Collect that adds bits leaves `current` holding a word that is not the empty one
+    /// (its CAS, or the push's exchange, made in the same locked section as the push). So a
+    /// Collect that happens before this load is seen as its own store or a later one: another
+    /// Collect's (not empty) or a Gather's empty word, which took it (atomics' coherence).
+    [[nodiscard]] bool NothingCollected() const noexcept {
+        const TransformAddress t = current.load(std::memory_order_acquire);
+        return t.address == default_transform.address && t.mask == default_transform.mask;
     }
 
     /// Returns true when collected writes not yet gathered overlap [address, address + size).
@@ -173,5 +199,13 @@ private:
     std::vector<TransformAddress> back_buffer;
     std::vector<TransformAddress> front_buffer;
 };
+
+/// The bank check's page flags live in common (common/fritchii_page_flags.h), where the write
+/// ring and the guest store's after-store point set them too.
+using Common::DevicePageFlags;
+static_assert(DevicePageFlags::PageBits == DEVICE_PAGEBITS);
+inline DevicePageFlags& g_collected_write_pages = Common::g_collected_write_pages;
+inline DevicePageFlags& g_buffer_write_pages = Common::g_buffer_write_pages;
+inline DevicePageFlags& g_watch_write_pages = Common::g_watch_write_pages;
 
 } // namespace Core

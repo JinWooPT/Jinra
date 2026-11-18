@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -14,6 +16,7 @@
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
+#include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 
 namespace {
 using namespace Shader;
@@ -50,6 +53,25 @@ spv::ExecutionModel Model(const std::vector<u32>& code) {
     }
     FAIL("no entry point");
     return {};
+}
+
+bool HasBuiltIn(const std::vector<u32>& code, spv::BuiltIn builtin) {
+    return std::ranges::any_of(Instructions(code), [builtin](const Instruction& inst) {
+        size_t decoration;
+        switch (inst.op) {
+        case spv::Op::OpDecorate:
+            decoration = 1;
+            break;
+        case spv::Op::OpMemberDecorate:
+            decoration = 2;
+            break;
+        default:
+            return false;
+        }
+        return inst.operands.size() > decoration + 1 &&
+               inst.operands[decoration] == static_cast<u32>(spv::Decoration::BuiltIn) &&
+               inst.operands[decoration + 1] == static_cast<u32>(builtin);
+    });
 }
 
 bool HasCapability(const std::vector<u32>& code, spv::Capability capability) {
@@ -130,7 +152,8 @@ Profile MakeProfile() {
 // A one-triangle mesh program (or the task program launching it), as the frontend lowers them.
 // With lane_id the mesh program writes its lane as the vertex's first attribute word.
 std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
-                             Profile profile = MakeProfile(), bool lane_id = false) {
+                             Profile profile = MakeProfile(), bool lane_id = false,
+                             const MeshInfo& mesh = TriangleMesh()) {
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     IR::Program program;
@@ -140,7 +163,10 @@ std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
     program.post_order_blocks = {&block};
     program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
                            {{}, IR::AbstractSyntaxNode::Type::Return}};
-    program.mesh = TriangleMesh();
+    program.mesh = mesh;
+    for (const u32 line : mesh.primitive_lines) {
+        program.info.stores.Set(static_cast<IR::Attribute>(line), true);
+    }
     program.info.is_task = stage == Stage::Task;
     program.info.is_mesh = stage == Stage::Mesh;
     program.info.uses_workgroup_id = true;
@@ -151,6 +177,12 @@ std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
         const IR::U32 index{lane_id ? ir.LaneId() : ir.IsbeRead(ir.Imm32(0))};
         program.info.uses_subgroup_invocation_id = lane_id;
         ir.IsbeWriteAttribute(ir.Imm32(0), index);
+        if (!mesh.primitive_lines.empty()) {
+            // The first primitive's first line, after the vertex groups.
+            const u32 vertex_groups{(mesh.max_vertices + 31) / 32};
+            const u32 base{vertex_groups * static_cast<u32>(mesh.vertex_lines.size()) * 32};
+            ir.IsbeWriteAttribute(ir.Imm32(base * 4), index);
+        }
         ir.IsbeWriteMapU8(ir.Imm32(4), ir.Imm32(0));
         ir.IsbeWriteMapU32(ir.Imm32(3), ir.Imm32(1));
     } else {
@@ -256,4 +288,152 @@ TEST_CASE("Mesh fallback distribution pass binds its buffers and constants",
                inst.operands.size() == 1 + sizeof(SPIRV::MeshEmulationDistributionConstants) / 4;
     })};
     REQUIRE(has_constants);
+}
+
+TEST_CASE("Mesh fallback reserves auxiliary storage buffers in the descriptor set limit",
+          "[video_core][mesh_fallback]") {
+    using Vulkan::FitsStorageBufferSetLimit;
+
+    // Ordinary graphics pipelines do not add emulation descriptors.
+    REQUIRE(FitsStorageBufferSetLimit(8, 0, 8));
+    REQUIRE_FALSE(FitsStorageBufferSetLimit(9, 0, 8));
+
+    // Mesh only: one output buffer. Task+mesh: four auxiliary bindings.
+    REQUIRE(FitsStorageBufferSetLimit(7, 1, 8));
+    REQUIRE_FALSE(FitsStorageBufferSetLimit(8, 1, 8));
+    REQUIRE(FitsStorageBufferSetLimit(4, 4, 8));
+    REQUIRE_FALSE(FitsStorageBufferSetLimit(5, 4, 8));
+
+    // No limit is represented by zero. Reject huge inputs without addition overflow.
+    REQUIRE(FitsStorageBufferSetLimit(200, 4, 0));
+    REQUIRE_FALSE(FitsStorageBufferSetLimit((std::numeric_limits<size_t>::max)(), 4, 8));
+}
+
+namespace {
+// A triangle mesh with a per-primitive generic (Generic1X), Layer and PrimitiveId.
+MeshInfo PerPrimitiveMesh() {
+    MeshInfo mesh{TriangleMesh()};
+    mesh.max_primitives = 4;
+    for (const IR::Attribute attribute :
+         {IR::Attribute::PrimitiveId, IR::Attribute::Layer, IR::Attribute::Generic1X}) {
+        mesh.primitive_lines.push_back(static_cast<u32>(attribute));
+    }
+    return mesh;
+}
+
+bool HasDecoration(const std::vector<u32>& code, spv::Decoration decoration) {
+    return std::ranges::any_of(Instructions(code), [&](const Instruction& inst) {
+        return inst.op == spv::Op::OpDecorate && inst.operands[1] == static_cast<u32>(decoration);
+    });
+}
+
+// Ids decorated with decoration (and, when given, that decoration's operand).
+std::vector<u32> Decorated(const std::vector<u32>& code, spv::Decoration decoration,
+                           std::optional<u32> value = std::nullopt) {
+    std::vector<u32> ids;
+    for (const Instruction& inst : Instructions(code)) {
+        if (inst.op == spv::Op::OpDecorate && inst.operands[1] == static_cast<u32>(decoration) &&
+            (!value || (inst.operands.size() > 2 && inst.operands[2] == *value))) {
+            ids.push_back(inst.operands[0]);
+        }
+    }
+    return ids;
+}
+
+// A pixel program after a mesh program writing Generic1X and PrimitiveId per primitive.
+std::vector<u32> EmitPixelProgram(bool emulated) {
+    ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::Program program;
+    program.stage = Stage::Fragment;
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
+                           {{}, IR::AbstractSyntaxNode::Type::Return}};
+    program.info.loads.Set(IR::Attribute::Generic1X, true);
+    program.info.loads.Set(IR::Attribute::PrimitiveId, true);
+    program.info.stores_frag_color[0] = true;
+    IR::IREmitter ir{block};
+    ir.Prologue();
+    ir.SetFragColor(0, 0, ir.GetAttribute(IR::Attribute::Generic1X));
+    ir.SetFragColor(0, 1, ir.BitCast<IR::F32>(ir.GetAttributeU32(IR::Attribute::PrimitiveId)));
+    ir.Epilogue();
+
+    RuntimeInfo runtime_info;
+    runtime_info.previous_stage_stores.Set(IR::Attribute::Generic1X, true);
+    runtime_info.previous_stage_stores.Set(IR::Attribute::PrimitiveId, true);
+    runtime_info.per_primitive_generics.set(1);
+    if (emulated) {
+        runtime_info.per_primitive_flat = true;
+        runtime_info.primitive_id_location = 5;
+    }
+    Backend::Bindings bindings;
+    return SPIRV::EmitSPIRV(MakeProfile(), runtime_info, program, bindings);
+}
+} // Anonymous namespace
+
+TEST_CASE("Mesh fallback blocks hold each primitive's lines after the indices",
+          "[video_core][spirv][mesh_fallback]") {
+    const MeshInfo mesh{PerPrimitiveMesh()};
+    const u32 vertex_words{mesh.max_vertices * static_cast<u32>(mesh.vertex_lines.size())};
+    REQUIRE(SPIRV::MeshEmulationBlockWords(mesh) == vertex_words + 4 * 3 + 4 * 3);
+}
+
+TEST_CASE("Mesh fallback emits mesh programs with per-primitive outputs as compute shaders",
+          "[video_core][spirv][mesh_fallback]") {
+    const MeshInfo mesh{PerPrimitiveMesh()};
+    const std::vector<u32> code{
+        EmitProgram(Stage::Mesh, true, false, MakeProfile(), false, mesh)};
+    Dump(code, "fallback-mesh-per-primitive");
+    RequireNoMeshShading(code);
+    REQUIRE_FALSE(HasDecoration(code, spv::Decoration::PerPrimitiveEXT));
+    REQUIRE_FALSE(HasCapability(code, spv::Capability::ShaderViewportIndexLayerEXT));
+    REQUIRE(Bindings(code) == std::vector<u32>{OUTPUT_BINDING});
+
+    const std::vector<u32> native{
+        EmitProgram(Stage::Mesh, false, false, MakeProfile(), false, mesh)};
+    REQUIRE(Model(native) == spv::ExecutionModel::MeshEXT);
+    REQUIRE(HasDecoration(native, spv::Decoration::PerPrimitiveEXT));
+}
+
+TEST_CASE("Mesh fallback vertex shader gives each vertex its primitive's outputs",
+          "[video_core][spirv][mesh_fallback]") {
+    const MeshInfo mesh{PerPrimitiveMesh()};
+    const std::vector<u32> code{SPIRV::EmitMeshEmulationVertex(MakeProfile(), mesh, OUTPUT_BINDING,
+                                                               ARGS_BINDING, false, 1.0f, 5)};
+    Dump(code, "fallback-vertex-per-primitive");
+    REQUIRE(Model(code) == spv::ExecutionModel::Vertex);
+    REQUIRE(Decorated(code, spv::Decoration::Location, 1).size() == 1);
+    REQUIRE(Decorated(code, spv::Decoration::Location, 5).size() == 1);
+    REQUIRE(HasBuiltIn(code, spv::BuiltIn::Layer));
+    REQUIRE_FALSE(HasBuiltIn(code, spv::BuiltIn::PrimitiveId));
+    REQUIRE(HasCapability(code, spv::Capability::ShaderViewportIndexLayerEXT));
+    REQUIRE(HasExtension(code, "SPV_EXT_shader_viewport_index_layer"));
+
+    const std::vector<u32> without_id{
+        SPIRV::EmitMeshEmulationVertex(MakeProfile(), mesh, OUTPUT_BINDING, ~0U, false)};
+    Dump(without_id, "fallback-vertex-per-primitive-without-id");
+    REQUIRE(Decorated(without_id, spv::Decoration::Location, 1).size() == 1);
+    REQUIRE(Decorated(without_id, spv::Decoration::Location, 5).empty());
+}
+
+TEST_CASE("Mesh fallback pixel programs read per-primitive outputs flat",
+          "[video_core][spirv][mesh_fallback]") {
+    const std::vector<u32> emulated{EmitPixelProgram(true)};
+    Dump(emulated, "fallback-pixel-per-primitive");
+    REQUIRE(Model(emulated) == spv::ExecutionModel::Fragment);
+    REQUIRE_FALSE(HasCapability(emulated, spv::Capability::MeshShadingEXT));
+    REQUIRE_FALSE(HasExtension(emulated, "SPV_EXT_mesh_shader"));
+    REQUIRE_FALSE(HasDecoration(emulated, spv::Decoration::PerPrimitiveEXT));
+    REQUIRE_FALSE(HasBuiltIn(emulated, spv::BuiltIn::PrimitiveId));
+    const auto flat{Decorated(emulated, spv::Decoration::Flat)};
+    for (const u32 location : {1U, 5U}) {
+        const auto ids{Decorated(emulated, spv::Decoration::Location, location)};
+        REQUIRE(ids.size() == 1);
+        REQUIRE(std::ranges::find(flat, ids[0]) != flat.end());
+    }
+
+    const std::vector<u32> native{EmitPixelProgram(false)};
+    REQUIRE(HasDecoration(native, spv::Decoration::PerPrimitiveEXT));
+    REQUIRE(HasBuiltIn(native, spv::BuiltIn::PrimitiveId));
 }

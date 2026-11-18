@@ -26,6 +26,7 @@
 #include "common/settings.h"
 #include "common/string_util.h"
 #include "configuration/system/new_user_dialog.h"
+#include "core/constants.h"
 #include "core/core.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -64,10 +65,12 @@ QPixmap GetIcon(const Common::UUID& uuid) {
     QPixmap icon{GetImagePath(uuid)};
 
     if (!icon) {
-        icon.load(QStringLiteral(":/jinra/icon.png"));
+        icon.fill(Qt::black);
+        icon.loadFromData(Core::Constants::ACCOUNT_BACKUP_JPEG.data(),
+                          static_cast<u32>(Core::Constants::ACCOUNT_BACKUP_JPEG.size()));
     }
 
-    return icon;
+    return icon.scaled(64, 64, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 }
 
 } // Anonymous namespace
@@ -173,12 +176,8 @@ void ConfigureProfileManager::UpdateCurrentUser() {
     const auto username = GetAccountUsername(profile_manager, *current_user);
 
     scene->clear();
-    const auto ratio = devicePixelRatioF();
-    auto icon = GetIcon(*current_user)
-                    .scaled(qRound(64 * ratio), qRound(64 * ratio), Qt::KeepAspectRatio,
-                            Qt::SmoothTransformation);
-    icon.setDevicePixelRatio(ratio);
-    scene->addPixmap(icon);
+    scene->addPixmap(
+        GetIcon(*current_user).scaled(64, 64, Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
     ui->current_user_username->setText(username);
 }
 
@@ -214,8 +213,7 @@ void ConfigureProfileManager::saveImage(QPixmap pixmap, Common::UUID uuid) {
         return;
     }
 
-    const auto avatar = pixmap.scaled(256, 256, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-    if (!avatar.save(image_path, "JPEG", 100)) {
+    if (!pixmap.save(image_path, "JPEG", 100)) {
         QMessageBox::warning(this, tr("Error saving user image"),
                              tr("Unable to save image to file"));
         return;

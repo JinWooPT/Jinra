@@ -1,20 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <atomic>
+#include <chrono>
 
 #ifdef _WIN32
 
-#include <array>
-#include <cstring>
 #include <iterator>
-#include <limits>
-#include <new>
 #include "common/container/unordered_map.h"
 #include <boost/icl/separate_interval_set.hpp>
 #include <windows.h>
 #include <psapi.h>
+#include <vector>
 #include "common/dynamic_library.h"
 
 #else // ^^^ Windows ^^^ vvv POSIX vvv
@@ -58,14 +57,16 @@
 #endif // ^^^ POSIX ^^^
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <random>
-#include <utility>
 #include <vector>
 
 #include "common/alignment.h"
+#include "common/nx2_hitch.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "common/free_region_manager.h"
@@ -84,9 +85,47 @@ static int memfd_create(const char* name, unsigned int flags) {
 
 namespace Common {
 
-thread_local HostMemory::AllocationTestControl* HostMemory::allocation_test_control{};
+namespace {
+// Guest map/unmap/protect calls under way (Windows): the zero-page pass gives way to them between
+// its unlock runs (fable52_answer_backdraw (b) fix 1: host unmap/protect stalled up to 12.2 ms
+// during a pass in the Stalchild fight, 424.55 s and 440.35 s).
+std::atomic<int> g_guest_mapping_in_flight{};
+// FRITCHII_ZERO_TRIM_CHUNK's numbers (helper CR): while a pass makes its VirtualUnlock calls, the
+// guest map/unmap/protect calls that start are timed (count, longest), for the pass line. One
+// relaxed load per call otherwise.
+std::atomic<bool> g_zero_trim_unlocking{false};
+std::atomic<u64> g_guest_calls_in_unlock{0};
+std::atomic<u64> g_longest_guest_in_unlock_ns{0};
+struct GuestMappingInFlight {
+    GuestMappingInFlight() noexcept {
+        g_guest_mapping_in_flight.fetch_add(1, std::memory_order_relaxed);
+        if (g_zero_trim_unlocking.load(std::memory_order_relaxed)) [[unlikely]] {
+            start = std::chrono::steady_clock::now();
+            timed = true;
+        }
+    }
+    ~GuestMappingInFlight() {
+        g_guest_mapping_in_flight.fetch_sub(1, std::memory_order_relaxed);
+        if (timed) [[unlikely]] {
+            const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - start)
+                                                .count());
+            g_guest_calls_in_unlock.fetch_add(1, std::memory_order_relaxed);
+            u64 longest = g_longest_guest_in_unlock_ns.load(std::memory_order_relaxed);
+            while (ns > longest && !g_longest_guest_in_unlock_ns.compare_exchange_weak(
+                                       longest, ns, std::memory_order_relaxed)) {
+            }
+        }
+    }
+    std::chrono::steady_clock::time_point start{};
+    bool timed = false;
+    GuestMappingInFlight(const GuestMappingInFlight&) = delete;
+    GuestMappingInFlight& operator=(const GuestMappingInFlight&) = delete;
+};
+} // Anonymous namespace
 
 [[maybe_unused]] constexpr size_t PageAlignment = 0x1000;
+[[maybe_unused]] constexpr int BackingAttempts = 5; // fastmem backing allocation tries (Windows)
 [[maybe_unused]] constexpr size_t HugePageSize = 0x200000;
 
 #ifdef _WIN32
@@ -135,11 +174,13 @@ static void GetFuncAddress(Common::DynamicLibrary& dll, const char* name, T& pfn
 }
 
 namespace {
-/// EDEN_NX2_SEC_RESERVE=1 (off by default): the guest memory section is created reserved, and
+/// EDEN_NX2_SEC_RESERVE (on by default, =0 off): the guest memory section is created reserved, and
 /// HostMemory::Commit commits its pages as the kernel hands them out (see host_memory.h).
 bool ReserveGuestMemory() {
+    // On by default (2026-11-08: Castle Town 15.1 -> 12.8 GB working set with the prebuild
+    // streaming, ~3 GB less commit, 0 fault commits); EDEN_NX2_SEC_RESERVE=0 turns it off.
     const char* value = std::getenv("EDEN_NX2_SEC_RESERVE");
-    return value != nullptr && value[0] == '1';
+    return value == nullptr || value[0] != '0';
 }
 
 /// The views of a reserved section, for ReservedPageHandler.
@@ -213,12 +254,6 @@ public:
     {}
 
     bool Init() {
-        if (allocation_test_control) {
-            ++allocation_test_control->fastmem_attempts;
-            if (allocation_test_control->fail_fastmem) {
-                return false;
-            }
-        }
         if (!kernelbase_dll.IsOpen()) {
             LOG_CRITICAL(HW_Memory, "Failed to load Kernelbase.dll");
             return false;
@@ -234,28 +269,31 @@ public:
         }
 
         reserved = ReserveGuestMemory();
-        constexpr int BackingAttempts = 5;
-        for (int attempt = 1; attempt <= BackingAttempts; ++attempt) {
-            backing_handle = pfn_CreateFileMapping2(
-                INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE,
-                reserved ? SEC_RESERVE : SEC_COMMIT, backing_size, nullptr, nullptr, 0);
+        // Allocate backing file map (SEC_RESERVE with EDEN_NX2_SEC_RESERVE). SEC_COMMIT charges all of it to the commit limit up front, and
+        // when the free commit is only just above its size the call fails with
+        // ERROR_NO_SYSTEM_RESOURCES without growing a system-managed page file. The emulator then
+        // runs the whole session without fastmem (Ocarina of Time: 20-25% fewer fps). A private
+        // commit of the same size does grow the page file, so make one, release it and try again.
+        for (int attempt = 1; attempt <= BackingAttempts && !backing_handle; ++attempt) {
+            backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, reserved ? SEC_RESERVE : SEC_COMMIT, backing_size, nullptr, nullptr, 0);
             if (backing_handle) {
+                if (attempt > 1) {
+                    LOG_INFO(HW_Memory, "Allocated {} MiB of backing memory on attempt {}", backing_size >> 20, attempt);
+                }
                 break;
             }
             const DWORD error = GetLastError();
-            if (attempt == BackingAttempts ||
-                (error != ERROR_NO_SYSTEM_RESOURCES && error != ERROR_NOT_ENOUGH_MEMORY &&
-                 error != ERROR_COMMITMENT_LIMIT && error != ERROR_OUTOFMEMORY)) {
-                break;
+            MEMORYSTATUSEX status{};
+            status.dwLength = sizeof(status);
+            GlobalMemoryStatusEx(&status);
+            LOG_WARNING(HW_Memory, "Failed to allocate {} MiB of backing memory (attempt {}, error {}, {} MiB of commit free)",
+                        backing_size >> 20, attempt, error, status.ullAvailPageFile >> 20);
+            if (void* const probe = VirtualAlloc(nullptr, backing_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) {
+                VirtualFree(probe, 0, MEM_RELEASE);
             }
-            // A private commit can grow the system-managed page file when section creation fails.
-            if (!reserved) {
-                if (void* probe = VirtualAlloc(nullptr, backing_size, MEM_RESERVE | MEM_COMMIT,
-                                               PAGE_READWRITE)) {
-                    VirtualFree(probe, 0, MEM_RELEASE);
-                }
+            if (attempt < BackingAttempts) {
+                Sleep(50);
             }
-            Sleep(50);
         }
         if (!backing_handle) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate {} MiB of backing memory", backing_size >> 20);
@@ -302,24 +340,24 @@ public:
         Release();
     }
 
+    /// EDEN_NX2_SEC_RESERVE: commits [offset, end) of the section through the backing view.
     bool CommitBacking(size_t offset, size_t end) {
         end = (std::min)(end, backing_size);
-        if (offset >= end ||
-            VirtualAlloc(backing_base + offset, end - offset, MEM_COMMIT, PAGE_READWRITE)) {
+        if (offset >= end) {
             return true;
         }
-        LOG_ERROR(HW_Memory, "Could not commit guest memory at {:#x} ({} bytes, error {})",
-                  offset, end - offset, GetLastError());
-        return false;
+        if (VirtualAlloc(backing_base + offset, end - offset, MEM_COMMIT, PAGE_READWRITE) ==
+            nullptr) {
+            LOG_CRITICAL(HW_Memory,
+                         "EDEN_NX2_SEC_RESERVE: committing {:#x} bytes of guest memory at {:#x} "
+                         "failed, error {}",
+                         end - offset, offset, GetLastError());
+            return false;
+        }
+        return true;
     }
 
     void* Allocate(size_t size) {
-        if (allocation_test_control) {
-            ++allocation_test_control->fallback_attempts;
-            if (allocation_test_control->fail_fallback) {
-                return nullptr;
-            }
-        }
         auto* ptr = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (ptr == nullptr) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate fallback buffer with size {:#x}, error {}", size, GetLastError());
@@ -328,6 +366,8 @@ public:
     }
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
+        const GuestMappingInFlight in_flight;
+        const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::HostMap, length}; // before the lock
         std::unique_lock lock{placeholder_mutex};
         if (!IsNiechePlaceholder(virtual_offset, length)) {
             Split(virtual_offset, length);
@@ -339,6 +379,8 @@ public:
     }
 
     void Unmap(size_t virtual_offset, size_t length) {
+        const GuestMappingInFlight in_flight;
+        const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::HostUnmap, length}; // before the lock
         std::scoped_lock lock{placeholder_mutex};
 
         // Unmap until there are no more placeholders
@@ -359,7 +401,29 @@ public:
         }
         const size_t virtual_end = virtual_offset + length;
 
+        const GuestMappingInFlight in_flight;
+        const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::HostProtect, length}; // before the lock
+        // FRITCHII_PROTECT_UNLOCKED (port of zortos293/Lichii #1780): nearly every call protects
+        // a range inside one mapped view, which VirtualProtect changes whole without the lock.
+        // It refuses a range that reaches a placeholder or a second view (one Map or Unmap is
+        // making or taking apart, or a range across views): those take the lock below, which
+        // gives each view of the range the same flags. Map and Unmap hold the lock across their
+        // kernel calls, which slow down when the game maps memory in bulk (zone changes), and
+        // the write-trap protections, thousands a second, queued behind them. Any interleaving
+        // ends as a Protect done wholly before or after the Map or Unmap: a view in place is the
+        // range's final view, a placeholder sends the call to the locked path.
+        const bool unlocked = ProtectUnlocked();
+        if (unlocked) {
+            DWORD old_flags{};
+            if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
+                NoteProtect(true);
+                return;
+            }
+        }
         std::scoped_lock lock{placeholder_mutex};
+        if (unlocked) {
+            NoteProtect(false);
+        }
         auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
         while (it != end) {
             const size_t offset = (std::max)(it->lower(), virtual_offset);
@@ -370,6 +434,74 @@ public:
             }
             ++it;
         }
+    }
+
+    /// FRITCHII_PROTECT_UNLOCKED's value, read from the environment on first use.
+    static bool ProtectUnlocked() {
+        int value = g_protect_unlocked.load(std::memory_order_relaxed);
+        if (value < 0) [[unlikely]] {
+            const char* const env = std::getenv("FRITCHII_PROTECT_UNLOCKED");
+            int unset = -1;
+            g_protect_unlocked.compare_exchange_strong(
+                unset, env != nullptr ? std::atoi(env) : 0, std::memory_order_relaxed);
+            value = g_protect_unlocked.load(std::memory_order_relaxed);
+        }
+        return value > 0;
+    }
+
+    /// Counts Protect calls done without the lock and ones that fell back to it, and logs both
+    /// every 10 s while the switch is on (the fallbacks are the calls that still wait).
+    static void NoteProtect(bool without_lock) {
+        static std::atomic<u64> fast{};
+        static std::atomic<u64> locked{};
+        static std::atomic<u64> next_report_ns{};
+        (without_lock ? fast : locked).fetch_add(1, std::memory_order_relaxed);
+        const u64 now = Common::Nx2Hitch::NowNs();
+        u64 due = next_report_ns.load(std::memory_order_relaxed);
+        if (now < due) {
+            return;
+        }
+        constexpr u64 Window = u64{10'000'000'000};
+        if (!next_report_ns.compare_exchange_strong(due, now + Window,
+                                                    std::memory_order_relaxed)) {
+            return;
+        }
+        const u64 fast_count = fast.exchange(0, std::memory_order_relaxed);
+        const u64 locked_count = locked.exchange(0, std::memory_order_relaxed);
+        if (due != 0) {
+            LOG_INFO(HW_Memory,
+                     "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): {} without the "
+                     "lock, {} took the lock (placeholder or several views)",
+                     fast_count, locked_count);
+        }
+    }
+
+    /// The views mapped now: {virtual offset, length, backing offset} each (SampleResident).
+    std::vector<std::array<size_t, 3>> MappedViews() {
+        std::scoped_lock lock{placeholder_mutex};
+        std::vector<std::array<size_t, 3>> views;
+        views.reserve(placeholders.iterative_size());
+        for (const auto& interval : placeholders) {
+            const auto it = placeholder_host_pointers.find(interval.lower());
+            if (it != placeholder_host_pointers.end()) {
+                views.push_back({interval.lower(), interval.upper() - interval.lower(), it->second});
+            }
+        }
+        return views;
+    }
+
+    /// Backing offset the view page at virtual_offset maps, or nullopt when it is not mapped.
+    std::optional<size_t> BackingOffset(size_t virtual_offset) {
+        std::scoped_lock lock{placeholder_mutex};
+        const auto it = placeholders.find(virtual_offset);
+        if (it == placeholders.end()) {
+            return std::nullopt;
+        }
+        const auto host_pointer_it = placeholder_host_pointers.find(it->lower());
+        if (host_pointer_it == placeholder_host_pointers.end()) {
+            return std::nullopt;
+        }
+        return host_pointer_it->second + virtual_offset - it->lower();
     }
 
     void EnableDirectMappedAddress() {
@@ -403,7 +535,6 @@ private:
             if (!VirtualFree(virtual_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(HW_Memory, "Failed to free virtual memory");
             }
-            virtual_base = nullptr;
         }
         if (backing_base) {
             if (!pfn_UnmapViewOfFile2(process, backing_base, MEM_PRESERVE_PLACEHOLDER)) {
@@ -412,13 +543,9 @@ private:
             if (!VirtualFreeEx(process, backing_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(HW_Memory, "Failed to free backing memory");
             }
-            backing_base = nullptr;
         }
-        if (backing_handle && backing_handle != INVALID_HANDLE_VALUE) {
-            if (!CloseHandle(backing_handle)) {
-                LOG_CRITICAL(HW_Memory, "Failed to free backing memory file handle");
-            }
-            backing_handle = nullptr;
+        if (!CloseHandle(backing_handle)) {
+            LOG_CRITICAL(HW_Memory, "Failed to free backing memory file handle");
         }
     }
 
@@ -677,12 +804,6 @@ public:
 
     bool Init() {
         const long page_size = sysconf(_SC_PAGESIZE);
-        if (allocation_test_control) {
-            ++allocation_test_control->fastmem_attempts;
-            if (allocation_test_control->fail_fastmem) {
-                return false;
-            }
-        }
         if (page_size < static_cast<long>(PageAlignment) ||
             page_size % static_cast<long>(PageAlignment) != 0) {
             LOG_WARNING(Common_Memory, "Host page size {:#x} does not support fastmem", page_size);
@@ -789,16 +910,9 @@ public:
     }
 
     void* Allocate(size_t size) {
-        if (allocation_test_control) {
-            ++allocation_test_control->fallback_attempts;
-            if (allocation_test_control->fail_fallback) {
-                return nullptr;
-            }
-        }
         auto* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
         if (ptr == MAP_FAILED) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate fallback buffer with size {:#x}, {}", size, strerror(errno));
-            return nullptr;
         }
         return ptr;
     }
@@ -1063,23 +1177,14 @@ private:
 #endif // ^^^ POSIX ^^^
 
 HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
-    : backing_size(allocation_test_control ? allocation_test_control->backing_size : backing_size_)
-    , virtual_size(allocation_test_control ? allocation_test_control->virtual_size : virtual_size_)
-    , num_granules(Common::DivCeil(backing_size, size_t{1} << GranuleShift))
+    : backing_size(backing_size_)
+    , virtual_size(virtual_size_)
+    , num_granules(Common::DivCeil(backing_size_, size_t{1} << GranuleShift))
 {
     granules = std::make_unique<std::atomic<u8>[]>(num_granules);
 #if defined(__OPENORBIS__) || defined(__managarm__)
     LOG_WARNING(HW_Memory, "Platform doesn't support fastmem");
-    if (allocation_test_control) {
-        ++allocation_test_control->fallback_attempts;
-    }
-    if (!allocation_test_control || !allocation_test_control->fail_fallback) {
-        backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-        if (backing_base == MAP_FAILED) {
-            backing_base = nullptr;
-        }
-    }
-    fallback_buffer = true;
+    backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     virtual_base = nullptr;
 #else
     // Try to allocate a fastmem arena.
@@ -1107,40 +1212,19 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
 
 HostMemory::~HostMemory() {
 #ifdef _WIN32
-    if (fallback_buffer && backing_base) {
-        VirtualFree(backing_base, 0, MEM_RELEASE);
+    if (fallback_buffer) {
+        VirtualFree(backing_base, backing_size, MEM_RELEASE);
     }
 #else
-    if (fallback_buffer && backing_base) {
+    if (fallback_buffer) {
         munmap(backing_base, backing_size);
     }
 #endif
 }
 
-HostMemory::HostMemory(HostMemory&& other) noexcept {
-    Swap(other);
-}
+HostMemory::HostMemory(HostMemory&&) noexcept = default;
 
-HostMemory& HostMemory::operator=(HostMemory&& other) noexcept {
-    HostMemory replacement{std::move(other)};
-    Swap(replacement);
-    return *this;
-}
-
-void HostMemory::Swap(HostMemory& other) noexcept {
-    std::swap(backing_size, other.backing_size);
-    std::swap(virtual_size, other.virtual_size);
-#if !(defined(__OPENORBIS__) || defined(__managarm__))
-    std::swap(impl, other.impl);
-#endif
-    std::swap(backing_base, other.backing_base);
-    std::swap(virtual_base, other.virtual_base);
-    std::swap(virtual_base_offset, other.virtual_base_offset);
-    std::swap(granules, other.granules);
-    std::swap(num_granules, other.num_granules);
-    std::swap(fallback_buffer, other.fallback_buffer);
-    std::swap(commit_on_use, other.commit_on_use);
-}
+HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
 
 void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
@@ -1208,111 +1292,284 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
     }
 }
 
-#ifdef _WIN32
-std::pair<size_t, size_t> HostMemory::TrimZeroPages(std::stop_token stop) const try {
-    if (backing_base == nullptr || stop.stop_requested()) {
-        return {};
+namespace {
+std::atomic<u64> g_zero_filled_bytes{};
+
+[[maybe_unused]] bool IsZeroPage(const u8* page) {
+    // Stops at the first non-zero line. Read whole, the ~6 GB of resident guest pages took
+    // 1.35-1.47 s a pass (fable52_answer_1), and most pages hold data in their first bytes.
+    const auto* words = reinterpret_cast<const u64*>(page);
+    constexpr size_t LineWords = 8; // 64 bytes
+    for (size_t i = 0; i < PageAlignment / sizeof(u64); i += LineWords) {
+        u64 bits = 0;
+        for (size_t j = 0; j < LineWords; ++j) {
+            bits |= words[i + j];
+        }
+        if (bits != 0) {
+            return false;
+        }
     }
-    const HANDLE process = GetCurrentProcess();
-    constexpr size_t MaxEntries = std::numeric_limits<DWORD>::max() / sizeof(ULONG_PTR);
-    constexpr size_t EntrySlack = 16384;
-    std::vector<ULONG_PTR> entries(1);
+    return true;
+}
+} // namespace
+
+u64 HostMemory::ZeroFilledBytes() noexcept {
+    return g_zero_filled_bytes.load(std::memory_order_relaxed);
+}
+
+namespace {
+std::mutex g_resident_mutex;
+HostMemory::ResidentSample g_resident_sample{};
+} // Anonymous namespace
+
+HostMemory::ResidentSample HostMemory::SampleResident(size_t stride_pages) const {
+    ResidentSample sample{};
+#ifdef _WIN32
+    if (backing_base == nullptr || stride_pages == 0) {
+        return sample;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const size_t stride = stride_pages * PageAlignment;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> entries;
+    entries.reserve(backing_size / stride + 1);
+    for (size_t offset = 0; offset < backing_size; offset += stride) {
+        entries.emplace_back().VirtualAddress = backing_base + offset;
+    }
+    const size_t backing_count = entries.size();
+    // Each view sample point is followed by its backing page, on the same grid of virtual
+    // offsets as everywhere else so the estimate stays unbiased.
+    if (impl && impl->virtual_base != nullptr) {
+        for (const auto& [virtual_offset, length, backing_offset] : impl->MappedViews()) {
+            sample.view_mapped_bytes += length;
+            const size_t end = virtual_offset + length;
+            for (size_t offset = Common::AlignUp(virtual_offset, stride); offset < end;
+                 offset += stride) {
+                const size_t host_offset = backing_offset + (offset - virtual_offset);
+                if (host_offset >= backing_size) {
+                    break;
+                }
+                entries.emplace_back().VirtualAddress = impl->virtual_base + offset;
+                entries.emplace_back().VirtualAddress = backing_base + host_offset;
+            }
+        }
+    }
+    // In slices, so page faults on the game's threads never wait long on the working set lock.
+    constexpr size_t Slice = 8192;
+    for (size_t first = 0; first < entries.size(); first += Slice) {
+        const size_t count = (std::min)(Slice, entries.size() - first);
+        if (!K32QueryWorkingSetEx(GetCurrentProcess(), entries.data() + first,
+                                  static_cast<DWORD>(count * sizeof(entries[0])))) {
+            return sample;
+        }
+    }
+    for (size_t i = 0; i < backing_count; ++i) {
+        if (entries[i].VirtualAttributes.Valid) {
+            sample.backing_bytes += stride;
+        }
+    }
+    for (size_t i = backing_count; i + 1 < entries.size(); i += 2) {
+        if (entries[i].VirtualAttributes.Valid) {
+            sample.view_bytes += stride;
+            if (entries[i + 1].VirtualAttributes.Valid) {
+                sample.both_bytes += stride;
+            }
+        }
+    }
+    sample.micros = static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - start)
+                                         .count());
+    sample.valid = true;
+    std::scoped_lock lock{g_resident_mutex};
+    g_resident_sample = sample;
+#endif
+    return sample;
+}
+
+HostMemory::ResidentSample HostMemory::LastResidentSample() {
+    std::scoped_lock lock{g_resident_mutex};
+    return g_resident_sample;
+}
+
+namespace {
+HostMemory::ZeroTrimPhases g_zero_trim_phases{};
+[[maybe_unused]] u64 MicrosSince(std::chrono::steady_clock::time_point begin) {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - begin)
+                                .count());
+}
+} // Anonymous namespace
+
+HostMemory::ZeroTrimPhases HostMemory::LastZeroTrimPhases() noexcept {
+    return g_zero_trim_phases; // written and read by the ZeroTrim thread only
+}
+
+std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
+#ifdef _WIN32
+    if (backing_base == nullptr) {
+        return {0, 0};
+    }
+    ZeroTrimPhases phases{};
+    auto phase_start = std::chrono::steady_clock::now();
+    std::vector<ULONG_PTR> entries(size_t{1} << 22);
     for (int attempt = 0;; ++attempt) {
-        if (K32QueryWorkingSet(process, entries.data(),
+        if (K32QueryWorkingSet(GetCurrentProcess(), entries.data(),
                                static_cast<DWORD>(entries.size() * sizeof(ULONG_PTR)))) {
             break;
         }
-        if (GetLastError() != ERROR_BAD_LENGTH || attempt == 3 ||
-            entries[0] >= MaxEntries - EntrySlack || stop.stop_requested()) {
-            return {};
+        if (GetLastError() != ERROR_BAD_LENGTH || attempt == 3) {
+            return {0, 0};
         }
-        entries.resize(static_cast<size_t>(entries[0]) + EntrySlack + 1);
+        entries.assign((std::max)(entries.size() * 2, size_t{entries[0]} + (size_t{1} << 18)), 0);
     }
-
+    phases.query_us = MicrosSince(phase_start);
+    phase_start = std::chrono::steady_clock::now();
+    const size_t count = (std::min)(size_t{entries[0]}, entries.size() - 1);
     const auto backing_begin = reinterpret_cast<uintptr_t>(backing_base);
     const auto view_begin = reinterpret_cast<uintptr_t>(impl ? impl->virtual_base : nullptr);
     const size_t view_size = impl ? impl->virtual_size : 0;
-    const size_t count = (std::min)(static_cast<size_t>(entries[0]), entries.size() - 1);
-    // Keep just the guest mappings, in the snapshot buffer itself.
-    size_t guest_pages = 0;
+    std::vector<uintptr_t> backing_pages;
+    std::vector<uintptr_t> view_pages;
     for (size_t i = 1; i <= count; ++i) {
         const uintptr_t page = entries[i] & ~uintptr_t{PageAlignment - 1};
-        if (page - backing_begin < backing_size ||
-            (view_begin != 0 && page - view_begin < view_size)) {
-            entries[guest_pages++] = page;
+        if (page - backing_begin < backing_size) {
+            backing_pages.push_back(page);
+        } else if (view_begin != 0 && page - view_begin < view_size) {
+            view_pages.push_back(page);
         }
     }
-    entries.resize(guest_pages);
-    std::ranges::sort(entries);
-
-    constexpr size_t BatchPages = 64;
-    static constexpr std::array<u8, PageAlignment> ZeroPage{};
-    std::vector<u8> sample(BatchPages * PageAlignment);
-    const auto read = [&](uintptr_t address, size_t pages) {
-        // The guest may write or remap these pages. Ask Windows for a copy into private memory
-        // instead of racing guest stores or dereferencing a view that became inaccessible.
-        const size_t bytes = pages * PageAlignment;
-        SIZE_T copied{};
-        return ReadProcessMemory(process, reinterpret_cast<const void*>(address), sample.data(),
-                                 bytes, &copied) && copied == bytes;
-    };
-    const auto is_zero = [&](size_t index) {
-        return std::memcmp(sample.data() + index * PageAlignment, ZeroPage.data(),
-                           PageAlignment) == 0;
-    };
-    const auto unlock = [](uintptr_t address, size_t bytes) {
-        return VirtualUnlock(reinterpret_cast<void*>(address), bytes) ||
-               GetLastError() == ERROR_NOT_LOCKED;
-    };
-    size_t trimmed = 0;
-    const auto trim = [&](size_t first, size_t end) {
-        // VirtualUnlock preserves contents, including writes made after the snapshot. A run may
-        // cross view boundaries; retry by page if Windows won't accept the whole range.
-        const size_t bytes = (end - first) * PageAlignment;
-        if (unlock(entries[first], bytes)) {
-            trimmed += bytes;
-        } else if (end - first > 1) {
-            for (size_t i = first; i < end; ++i) {
-                if (unlock(entries[i], PageAlignment)) {
-                    trimmed += PageAlignment;
-                }
-            }
+    std::sort(backing_pages.begin(), backing_pages.end());
+    // A run can span two views, which VirtualUnlock refuses as a whole: then page by page.
+    const auto unlock = [](uintptr_t begin, uintptr_t end) {
+        if (VirtualUnlock(reinterpret_cast<void*>(begin), end - begin) ||
+            GetLastError() == ERROR_NOT_LOCKED) {
+            return;
+        }
+        for (uintptr_t page = begin; page < end; page += PageAlignment) {
+            VirtualUnlock(reinterpret_cast<void*>(page), PageAlignment);
         }
     };
-    for (size_t first = 0; first < guest_pages && !stop.stop_requested();) {
-        size_t end = first + 1;
-        while (end < guest_pages && end - first < BatchPages &&
-               entries[end] == entries[end - 1] + PageAlignment) {
-            ++end;
-        }
-        if (read(entries[first], end - first)) {
-            for (size_t i = first; i < end;) {
-                if (!is_zero(i - first)) {
-                    ++i;
-                    continue;
-                }
-                const size_t start = i++;
-                while (i < end && is_zero(i - first)) {
-                    ++i;
-                }
-                trim(start, i);
-            }
-        } else if (end - first > 1) {
-            // One page that became inaccessible need not exclude the rest of the batch.
-            for (size_t i = first; i < end; ++i) {
-                if (read(entries[i], 1) && is_zero(0)) {
-                    trim(i, i + 1);
-                }
-            }
-        }
-        first = end;
+    u64 unlock_us = 0;
+    // FRITCHII_ZERO_TRIM_CHUNK (live, read once per pass; helper CR, 2026-11-16): one VirtualUnlock
+    // over a long run holds the address space for the whole call, and a guest VirtualProtect that
+    // lands in it waits: the first big pass after an area load (~530 MiB trimmed, 88 s after
+    // boot) had runs of 30-46 ms and the GPU-cache write traps stalled as long (host protect
+    // longest 21.6 / 19.1 / 45.7 ms in the market, Castle Town and night market hitches of 62,
+    // 53 and 71 ms, b18-reg logs). With 1, a run goes in calls of at most 256 pages (1 MiB); with
+    // N >= 2, of N pages. The same pages leave the working set (the calls cover exactly the run),
+    // contents untouched: nothing for a verify mode to compare. The give-way check runs before
+    // every call, so a guest call waits for at most one chunk.
+    int chunk_mode = g_zero_trim_chunk.load(std::memory_order_relaxed);
+    if (chunk_mode < 0) {
+        const char* const value = std::getenv("FRITCHII_ZERO_TRIM_CHUNK");
+        int unset = -1;
+        g_zero_trim_chunk.compare_exchange_strong(
+            unset, value != nullptr ? (std::max)(0, std::atoi(value)) : 0,
+            std::memory_order_relaxed);
+        chunk_mode = g_zero_trim_chunk.load(std::memory_order_relaxed);
     }
-    return {guest_pages * PageAlignment, trimmed};
-} catch (const std::bad_alloc&) {
-    // Trimming is opportunistic; skip this pass if its working-set snapshot won't fit.
-    return {};
-}
+    const uintptr_t chunk_bytes = chunk_mode <= 0   ? ~uintptr_t{0}
+                                  : chunk_mode == 1 ? uintptr_t{256} * PageAlignment
+                                                    : uintptr_t(chunk_mode) * PageAlignment;
+    phases.chunk_mode = (std::max)(0, chunk_mode);
+    g_guest_calls_in_unlock.store(0, std::memory_order_relaxed);
+    g_longest_guest_in_unlock_ns.store(0, std::memory_order_relaxed);
+    // Takes the pages in `pages` (sorted and deduplicated here) out of the working set, run by run.
+    const auto unlock_all = [&](std::vector<uintptr_t>& pages) {
+        const auto unlock_start = std::chrono::steady_clock::now();
+        std::sort(pages.begin(), pages.end());
+        pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+        g_zero_trim_unlocking.store(true, std::memory_order_relaxed);
+        for (size_t i = 0; i < pages.size();) {
+            size_t j = i + 1;
+            while (j < pages.size() && pages[j] == pages[j - 1] + PageAlignment) {
+                ++j;
+            }
+            const uintptr_t run_end = pages[j - 1] + PageAlignment;
+            u64 run_us = 0; // the run's calls, without the give-way waits (as before the chunks)
+            for (uintptr_t begin = pages[i]; begin < run_end;) {
+                const uintptr_t end =
+                    run_end - begin > chunk_bytes ? begin + chunk_bytes : run_end;
+                // Give way to a guest map/unmap/protect under way (they share the address space
+                // lock with VirtualUnlock): at most 20 ms per call, so a game that maps nonstop
+                // does not hold the pass.
+                if (g_guest_mapping_in_flight.load(std::memory_order_relaxed) > 0) {
+                    const auto give_way_start = std::chrono::steady_clock::now();
+                    while (g_guest_mapping_in_flight.load(std::memory_order_relaxed) > 0 &&
+                           std::chrono::steady_clock::now() - give_way_start <
+                               std::chrono::milliseconds{20}) {
+                        SwitchToThread();
+                    }
+                }
+                const auto call_start = std::chrono::steady_clock::now();
+                unlock(begin, end);
+                const u64 call_us = MicrosSince(call_start);
+                phases.longest_call_us = (std::max)(phases.longest_call_us, call_us);
+                run_us += call_us;
+                ++phases.unlock_calls;
+                begin = end;
+            }
+            phases.longest_unlock_us = (std::max)(phases.longest_unlock_us, run_us);
+            ++phases.unlock_runs;
+            i = j;
+        }
+        g_zero_trim_unlocking.store(false, std::memory_order_relaxed);
+        unlock_us += MicrosSince(unlock_start);
+    };
+    // FRITCHII_ZERO_TRIM_BATCH (boot, default 0; docs/fritchii/switches.md): the backing pages a
+    // pass reads for resident view pages leave the working set again every 4096 pages instead of
+    // at the end. Reading them maps a second address of a page already in RAM (no new memory),
+    // but until the end of the pass the working set counted each twice: the market's working set
+    // peaks (12.2, 14.1 and 14.6 GB, 2026-11-16) each fell inside a pass.
+    static const bool batch_touched = [] {
+        const char* const value = std::getenv("FRITCHII_ZERO_TRIM_BATCH");
+        return value != nullptr && value[0] == '1';
+    }();
+    constexpr size_t TouchedBatch = 4096;
+    std::vector<uintptr_t> touched;
+    // Pages are only ever read through the backing, which stays mapped and writable: a view page
+    // can be unmapped or protected by a guest thread meanwhile. Trimming keeps the contents, so a
+    // write that lands after the check costs a soft fault and nothing else.
+    std::vector<uintptr_t> trim;
+    size_t zero_bytes = 0;
+    for (const uintptr_t page : backing_pages) {
+        if (IsZeroPage(reinterpret_cast<const u8*>(page))) {
+            trim.push_back(page);
+            zero_bytes += PageAlignment;
+        }
+    }
+    for (const uintptr_t page : view_pages) {
+        const auto offset = impl->BackingOffset(page - view_begin);
+        if (!offset || *offset >= backing_size) {
+            continue;
+        }
+        const uintptr_t backing_page = backing_begin + *offset;
+        if (IsZeroPage(reinterpret_cast<const u8*>(backing_page))) {
+            trim.push_back(page);
+            zero_bytes += PageAlignment;
+        }
+        // Reading it put the backing page in the working set: take it out again.
+        if (!std::binary_search(backing_pages.begin(), backing_pages.end(), backing_page)) {
+            (batch_touched ? touched : trim).push_back(backing_page);
+            if (touched.size() >= TouchedBatch) {
+                unlock_all(touched);
+                touched.clear();
+            }
+        }
+    }
+    if (!touched.empty()) {
+        unlock_all(touched);
+    }
+    phases.scan_us = MicrosSince(phase_start) - unlock_us;
+    unlock_all(trim);
+    phases.unlock_us = unlock_us;
+    phases.guest_calls = g_guest_calls_in_unlock.load(std::memory_order_relaxed);
+    phases.longest_guest_us = g_longest_guest_in_unlock_ns.load(std::memory_order_relaxed) / 1000;
+    g_zero_trim_phases = phases;
+    return {(backing_pages.size() + view_pages.size()) * PageAlignment, zero_bytes};
+#else
+    return {0, 0};
 #endif
+}
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
     if (length == 0) {
@@ -1348,6 +1605,7 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
 #endif
             if (!cleared) {
                 std::memset(backing_base + offset, 0, clear_end - offset);
+                g_zero_filled_bytes.fetch_add(clear_end - offset, std::memory_order_relaxed);
             }
             if (whole) {
                 granules[index].fetch_and(static_cast<u8>(~GranuleDirty), std::memory_order_release);
@@ -1427,7 +1685,6 @@ void HostMemory::Commit(size_t physical_offset, size_t length) {
 }
 
 void HostMemory::CommitAllBut(std::span<const std::pair<size_t, size_t>> lazy) {
-#ifdef _WIN32
     if (!commit_on_use) {
         return;
     }
@@ -1443,10 +1700,9 @@ void HostMemory::CommitAllBut(std::span<const std::pair<size_t, size_t>> lazy) {
     if (offset < backing_size) {
         Commit(offset, backing_size - offset);
     }
+#ifdef _WIN32
     LOG_INFO(HW_Memory, "EDEN_NX2_SEC_RESERVE: {} MiB of guest memory committed (the kernel's own)",
              g_committed_bytes.load(std::memory_order_relaxed) >> 20);
-#else
-    static_cast<void>(lazy);
 #endif
 }
 

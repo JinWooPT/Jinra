@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -23,7 +22,6 @@ enum class EdenPath {
     KeysDir,        // Where key files are stored.
     LoadDir,        // Where cheat/mod files are stored.
     LogDir,         // Where log files are stored.
-    LosslessDir,    // Where the user-supplied Lossless Scaling library is stored.
     NANDDir,        // Where the emulated NAND is stored.
     PlayTimeDir,    // Where play time data is stored.
     PostPresetDir,
@@ -35,11 +33,19 @@ enum class EdenPath {
     TASDir,         // Where TAS scripts are stored.
     IconsDir,       // Where Icons for Windows shortcuts are stored.
     StreamlineDir,  // Where the user-supplied NVIDIA Streamline loader is stored.
-    FidelityFxDir,  // Where the downloaded AMD FidelityFX runtime is stored.
+    FidelityFxDir,  // Where AMD's FidelityFX runtime (FSR 4) is downloaded.
 };
 
 // migration/compat dirs
 enum EmuPath {
+    LegacyEdenDir,
+    LegacyEdenConfigDir,
+    LegacyEdenCacheDir,
+
+    LichiiDir,
+    LichiiConfigDir,
+    LichiiCacheDir,
+
     CitronDir,
     CitronConfigDir,
     CitronCacheDir,
@@ -223,6 +229,8 @@ template <typename Path>
  */
 void SetAppDirectory(const std::string& app_directory);
 
+[[nodiscard]] bool IsPortableMode();
+
 /**
  * Gets the filesystem path associated with the EdenPath enum.
  *
@@ -269,7 +277,7 @@ void SetAppDirectory(const std::string& app_directory);
 void SetEdenPath(EdenPath eden_path, const std::filesystem::path& new_path);
 
 /**
- * Creates all necessary Eden paths in the filesystem.
+ * Creates all necessary Fritchii paths in the filesystem.
  */
 void CreateEdenPaths();
 
@@ -311,14 +319,14 @@ void SetEdenPath(EdenPath eden_path, const Path& new_path) {
 [[nodiscard]] std::filesystem::path GetHomeDirectory();
 
 /**
- * Gets the relevant paths for yuzu to store its data based on the given XDG environment variable.
+ * Gets the relevant paths for Fritchii to store its data based on the given XDG environment variable.
  * See https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
  * Defaults to $HOME/.local/share for main application data,
  * $HOME/.cache for cached data, and $HOME/.config for configuration files.
  *
  * @param env_name XDG environment variable name
  *
- * @returns The path where yuzu should store its data.
+ * @returns The path where Fritchii should store its data.
  */
 [[nodiscard]] std::filesystem::path GetDataDirectory(const std::string& env_name);
 

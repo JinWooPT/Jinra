@@ -53,6 +53,9 @@ public:
     /// Slot used to update the status of the progress bar
     void OnLoadProgress(VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total);
 
+    /// Shows the progress of the Vulkan pipelines being prepared before play.
+    void ShowShaderPreparationProgress(std::size_t done, std::size_t total);
+
     /// Hides the LoadingScreen with a fade out effect
     void OnLoadComplete();
 
@@ -68,6 +71,8 @@ signals:
     void Hidden();
 
 private:
+    void UpdateProgress(std::size_t value, std::size_t total);
+
 #ifndef YUZU_QT_MOVIE_MISSING
     std::unique_ptr<QMovie> animation;
     std::unique_ptr<QBuffer> backing_buf;
@@ -75,14 +80,12 @@ private:
 #endif
     std::unique_ptr<Ui::LoadingScreen> ui;
     std::size_t previous_total = 0;
-    VideoCore::LoadCallbackStage previous_stage;
 
     QGraphicsOpacityEffect* opacity_effect = nullptr;
     std::unique_ptr<QPropertyAnimation> fadeout_animation;
 
     std::chrono::steady_clock::time_point stage_start;
     std::size_t first_value = 0;
-    bool play_now_requested = false;
 };
 
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)

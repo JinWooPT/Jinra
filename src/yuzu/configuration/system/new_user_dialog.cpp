@@ -6,6 +6,7 @@
 #include "common/fs/path_util.h"
 #include "common/uuid.h"
 #include "configuration/system/profile_avatar_dialog.h"
+#include "core/constants.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/romfs.h"
@@ -23,7 +24,13 @@
 #include <qvalidator.h>
 
 QPixmap NewUserDialog::DefaultAvatar() {
-    return QPixmap{QStringLiteral(":/jinra/icon.png")};
+    QPixmap icon;
+
+    icon.fill(Qt::black);
+    icon.loadFromData(Core::Constants::ACCOUNT_BACKUP_JPEG.data(),
+                      static_cast<u32>(Core::Constants::ACCOUNT_BACKUP_JPEG.size()));
+
+    return icon.scaled(64, 64, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 }
 
 QString NewUserDialog::GetImagePath(const Common::UUID& uuid) {
@@ -40,7 +47,7 @@ QPixmap NewUserDialog::GetIcon(const Common::UUID& uuid) {
         return DefaultAvatar();
     }
 
-    return icon;
+    return icon.scaled(64, 64, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 }
 
 NewUserDialog::NewUserDialog(Common::UUID uuid, const std::string& username, const QString& title,
@@ -51,7 +58,7 @@ NewUserDialog::NewUserDialog(Common::UUID uuid, const std::string& username, con
 }
 
 NewUserDialog::NewUserDialog(QWidget* parent) : QDialog(parent) {
-    setup(Common::UUID::MakeRandom(), "Jinra", tr("New User"));
+    setup(Common::UUID::MakeRandom(), "Fritchii", tr("New User"));
 }
 
 void NewUserDialog::setup(Common::UUID uuid, const std::string& username, const QString& title) {
@@ -140,7 +147,7 @@ void NewUserDialog::selectImage() {
         image = image.scaled(256, 256, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
     }
 
-    setImage(image);
+    setImage(image.scaled(64, 64, Qt::IgnoreAspectRatio));
     setIsDefaultAvatar(false);
 }
 
@@ -151,7 +158,7 @@ void NewUserDialog::setAvatar() {
         }
     }
     if (avatar_dialog->exec() == QDialog::Accepted) {
-        setImage(avatar_dialog->GetSelectedAvatar());
+        setImage(avatar_dialog->GetSelectedAvatar().scaled(64, 64, Qt::IgnoreAspectRatio));
     }
 }
 
@@ -293,11 +300,7 @@ std::vector<uint8_t> NewUserDialog::DecompressYaz0(const FileSys::VirtualFile& f
 void NewUserDialog::setImage(const QPixmap& pixmap) {
     m_pixmap = pixmap;
     m_scene->clear();
-    const auto ratio = devicePixelRatioF();
-    auto preview = m_pixmap.scaled(qRound(64 * ratio), qRound(64 * ratio), Qt::KeepAspectRatio,
-                                   Qt::SmoothTransformation);
-    preview.setDevicePixelRatio(ratio);
-    m_scene->addPixmap(preview);
+    m_scene->addPixmap(m_pixmap);
 }
 
 void NewUserDialog::revertImage() {

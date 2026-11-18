@@ -130,75 +130,62 @@ bool HasSha256(const std::filesystem::path& path, std::string_view sha256) {
 namespace {
 
 struct Loaded : Api {
-    HMODULE loader{};
-    HMODULE upscaler{};
-
-    ~Loaded() {
-        if (loader) {
-            FreeLibrary(loader);
-        }
-        if (upscaler) {
-            FreeLibrary(upscaler);
-        }
-    }
+    HMODULE module{};
 };
 
 std::mutex mutex;
-std::shared_ptr<const Loaded> current;
+std::weak_ptr<const Loaded> current;
 
-HMODULE LoadVerified(const File& file) {
-    const auto path = Folder() / file.name;
-    const auto name = std::filesystem::path{file.name}.wstring();
-    // Keep the file stable between verifying it and mapping it as an executable image.
-    const HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
-        LOG_INFO(Render_Vulkan, "AMD FSR 4: cannot open {}; using FSR 3.1", file.name);
-        return nullptr;
-    }
-    LARGE_INTEGER size{};
-    const bool verified = GetFileSizeEx(handle, &size) && size.QuadPart >= 0 &&
-                          static_cast<u64>(size.QuadPart) == file.size &&
-                          HasSha256(path, file.sha256) && IsSignedByAmd(path);
-    HMODULE module = nullptr;
+/// Once every file checks out it isn't hashed again this session; a failed check is retried, so
+/// files downloaded after a game ran are used by the next one.
+bool FilesVerified() {
+    static bool verified = false;
     if (verified) {
-        module = LoadLibraryExW(path.c_str(), nullptr,
-                                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return true;
     }
-    const DWORD error = module ? ERROR_SUCCESS : GetLastError();
-    CloseHandle(handle);
-    if (!verified) {
-        LOG_WARNING(Render_Vulkan, "AMD FSR 4: {} failed verification; using FSR 3.1", file.name);
-    } else if (!module) {
-        LOG_WARNING(Render_Vulkan, "AMD FSR 4: cannot load {} (error {}); using FSR 3.1",
-                    file.name, error);
-    } else if (GetModuleHandleW(name.c_str()) != module) {
-        LOG_WARNING(Render_Vulkan, "AMD FSR 4: another {} is loaded; using FSR 3.1", file.name);
-        FreeLibrary(module);
-        return nullptr;
+    const std::filesystem::path folder = Folder();
+    for (const File& file : FILES) {
+        const std::filesystem::path path = folder / file.name;
+        std::error_code ec;
+        const char* problem = nullptr;
+        if (!std::filesystem::is_regular_file(path, ec)) {
+            problem = "missing";
+        } else if (std::filesystem::file_size(path, ec) != file.size ||
+                   !HasSha256(path, file.sha256)) {
+            problem = "not the pinned AMD FidelityFX SDK file";
+        } else if (!IsSignedByAmd(path)) {
+            problem = "not signed by AMD";
+        }
+        if (problem) {
+            LOG_INFO(Render_Vulkan, "AMD FSR 4: {} is {}; using FSR 3.1",
+                     Common::FS::PathToUTF8String(path), problem);
+            return false;
+        }
     }
-    return module;
+    verified = true;
+    return true;
 }
 
 } // Anonymous namespace
 
 std::shared_ptr<const Api> Acquire() {
     std::scoped_lock lock{mutex};
-    if (current) {
-        return current;
+    if (auto existing = current.lock()) {
+        return existing;
     }
-    auto loaded = std::make_shared<Loaded>();
-    // AMD prefers effect DLLs already loaded by name, then those beside the executable.
-    // Preload the verified effect so it cannot pick up an unverified copy from either location.
-    loaded->upscaler = LoadVerified(FILES[1]);
-    if (!loaded->upscaler) {
+    if (!FilesVerified()) {
         return nullptr;
     }
-    loaded->loader = LoadVerified(FILES[0]);
-    const HMODULE module = loaded->loader;
+    // The loader finds the upscaler next to itself.
+    const std::wstring loader = (Folder() / FILES[0].name).wstring();
+    const HMODULE module = LoadLibraryExW(loader.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!module) {
+        LOG_WARNING(Render_Vulkan, "AMD FSR 4: the FidelityFX loader doesn't load (error {})",
+                    GetLastError());
         return nullptr;
     }
+    auto loaded = std::make_unique<Loaded>();
+    loaded->module = module;
     loaded->create_context =
         reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(module, "ffxCreateContext"));
     loaded->destroy_context =
@@ -208,11 +195,29 @@ std::shared_ptr<const Api> Acquire() {
     if (!loaded->create_context || !loaded->destroy_context || !loaded->query ||
         !loaded->dispatch) {
         LOG_WARNING(Render_Vulkan, "AMD FSR 4: the FidelityFX loader lacks its exports");
+        FreeLibrary(module);
         return nullptr;
     }
     LOG_INFO(Render_Vulkan, "AMD FSR 4: FidelityFX SDK {} runtime loaded", SDK_VERSION);
-    current = std::move(loaded);
-    return current;
+    // The upscaler the loader brought in goes with it, so the next game loads both afresh with
+    // its own device (CheezyEmu found a kept AMD DLL holding the stopped game's device). Holders
+    // destroy their contexts first. The deleter takes the lock: release happens outside it.
+    std::shared_ptr<const Loaded> shared{loaded.release(), [](const Loaded* l) {
+                                             std::scoped_lock unload_lock{mutex};
+                                             FreeLibrary(l->module);
+                                             for (int i = 0; i < 8; ++i) {
+                                                 const HMODULE upscaler = GetModuleHandleW(
+                                                     L"amd_fidelityfx_upscaler_vk.dll");
+                                                 if (!upscaler || !FreeLibrary(upscaler)) {
+                                                     break;
+                                                 }
+                                             }
+                                             LOG_INFO(Render_Vulkan,
+                                                      "AMD FSR 4: FidelityFX runtime unloaded");
+                                             delete l;
+                                         }};
+    current = shared;
+    return shared;
 }
 
 #else

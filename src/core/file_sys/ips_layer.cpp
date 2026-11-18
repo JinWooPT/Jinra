@@ -101,6 +101,49 @@ VirtualFile PatchIPS(const VirtualFile& in, const VirtualFile& ips) {
     return nullptr;
 }
 
+PatchWriteRanges GetIPSWriteRanges(const VirtualFile& ips) {
+    if (ips == nullptr)
+        return {};
+
+    const auto type = IdentifyMagic(ips->ReadBytes(0x5));
+    if (type == IPSFileType::Error)
+        return {};
+
+    PatchWriteRanges ranges;
+    std::vector<u8> temp(type == IPSFileType::IPS ? 3 : 4);
+    u64 offset = 5; // After header
+    while (ips->Read(temp.data(), temp.size(), offset) == temp.size()) {
+        offset += temp.size();
+        if (IsEOF(type, temp)) {
+            return ranges;
+        }
+
+        const u64 real_offset = (type == IPSFileType::IPS32)
+            ? ((u64{temp[0]} << 24) | (u64{temp[1]} << 16) | (u64{temp[2]} << 8) | temp[3])
+            : ((u64{temp[0]} << 16) | (u64{temp[1]} << 8) | temp[2]);
+
+        u16 data_size{};
+        if (ips->ReadObject(&data_size, offset) != sizeof(u16))
+            return {};
+        data_size = Common::swap16(data_size);
+        offset += sizeof(u16);
+
+        u64 size = data_size;
+        if (data_size == 0) { // RLE: size, then the byte
+            u16 rle_size{};
+            if (ips->ReadObject(&rle_size, offset) != sizeof(u16))
+                return {};
+            size = Common::swap16(rle_size);
+            offset += sizeof(u16) + 1;
+        } else {
+            offset += data_size;
+        }
+        if (size != 0)
+            ranges.emplace_back(real_offset, real_offset + size);
+    }
+    return {}; // no EOF marker: PatchIPS applies none of it
+}
+
 
 struct IPSwitchRecord {
     std::vector<uint8_t> data;
@@ -147,44 +190,6 @@ static IPSwitchRecord EscapeStringSequences(std::string_view sv) {
     return r;
 }
 
-static bool IsHexString(std::string_view sv) {
-    return !sv.empty() && std::all_of(sv.cbegin(), sv.cend(), [](char c) {
-        return std::isxdigit(static_cast<unsigned char>(c)) != 0;
-    });
-}
-
-// A record is a hex offset followed by a quoted string or a hex value.
-static bool IsPatchRecord(std::string_view line) {
-    const auto offset_end = line.find_first_of(" \t\"'");
-    if (offset_end == std::string_view::npos) {
-        return false;
-    }
-    auto offset = line.substr(0, offset_end);
-    if (offset.starts_with("0x") || offset.starts_with("0X")) {
-        offset.remove_prefix(2);
-    }
-    if (!IsHexString(offset)) {
-        return false;
-    }
-    const auto value_start = line.find_first_not_of(" \t", offset_end);
-    if (value_start == std::string_view::npos) {
-        return false;
-    }
-    const auto value = line.substr(value_start);
-    if (value[0] == '"' || value[0] == '\'') {
-        // The closing quote must end the line, as comments are already stripped.
-        for (size_t i = 1; i < value.size(); ++i) {
-            if (value[i] == '\\') {
-                ++i;
-            } else if (value[i] == value[0]) {
-                return i + 1 == value.size();
-            }
-        }
-        return false;
-    }
-    return value.find_first_not_of("0123456789abcdefABCDEF \t") == std::string_view::npos;
-}
-
 void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
     LOG_INFO(Loader, "IPSwitchCompiler: '{}'", patch_text->GetName());
     bool is_little_endian = true;
@@ -200,7 +205,9 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
             // yes, @nsobid too -- NSO Build ID Specifier
             case 'n':
             case 'N':
-                nso_build_id = Common::HexStringToArray<0x20>(fmt::format("{:0<64}", line.substr(8)));
+                // A line shorter than "@nsobid-" names no build ID.
+                nso_build_id = Common::HexStringToArray<0x20>(
+                    fmt::format("{:0<64}", line.substr(std::min<size_t>(8, line.size()))));
                 break;
             // @stop
             case 's':
@@ -220,7 +227,10 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
             case 'f':
             case 'F': {
                 if (line.starts_with("@flag offset_shift")) {
-                    offset_shift = std::strtoll(line.data() + 19, nullptr, 0);  // Offset Shift Flag
+                    // Offset Shift Flag. The line is not null-terminated: copy the value so
+                    // strtoll stops at its end.
+                    const std::string shift{line.substr(std::min<size_t>(19, line.size()))};
+                    offset_shift = std::strtoll(shift.c_str(), nullptr, 0);
                 } else if (line.starts_with("@flag print_values")) {
                     //print_values = true; // Force printing of applied values
                 }
@@ -241,9 +251,6 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
             }
         } else if (patches.empty()) {
             LOG_WARNING(Loader, "Invalid line not in a patch {}", line);
-        } else if (!IsPatchRecord(line)) {
-            // Text after a patch, such as credits, must not be written into the module.
-            LOG_WARNING(Loader, "Ignoring line that is not a patch {}", line);
         } else {
             size_t offset = size_t(std::strtoul(line.data(), nullptr, 16));
             offset += size_t(offset_shift);
@@ -308,11 +315,7 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
                 || (!quote && p[0] == '#')) {
                     break;
                 } else if (p[0] == '\"' || p[0] == '\'') {
-                    if (!quote) {
-                        quote = p[0];
-                    } else if (p[0] == quote) {
-                        quote = '\0';
-                    }
+                    quote = (p[0] == quote) ? '\0' : p[0];
                     ++p;
                     last_char = p;
                 } else if (p + 1 < sline.cend() && p[0] == '\\') {
@@ -352,6 +355,19 @@ VirtualFile IPSwitchCompiler::Apply(const VirtualFile& in) const {
         }
     }
     return std::make_shared<VectorVfsFile>(std::move(in_data), in->GetName(), in->GetContainingDirectory());
+}
+
+PatchWriteRanges IPSwitchCompiler::GetWriteRanges() const {
+    PatchWriteRanges ranges;
+    for (const auto& patch : patches) {
+        if (patch.enabled) {
+            for (const auto& record : patch.records) {
+                if (!record.second.data.empty())
+                    ranges.emplace_back(record.first, u64{record.first} + record.second.data.size());
+            }
+        }
+    }
+    return ranges;
 }
 
 } // namespace FileSys

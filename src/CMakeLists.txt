@@ -1,14 +1,13 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 # Enable modules to include each other's files
 include_directories(.)
 
 # Dynarmic
-if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64) AND NOT YUZU_STATIC_ROOM)
+if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64))
     add_subdirectory(dynarmic)
     add_library(dynarmic::dynarmic ALIAS dynarmic)
 endif()
@@ -115,7 +114,7 @@ if (MSVC AND NOT CXX_CLANG)
         /we4457 # Declaration of 'identifier' hides function parameter
         /we4458 # Declaration of 'identifier' hides class member
         /we4459 # Declaration of 'identifier' hides global declaration
-        /w44505 # 'function': unreferenced local function has been removed
+        /w4505 # 'function': unreferenced local function has been removed
         /we4547 # 'operator': operator before comma has no effect; expected operator with side-effect
         /we4549 # 'operator1': operator before comma has no effect; did you intend 'operator2'?
         /we4555 # Expression has no effect; expected expression with side-effect
@@ -147,7 +146,13 @@ if (MSVC AND NOT CXX_CLANG)
     endif()
 
     set(CMAKE_EXE_LINKER_FLAGS_DEBUG   "/DEBUG /MANIFEST:NO" CACHE STRING "" FORCE)
-    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,ICF" CACHE STRING "" FORCE)
+    # LICHII_LINK_ICF=OFF keeps identical functions apart, so sampling profiles name them right.
+    option(LICHII_LINK_ICF "Fold identical functions when linking Release builds (MSVC)" ON)
+    if (LICHII_LINK_ICF)
+        set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,ICF" CACHE STRING "" FORCE)
+    else()
+        set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,NOICF" CACHE STRING "" FORCE)
+    endif()
 else()
     if (NOT MSVC)
         add_compile_options(
@@ -221,13 +226,6 @@ else()
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-stringop-overflow>)
     endif()
 
-    # GCC 13+ unswitches loops on switch statements and can drop cases from the unswitched copy
-    # (same pass as https://gcc.gnu.org/PR128356). It dropped the split front's macro uploads
-    # in Maxwell3D::FrontCallMultiMethod, so games using macros showed a black screen (#500).
-    if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "13" AND CXX_GCC)
-        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fno-unswitch-loops>)
-    endif()
-
     # Set file offset size to 64 bits.
     #
     # On modern Unixes, this is typically already the case. The lone exception is
@@ -240,7 +238,7 @@ else()
     if (YUZU_STATIC_BUILD AND NOT APPLE AND NOT MSVC)
         add_compile_options(-static)
 
-        # yuzu-cmd requires us to explicitly link libpthread, libgcc, and libstdc++ as static
+        # static builds need libpthread, libgcc, and libstdc++ linked explicitly as static
         add_link_options(-Wl,-Bstatic -static -lpthread)
         add_link_options(-static-libgcc -static-libstdc++)
     endif()
@@ -267,19 +265,6 @@ endif()
 add_subdirectory(common)
 add_subdirectory(network)
 
-if (YUZU_ROOM)
-    add_subdirectory(dedicated_room)
-endif()
-
-if (YUZU_ROOM_STANDALONE)
-    add_subdirectory(yuzu_room_standalone)
-    set_target_properties(yuzu-room PROPERTIES OUTPUT_NAME "eden-room")
-endif()
-
-if (YUZU_STATIC_ROOM)
-    return()
-endif()
-
 add_subdirectory(core)
 add_subdirectory(audio_core)
 add_subdirectory(video_core)
@@ -292,26 +277,16 @@ if (YUZU_TESTS)
     add_subdirectory(tests)
 endif()
 
-if (YUZU_CMD)
-    add_subdirectory(yuzu_cmd)
-    set_target_properties(yuzu-cmd PROPERTIES OUTPUT_NAME "jinra-cli")
-endif()
-
 if (ENABLE_QT)
     add_subdirectory(qt_common)
     add_subdirectory(yuzu)
-    if (WIN32 AND ENABLE_UPDATE_CHECKER)
-        add_subdirectory(updater)
+    if (WIN32)
+        add_subdirectory(lichii_forwarder)
     endif()
 endif()
 
 if (ENABLE_WEB_SERVICE)
     add_subdirectory(web_service)
-endif()
-
-if (ANDROID)
-    add_subdirectory(android/app/src/main/jni)
-    target_include_directories(yuzu-android PRIVATE android/app/src/main)
 endif()
 
 include(GenerateDepHashes)

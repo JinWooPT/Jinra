@@ -5,39 +5,39 @@
 # archives. The core uses its header-only C++ reader, vendored in
 # externals/nxformat. The Qt frontend's NX converter calls its C library to
 # convert games to .nx and to edit them. The pinned release of that library is
-# downloaded and checked here; JINRA_NXFORMAT_ROOT may instead point at an
+# downloaded and checked here; LICHII_NXFORMAT_ROOT may instead point at an
 # unpacked release, such as a local build packed by nxformat's
 # tools/package_release.py. When neither is available, the frontend is built
 # without the converter.
 #
 # The static library is linked into the executable, so there is no shared
-# library to ship. The variant
-# without Zstandard lets the converter use Jinra's bundled zstd
+# library to ship: a missing one stopped the emulator from starting. Its variant
+# without Zstandard is used, so the converter runs on the emulator's own bundled zstd
 # and the executable holds a single copy of it.
 #
 # Defines nxformat::static_nozstd when the converter is built.
-set(JINRA_NXFORMAT_ROOT "" CACHE PATH "Unpacked nxformat release (empty: download the pinned one)")
+set(LICHII_NXFORMAT_ROOT "" CACHE PATH "Unpacked nxformat release (empty: download the pinned one)")
 
-function(jinra_find_nxformat)
+function(lichii_find_nxformat)
     set(version 1.0.2)
     set(tag V1.0.2)
-    set(root "${JINRA_NXFORMAT_ROOT}")
+    set(root "${LICHII_NXFORMAT_ROOT}")
     if (NOT root)
         if (WIN32 AND ARCHITECTURE_x86_64)
             set(platform windows-x64)
-            set(sha256 5e6ef7dd2878f832c7ec90bd6ffa78f759b05a10fdf37997e2aed9a9ac662983)
+            set(sha256 d3c510a0f92c899d62ff413635b57538ce7a05d26765894fe176af2fb0bd88bf)
         elseif (APPLE)
             set(platform macos-universal)
-            set(sha256 4cdd2e39d6e42aa123da1c8c666766db2326a4eb1f2621f6d7de9e68e775a349)
+            set(sha256 0d9331b659c3ec22a7067a9a679863a0e7b4c6045b91b8d4ecc1b3b2789f833b)
         elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ARCHITECTURE_x86_64)
             set(platform linux-x64)
-            set(sha256 da94373e71b19e87459a3d6e0bc8f75a47ca405e1e73cdf87373ace71b97d95b)
+            set(sha256 d4aa0ebacb0f809411c07002bed0f1587aa08c601a46d5b718d34ac1c1d77285)
         elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ARCHITECTURE_arm64)
             set(platform linux-arm64)
-            set(sha256 be5e9e843d5efb7da48a5e54e3b4d416000d9375f038a7d0aa31b3af63e16ac2)
+            set(sha256 5ef94931d0e68bd95fba67c3f43877d341164cebef9cc2e0a00a4177d38fdacf)
         else()
             message(WARNING "NX converter disabled: nxformat has no prebuilt library for this platform. "
-                            "Set JINRA_NXFORMAT_ROOT to an unpacked nxformat release to build it. "
+                            "Set LICHII_NXFORMAT_ROOT to an unpacked nxformat release to build it. "
                             "Loading .nx games is not affected.")
             return()
         endif()
@@ -66,7 +66,7 @@ function(jinra_find_nxformat)
                 list(GET status 1 reason)
                 file(REMOVE "${archive}")
                 message(WARNING "NX converter disabled: could not download ${url} (${reason}). "
-                                "Reconfigure with network access, or set JINRA_NXFORMAT_ROOT to an "
+                                "Reconfigure with network access, or set LICHII_NXFORMAT_ROOT to an "
                                 "unpacked nxformat release, to build it. Loading .nx games is not affected.")
                 return()
             endif()
@@ -86,5 +86,5 @@ function(jinra_find_nxformat)
 endfunction()
 
 if (ENABLE_QT)
-    jinra_find_nxformat()
+    lichii_find_nxformat()
 endif()

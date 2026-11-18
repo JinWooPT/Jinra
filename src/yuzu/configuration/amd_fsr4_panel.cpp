@@ -22,7 +22,6 @@
 #include <QPlainTextEdit>
 #include <QProgressDialog>
 #include <QPushButton>
-#include <QTemporaryDir>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <fmt/format.h>
@@ -157,9 +156,8 @@ void AmdFsr4Panel::Refresh() {
     icon_label->setText(ready ? QStringLiteral("<span style=\"color:#2ea043\">&#10004;</span>")
                               : QStringLiteral("<span style=\"color:#d29922\">&#9888;</span>"));
     status_label->setText(
-        ready ? Tr("<b>Files found.</b> Jinra verifies the FidelityFX SDK %1 runtime when it starts "
-                   "FSR 4. If the files fail verification or the driver cannot run FSR 4, "
-                   "FSR 3.1 is used.")
+        ready ? Tr("<b>Ready.</b> Found AMD's FidelityFX runtime from FidelityFX SDK %1. FSR 4 runs "
+                   "if AMD's driver offers it for this GPU; otherwise FSR 3.1 does.")
                     .arg(version)
               : Tr("<b>AMD's files needed:</b> the FidelityFX runtime from AMD's FidelityFX SDK %1 "
                    "(amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll). Until then, "
@@ -167,8 +165,8 @@ void AmdFsr4Panel::Refresh() {
                     .arg(version));
     status_label->setToolTip(Tr("Folder: %1").arg(PathText(FfxRuntime::Folder())));
     download_button->setText(
-        (ready ? Tr("Download again from AMD (%1 MB)") : Tr("Download from AMD (%1 MB)"))
-            .arg((DownloadSize() + (1 << 20) - 1) >> 20));
+        Tr("Download from AMD (%1 MB)").arg((DownloadSize() + (1 << 20) - 1) >> 20));
+    download_button->setVisible(!ready);
 }
 
 void AmdFsr4Panel::Download() {
@@ -201,9 +199,9 @@ void AmdFsr4Panel::Download() {
     dialog.setWindowTitle(Tr("Download AMD FSR 4"));
     QVBoxLayout* layout = new QVBoxLayout(&dialog);
     QLabel* intro = new QLabel(
-        Tr("Jinra will download amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll "
+        Tr("Fritchii will download amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll "
            "from AMD's FidelityFX SDK %1 release on GitHub into %2.<br>These files are AMD's, under "
-           "AMD's licence terms below. Jinra checks AMD's signature before using them.")
+           "AMD's licence terms below. Fritchii checks AMD's signature before using them.")
             .arg(QString::fromUtf8(FfxRuntime::SDK_VERSION.data(),
                                    static_cast<qsizetype>(FfxRuntime::SDK_VERSION.size())),
                  PathText(folder)),
@@ -232,18 +230,6 @@ void AmdFsr4Panel::Download() {
     QApplication::processEvents();
     std::error_code ec;
     std::filesystem::create_directories(folder, ec);
-    if (ec) {
-        progress.close();
-        fail("could not create " + Common::FS::PathToUTF8String(folder));
-        return;
-    }
-    const QTemporaryDir download_folder(PathText(folder / "download-XXXXXX"));
-    if (!download_folder.isValid()) {
-        progress.close();
-        fail("could not create a temporary download directory");
-        return;
-    }
-    const std::filesystem::path staged{download_folder.path().toStdWString()};
     const u64 total = DownloadSize();
     u64 done = 0;
     for (const FfxRuntime::File& file : FfxRuntime::FILES) {
@@ -274,11 +260,12 @@ void AmdFsr4Panel::Download() {
                              FfxRuntime::SDK_VERSION));
             return;
         }
-        const auto partial = staged / file.name;
+        const std::filesystem::path target = folder / file.name;
+        std::filesystem::path partial = target;
+        partial += L".download";
         {
             std::ofstream stream(partial, std::ios::binary | std::ios::trunc);
             stream.write(contents->data(), static_cast<std::streamsize>(contents->size()));
-            stream.close();
             if (!stream) {
                 progress.close();
                 fail("could not write " + Common::FS::PathToUTF8String(partial));
@@ -286,39 +273,24 @@ void AmdFsr4Panel::Download() {
             }
         }
         if (!FfxRuntime::IsSignedByAmd(partial)) {
+            std::filesystem::remove(partial, ec);
             progress.close();
             fail(fmt::format("{} is not signed by AMD", file.name));
             return;
         }
+        std::filesystem::rename(partial, target, ec);
+        if (ec) {
+            std::filesystem::remove(partial, ec);
+            progress.close();
+            fail("could not save " + Common::FS::PathToUTF8String(target));
+            return;
+        }
+        LOG_INFO(Frontend, "Downloaded {} from AMD's FidelityFX SDK {}",
+                 Common::FS::PathToUTF8String(target), FfxRuntime::SDK_VERSION);
     }
     {
-        std::ofstream stream(staged / FfxRuntime::LICENSE_FILE, std::ios::binary | std::ios::trunc);
+        std::ofstream stream(folder / FfxRuntime::LICENSE_FILE, std::ios::binary | std::ios::trunc);
         stream.write(licence->data(), static_cast<std::streamsize>(licence->size()));
-        stream.close();
-        if (!stream) {
-            progress.close();
-            fail("could not save AMD's licence text");
-            return;
-        }
-    }
-    const auto save = [&](std::string_view name) {
-        std::filesystem::rename(staged / name, folder / name, ec);
-        if (ec) {
-            progress.close();
-            fail("could not save " + Common::FS::PathToUTF8String(folder / name));
-            return false;
-        }
-        return true;
-    };
-    if (!save(FfxRuntime::LICENSE_FILE)) {
-        return;
-    }
-    for (const FfxRuntime::File& file : FfxRuntime::FILES) {
-        if (!save(file.name)) {
-            return;
-        }
-        LOG_INFO(Frontend, "Downloaded {} from AMD's FidelityFX SDK {}", file.name,
-                 FfxRuntime::SDK_VERSION);
     }
     progress.setValue(1000);
     progress.close();

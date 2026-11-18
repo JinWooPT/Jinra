@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/settings_input.h"
@@ -72,7 +71,6 @@ void ControllerNavigation::ControllerUpdateButton() {
     case Core::HID::NpadStyleIndex::GameCube:
         TriggerButton(Settings::NativeButton::A, Qt::Key_Enter);
         TriggerButton(Settings::NativeButton::B, Qt::Key_Escape);
-        TriggerButton(Settings::NativeButton::Plus, Qt::Key_Menu);
         TriggerButton(Settings::NativeButton::DDown, Qt::Key_Down);
         TriggerButton(Settings::NativeButton::DLeft, Qt::Key_Left);
         TriggerButton(Settings::NativeButton::DRight, Qt::Key_Right);

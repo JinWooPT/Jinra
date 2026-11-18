@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -98,9 +97,9 @@ private:
         }
         // Pages in [full_begin, full_end) are all ones already (only Reset clears a page): fill
         // around that run and grow it. Keeps tracking a multi-megabyte binding O(1) once filled.
-        if (end < full_begin || begin > full_end) {
+        if (!Nx2Perf::On(Nx2Perf::Opt::UsageTracker) || end < full_begin || begin > full_end) {
             std::fill(pages.begin() + begin, pages.begin() + end, ~u64{0});
-            if (end - begin > full_end - full_begin) {
+            if (Nx2Perf::On(Nx2Perf::Opt::UsageTracker) && end - begin > full_end - full_begin) {
                 full_begin = begin;
                 full_end = end;
             }
@@ -161,10 +160,10 @@ private:
     /// Ranges tracked last, (offset, size).
     std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
     size_t recent_cursor{};
+    bool tracked{};
     /// Pages known to be all ones (FillPages).
     size_t full_begin{};
     size_t full_end{};
-    bool tracked{};
 };
 
 } // namespace VideoCommon

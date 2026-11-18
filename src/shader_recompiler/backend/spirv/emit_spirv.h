@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
+#include <cstdlib>
 #include <vector>
 
 #include "common/common_types.h"
@@ -33,6 +33,21 @@ constexpr u32 RESCALING_LAYOUT_WORDS_OFFSET = offsetof(RescalingLayout, rescalin
 constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, down_factor);
 constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
 
+// EDEN_NX2_MESH_FIRST=1: the draw's first vertex is the first task (or mesh, without a task)
+// workgroup index, as in NVN and GL_NV_mesh_shader. Only the first active stage reads non-zero.
+struct MeshDrawBaseLayout {
+    u32 task;
+    u32 mesh;
+};
+constexpr u32 MESH_DRAW_BASE_OFFSET = sizeof(RescalingLayout);
+static_assert(MESH_DRAW_BASE_OFFSET + sizeof(MeshDrawBaseLayout) <=
+              sizeof(RescalingLayout) + sizeof(RenderAreaLayout));
+
+inline bool MeshFirstEnabled() {
+    static const bool enabled{std::getenv("EDEN_NX2_MESH_FIRST") != nullptr};
+    return enabled;
+}
+
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
 [[nodiscard]] inline std::vector<u32> EmitSPIRV(const Profile& profile, IR::Program& program) {
     Bindings binding;
@@ -50,18 +65,33 @@ constexpr u32 COOPERATIVE_HMMA_TEST_LANE_WORDS = 10;
 /// Mesh emulation without VK_EXT_mesh_shader. The mesh program runs as a compute shader
 /// (RuntimeInfo::mesh_as_compute) that writes one block per workgroup to a u32 storage buffer:
 /// max_vertices * vertex_lines words (vertex v, line l at v * vertex_lines + l), then
-/// max_primitives * 3 vertex indices (0 0 0 past the primitive count, a degenerate triangle).
+/// max_primitives * 3 vertex indices (0 0 0 past the primitive count, a degenerate triangle),
+/// then max_primitives * primitive_lines words (primitive p, line l at p * primitive_lines + l).
+/// Points and lines keep the three index words per primitive: their one or two indices first,
+/// the last repeated, and MESH_EMULATION_CULLED past the primitive count.
 [[nodiscard]] inline u32 MeshEmulationBlockWords(const MeshInfo& mesh) {
     return mesh.max_vertices * static_cast<u32>(mesh.vertex_lines.size()) +
-           mesh.max_primitives * 3;
+           mesh.max_primitives * (3 + static_cast<u32>(mesh.primitive_lines.size()));
 }
 
-/// Vertex shader drawing the emulation's output as a triangle list of
-/// groups * max_primitives * 3 vertices, with the mesh program's vertex outputs. With a task
-/// program (args_binding != ~0) the blocks start at the arguments' MESH_EMULATION_ARGS_BASE.
-[[nodiscard]] std::vector<u32> EmitMeshEmulationVertex(const Profile& profile,
-                                                       const MeshInfo& mesh, u32 binding,
-                                                       u32 args_binding, bool convert_depth);
+/// Index word of a point or line primitive past the primitive count (MeshEmulationBlockWords):
+/// the vertex shader moves it off screen.
+constexpr u32 MESH_EMULATION_CULLED = 0xFFFFFFFFU;
+
+/// Vertex shader drawing the emulation's output as a triangle, line or point list (the mesh
+/// program's topology) of groups * max_primitives * MeshInfo::PrimitiveVertices() vertices, with
+/// the mesh program's vertex outputs. With a task program (args_binding != ~0) the blocks start at
+/// the arguments' MESH_EMULATION_ARGS_BASE. Points get `point_size` unless the program writes its
+/// own PointSize. Per-primitive outputs go to every vertex of their primitive, which no other
+/// primitive shares, for the fragment shader to read flat (RuntimeInfo::per_primitive_flat):
+/// generics at their location, Layer and ViewportIndex as built-ins, and PrimitiveId as a u32 at
+/// primitive_id_location (~0 drops it). Per-vertex generics in noperspective_generics are written
+/// times Position.w (RuntimeInfo::noperspective_outputs, FRITCHII_AMD_NOPERSPECTIVE).
+[[nodiscard]] std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo& mesh,
+                                                       u32 binding, u32 args_binding,
+                                                       bool convert_depth, float point_size = 1.0f,
+                                                       u32 primitive_id_location = ~0U,
+                                                       std::bitset<32> noperspective_generics = {});
 
 /// Mesh emulation with a task program: push constants of the distribution pass.
 struct MeshEmulationDistributionConstants {

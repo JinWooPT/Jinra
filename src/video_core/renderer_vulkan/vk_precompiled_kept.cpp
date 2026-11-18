@@ -13,7 +13,6 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
-#include <sys/file.h>
 #include <unistd.h>
 #endif
 
@@ -24,43 +23,13 @@
 #include "video_core/shader_environment.h"
 
 namespace Vulkan::PrecompiledKept {
-
-PreparationLock::PreparationLock(const std::filesystem::path& path) {
-#ifdef _WIN32
-    handle = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
-                         FILE_ATTRIBUTE_NORMAL, nullptr);
-#else
-    fd = open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-    if (fd != -1 && flock(fd, LOCK_EX | LOCK_NB) != 0) {
-        close(fd);
-        fd = -1;
-    }
-#endif
-}
-
-PreparationLock::~PreparationLock() {
-    if (IsLocked()) {
-#ifdef _WIN32
-        CloseHandle(handle);
-#else
-        close(fd);
-#endif
-    }
-}
-
-bool PreparationLock::IsLocked() const noexcept {
-#ifdef _WIN32
-    return handle != INVALID_HANDLE_VALUE;
-#else
-    return fd != -1;
-#endif
-}
 namespace {
 
 // A new layout, or a Shader::Info field the serializer learns (info_serialize.cpp), needs a new
 // magic: kept files written before are then prepared again. 2: the precompiled record offsets
-// (the boot check reads each sampled record's key from them).
-constexpr std::string_view Magic{"JNX2SPV1"};
+// (the boot check reads each sampled record's key from them). 4: Shader::Info's
+// storage_read_extents.
+constexpr std::string_view Magic{"NX2KEPT4"};
 constexpr std::string_view EndMagic{"NX2KEPTE"};
 constexpr u8 EntryInfo = 1;
 constexpr u8 EntrySpirv = 2;
@@ -138,7 +107,12 @@ std::span<const Record> EqualRange(const std::vector<Record>& records, u64 key_h
 
 } // Anonymous namespace
 
-u64 ExecutableStamp() {
+std::atomic<u64>& BytesRead() {
+    static std::atomic<u64> bytes{};
+    return bytes;
+}
+
+u64 SampleSeed() {
     std::filesystem::path exe;
 #ifdef _WIN32
     std::wstring buffer(32768, L'\0');
@@ -158,6 +132,29 @@ u64 ExecutableStamp() {
                           std::filesystem::last_write_time(exe, error).time_since_epoch().count());
     const std::array<u64, 2> identity{size, static_cast<u64>(modified)};
     return Common::CityHash64(reinterpret_cast<const char*>(identity.data()), sizeof(identity));
+}
+
+std::vector<size_t> SamplePositions(size_t count, size_t wanted, u64 seed) {
+    std::vector<size_t> positions;
+    if (count <= wanted) {
+        positions.resize(count);
+        for (size_t i = 0; i < count; ++i) {
+            positions[i] = i;
+        }
+        return positions;
+    }
+    positions.reserve(wanted);
+    for (size_t i = 0; i < wanted; ++i) {
+        // SplitMix64 of the seed and the stretch.
+        u64 z = seed + 0x9E3779B97F4A7C15ULL * (i + 1);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        z ^= z >> 31;
+        const size_t first = i * count / wanted;
+        const size_t last = (i + 1) * count / wanted;
+        positions.push_back(first + static_cast<size_t>(z % (last - first)));
+    }
+    return positions;
 }
 
 PositionalFile::PositionalFile(const std::filesystem::path& path) {
@@ -293,6 +290,7 @@ std::shared_ptr<const Index> Index::Load(const std::filesystem::path& kept,
         why = "damaged";
         return nullptr;
     }
+    index->record_offsets_at = at + records_bytes + blobs_bytes;
     index->blobs.reserve(blob_entries.size());
     for (const auto& entry : blob_entries) {
         const u64 offset = u64{entry[0]} | (u64{entry[1]} << 32);
@@ -348,6 +346,34 @@ std::span<const Record> Index::Compute(u64 key_hash) const {
     return EqualRange(compute, key_hash);
 }
 
+size_t Index::MemoryBytes() const noexcept {
+    return (graphics.capacity() + compute.capacity()) * sizeof(Record) +
+           blobs.capacity() * sizeof(blobs[0]) + environments.capacity() * sizeof(environments[0]);
+}
+
+bool Index::ReadPrecompiled(u64 offset, std::span<u8> out) const {
+    if (!precompiled_file.ReadAt(offset, out)) {
+        return false;
+    }
+    BytesRead().fetch_add(out.size(), std::memory_order_relaxed);
+    return true;
+}
+
+bool Index::RecordOffset(bool compute_record, size_t position, u64& offset) const {
+    if (position >= (compute_record ? compute.size() : graphics.size())) {
+        return false;
+    }
+    const size_t slot = compute_record ? graphics.size() + position : position;
+    if (!record_offsets.empty()) {
+        if (slot >= record_offsets.size()) {
+            return false;
+        }
+        offset = record_offsets[slot];
+        return true;
+    }
+    return Get(kept_file, record_offsets_at + slot * sizeof(u64), offset);
+}
+
 bool Index::ReadBlob(u32 blob, std::vector<u8>& bytes) const {
     if (blob >= blobs.size()) {
         return false;
@@ -357,7 +383,12 @@ bool Index::ReadBlob(u32 blob, std::vector<u8>& bytes) const {
     if (!kept_file.ReadAt(offset, bytes)) {
         return false;
     }
+    BytesRead().fetch_add(size, std::memory_order_relaxed);
     return true;
+}
+
+bool Index::ReadInfoBytes(u32 blob, std::vector<u8>& bytes) const {
+    return ReadBlob(blob, bytes);
 }
 
 bool Index::ReadInfo(u32 blob, Shader::Info& info) const {
@@ -388,42 +419,42 @@ bool Index::ReadEnvironment(u32 env, VideoCommon::FileEnvironment& out) const {
         return false;
     }
     const auto [offset, size] = environments[env];
-    if (size == 0 || size > (u64{4} << 20)) {
-        return false;
-    }
     std::vector<char> buffer(static_cast<size_t>(size));
     if (!precompiled_file.ReadAt(offset, std::span(reinterpret_cast<u8*>(buffer.data()),
                                                    buffer.size()))) {
         return false;
     }
+    BytesRead().fetch_add(size, std::memory_order_relaxed);
     MemoryStreamBuf memory{buffer.data(), buffer.size()};
     std::istream stream{&memory};
     try {
         stream.exceptions(std::ios_base::failbit | std::ios_base::badbit);
-        return out.DeserializePrepared(stream, size);
+        if (!VideoCommon::FileEnvironment::RecordFits(stream, size)) {
+            return false;
+        }
+        out.Deserialize(stream);
+        return true;
     } catch (const std::exception&) {
         return false;
     }
 }
 
-bool ReadPipelineEnvironment(const PositionalFile& file, u64 offset, u64 size,
-                             VideoCommon::FileEnvironment& out) {
-    if (size == 0 || size > (u64{64} << 20)) {
+namespace {
+bool MatchesStamp(const PositionalFile& in, const std::string& stamp) {
+    std::array<char, 8> magic{};
+    u32 stamp_size{};
+    if (!Get(in, 0, magic) || !Get(in, 8, stamp_size) ||
+        std::string_view{magic.data(), magic.size()} != Magic || stamp_size != stamp.size()) {
         return false;
     }
-    std::vector<char> buffer(static_cast<size_t>(size));
-    if (!file.ReadAt(offset, std::span(reinterpret_cast<u8*>(buffer.data()), buffer.size()))) {
-        return false;
-    }
-    MemoryStreamBuf memory{buffer.data(), buffer.size()};
-    std::istream stream{&memory};
-    try {
-        stream.exceptions(std::ios_base::failbit | std::ios_base::badbit);
-        out.Deserialize(stream);
-        return static_cast<u64>(stream.tellg()) == size;
-    } catch (const std::exception&) {
-        return false;
-    }
+    std::string file_stamp(stamp_size, '\0');
+    return in.ReadAt(12, std::span(reinterpret_cast<u8*>(file_stamp.data()), stamp_size)) &&
+           file_stamp == stamp;
+}
+} // namespace
+
+bool Writer::CanResume(const std::filesystem::path& part, const std::string& stamp) {
+    return MatchesStamp(PositionalFile{part}, stamp);
 }
 
 bool Writer::Scan(const std::filesystem::path& part, const std::string& stamp, u64& valid_end) {
@@ -433,18 +464,10 @@ bool Writer::Scan(const std::filesystem::path& part, const std::string& stamp, u
         return false;
     }
     PositionalFile in{part};
-    std::array<char, 8> magic{};
-    u32 stamp_size{};
-    if (!Get(in, 0, magic) || !Get(in, 8, stamp_size) ||
-        std::string_view{magic.data(), magic.size()} != Magic || stamp_size != stamp.size()) {
+    if (!MatchesStamp(in, stamp)) {
         return false;
     }
-    std::string file_stamp(stamp_size, '\0');
-    if (!in.ReadAt(12, std::span(reinterpret_cast<u8*>(file_stamp.data()), stamp_size)) ||
-        file_stamp != stamp) {
-        return false;
-    }
-    u64 at = 12 + stamp_size;
+    u64 at = 12 + stamp.size();
     valid_end = at;
     for (;;) {
         u8 type{};
@@ -612,12 +635,11 @@ void Writer::Keep(size_t index, u8 kind, u8 flags, u64 key_hash, std::span<const
     }
 }
 
-bool Writer::Flush() {
+void Writer::Flush() {
     std::scoped_lock lock{mutex};
     if (file.is_open()) {
         file.flush();
     }
-    return file.is_open() && !failed && static_cast<bool>(file);
 }
 
 void Writer::SortedRecords(std::span<const u64> record_offsets, std::vector<Record>& graphics,
@@ -644,6 +666,40 @@ void Writer::SortedRecords(std::span<const u64> record_offsets, std::vector<Reco
         compute.push_back(records[index]);
         offsets.push_back(index < record_offsets.size() ? record_offsets[index] : 0);
     }
+}
+
+std::shared_ptr<const Index> Writer::PartIndex(
+    const std::filesystem::path& part, const std::filesystem::path& precompiled,
+    std::span<const std::pair<u64, u64>> environments, std::span<const u64> record_offsets) {
+    std::scoped_lock lock{mutex};
+    if (record_offsets.size() != records.size()) {
+        return nullptr;
+    }
+    auto index = std::make_shared<Index>(part, precompiled);
+    if (!index->kept_file.IsOpen() || !index->precompiled_file.IsOpen()) {
+        return nullptr;
+    }
+    std::vector<Record> graphics;
+    std::vector<Record> compute;
+    std::vector<u64> offsets;
+    SortedRecords(record_offsets, graphics, compute, offsets);
+    index->blobs = blobs;
+    index->environments.assign(environments.begin(), environments.end());
+    // Records a damaged log could hold are left out of the check (the finished file's index is
+    // checked whole when it is loaded).
+    std::vector<u64> compute_offsets;
+    for (size_t i = 0; i < graphics.size() + compute.size(); ++i) {
+        const bool is_compute = i >= graphics.size();
+        const Record& record = is_compute ? compute[i - graphics.size()] : graphics[i];
+        if (!ValidRecord(record, index->blobs.size(), index->environments.size())) {
+            continue;
+        }
+        (is_compute ? index->compute : index->graphics).push_back(record);
+        (is_compute ? compute_offsets : index->record_offsets).push_back(offsets[i]);
+    }
+    index->record_offsets.insert(index->record_offsets.end(), compute_offsets.begin(),
+                                 compute_offsets.end());
+    return index;
 }
 
 bool Writer::Finish(std::span<const u64> record_offsets) {

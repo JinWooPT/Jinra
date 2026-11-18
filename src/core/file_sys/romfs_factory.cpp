@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
@@ -69,12 +68,7 @@ VirtualFile RomFSFactory::OpenPatchedRomFSWithProgramIndex(u64 title_id, u8 prog
                                                            ContentRecordType type) const {
     const auto res_title_id = GetBaseTitleIDWithProgramIndex(title_id, program_index);
 
-    auto romfs = OpenPatchedRomFS(res_title_id, type);
-    if (romfs == nullptr && program_index == 0 && !updatable) {
-        // NUP containers and loose dumps aren't in the content provider: use the loader's RomFS.
-        return file;
-    }
-    return romfs;
+    return OpenPatchedRomFS(res_title_id, type);
 }
 
 VirtualFile RomFSFactory::Open(u64 title_id, StorageId storage, ContentRecordType type) const {

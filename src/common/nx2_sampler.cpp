@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "common/nx2_sampler.h"
+#include "common/jit_symbols.h"
 
 #ifdef _WIN32
 
@@ -17,7 +18,6 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -40,28 +40,7 @@ struct Sample {
 struct Target {
     HANDLE handle;
     std::string name;
-    const NT_TIB* tib; ///< the thread's stack bounds, null if unknown
 };
-
-const NT_TIB* ThreadTib(HANDLE handle) {
-    struct BasicInformation {
-        LONG exit_status;
-        PVOID teb;
-        HANDLE client_id[2];
-        KAFFINITY affinity;
-        LONG priority;
-        LONG base_priority;
-    };
-    using QueryFn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-    static const auto query = reinterpret_cast<QueryFn>(
-        GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread"));
-    BasicInformation info{};
-    if (query == nullptr || query(handle, 0, &info, sizeof(info), nullptr) < 0) {
-        return nullptr;
-    }
-    // The TEB starts with the NT_TIB.
-    return static_cast<const NT_TIB*>(info.teb);
-}
 
 double EnvSeconds(const char* name, double fallback) {
     const char* text = std::getenv(name);
@@ -118,7 +97,7 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
             continue;
         }
         const HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
-                                             THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
+                                             THREAD_QUERY_LIMITED_INFORMATION,
                                          FALSE, entry.th32ThreadID);
         if (handle == nullptr) {
             continue;
@@ -133,7 +112,7 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
             LocalFree(wide);
         }
         if (Matches(name, patterns)) {
-            targets.push_back({handle, name, ThreadTib(handle)});
+            targets.push_back({handle, name});
         } else {
             CloseHandle(handle);
         }
@@ -143,19 +122,9 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
 }
 
 // Walks a suspended thread's stack from its context. Nothing here may allocate: the thread
-// could be paused holding the heap lock. A wrong unwind step (code with missing or wrong unwind
-// data) leaves a garbage stack pointer: reading through it crashed the process, so the walk
-// stops once the stack pointer leaves the thread's stack.
-unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_TIB* tib) {
-    if (tib == nullptr) {
-        return 0;
-    }
-    const auto on_stack = [tib](DWORD64 rsp) {
-        return rsp >= reinterpret_cast<DWORD64>(tib->StackLimit) &&
-               rsp + 8 <= reinterpret_cast<DWORD64>(tib->StackBase) && (rsp & 7) == 0;
-    };
-    unsigned depth = 0;
-    while (depth < MaxDepth && context.Rip != 0 && on_stack(context.Rsp)) {
+// could be paused holding the heap lock.
+void WalkUnguarded(CONTEXT& context, std::array<DWORD64, MaxDepth>& frames, unsigned& depth) {
+    while (depth < MaxDepth && context.Rip != 0) {
         frames[depth++] = context.Rip;
         DWORD64 image_base{};
         const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
@@ -174,6 +143,23 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_T
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
                          &handler_data, &establisher_frame, nullptr);
     }
+}
+
+// A guest core stopped in JIT code (or a thread in driver code) can leave the unwinder a garbage
+// return address and stack pointer: it then faulted inside ntdll on the DebugServer thread and
+// took the emulator down (the AMD tester's `sample` with threads "CPUCore_0,...,CPUCore_5",
+// access violation 0xc0000005). Keep the frames found up to the fault instead, as the sample
+// profile's walker does (nx2_sample_profile.cpp).
+unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
+    unsigned depth = 0;
+#ifdef _MSC_VER
+    __try {
+        WalkUnguarded(context, frames, depth);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+#else
+    WalkUnguarded(context, frames, depth);
+#endif
     return depth;
 }
 
@@ -181,36 +167,24 @@ struct Symbolizer {
     using SymInitializeFn = BOOL(WINAPI*)(HANDLE, PCSTR, BOOL);
     using SymSetOptionsFn = DWORD(WINAPI*)(DWORD);
     using SymFromAddrFn = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
-    using SymRefreshModuleListFn = BOOL(WINAPI*)(HANDLE);
 
     Symbolizer() {
-        // SymInitialize fails once the process is initialized, which left every report after
-        // the first without names. Initialize once and pick up modules loaded since then.
-        static const auto functions = [] {
-            std::pair<SymFromAddrFn, SymRefreshModuleListFn> result{};
-            const HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
-            if (dbghelp == nullptr) {
-                return result;
-            }
-            const auto set_options =
-                reinterpret_cast<SymSetOptionsFn>(GetProcAddress(dbghelp, "SymSetOptions"));
-            const auto initialize =
-                reinterpret_cast<SymInitializeFn>(GetProcAddress(dbghelp, "SymInitialize"));
-            const auto symbol =
-                reinterpret_cast<SymFromAddrFn>(GetProcAddress(dbghelp, "SymFromAddr"));
-            if (set_options == nullptr || initialize == nullptr || symbol == nullptr) {
-                return result;
-            }
-            set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-            if (initialize(GetCurrentProcess(), nullptr, TRUE)) {
-                result = {symbol, reinterpret_cast<SymRefreshModuleListFn>(
-                                      GetProcAddress(dbghelp, "SymRefreshModuleList"))};
-            }
-            return result;
-        }();
-        from_address = functions.first;
-        if (functions.second != nullptr) {
-            functions.second(GetCurrentProcess());
+        const HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+        if (dbghelp == nullptr) {
+            return;
+        }
+        const auto set_options =
+            reinterpret_cast<SymSetOptionsFn>(GetProcAddress(dbghelp, "SymSetOptions"));
+        const auto initialize =
+            reinterpret_cast<SymInitializeFn>(GetProcAddress(dbghelp, "SymInitialize"));
+        from_address = reinterpret_cast<SymFromAddrFn>(GetProcAddress(dbghelp, "SymFromAddr"));
+        if (set_options == nullptr || initialize == nullptr || from_address == nullptr) {
+            from_address = nullptr;
+            return;
+        }
+        set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        if (!initialize(GetCurrentProcess(), nullptr, TRUE)) {
+            from_address = nullptr;
         }
     }
 
@@ -238,6 +212,11 @@ struct Symbolizer {
             GetModuleFileNameA(module, path, sizeof(path));
             const char* base = std::strrchr(path, '\\');
             it->second = std::string{base != nullptr ? base + 1 : path} + "!?";
+        } else if (auto block = Common::JitSymbols::Lookup(reinterpret_cast<const void*>(address))) {
+            // JIT code is reused for other blocks after a cache clear: don't keep the name.
+            jit_name = std::move(*block);
+            cache.erase(it);
+            return jit_name;
         } else {
             it->second = "(jit)";
         }
@@ -246,11 +225,22 @@ struct Symbolizer {
 
     SymFromAddrFn from_address{};
     std::unordered_map<DWORD64, std::string> cache;
+    std::string jit_name;
 };
+
+// SymInitialize fails on a second call without SymCleanup, so keep one symbolizer for the
+// sampler and the lock census (DbgHelp is single-threaded: its users hold the mutex).
+std::mutex g_symbolizer_mutex;
+
+Symbolizer& SharedSymbolizer() {
+    static Symbolizer symbolizer;
+    return symbolizer;
+}
 
 std::string Report(const std::vector<Target>& targets, const std::vector<Sample>& samples,
                    const char* path) {
-    Symbolizer symbolizer;
+    const std::scoped_lock symbolizer_lock{g_symbolizer_mutex};
+    Symbolizer& symbolizer = SharedSymbolizer();
     std::string text;
     for (unsigned thread = 0; thread < targets.size(); ++thread) {
         std::map<std::string, unsigned> self;
@@ -371,18 +361,13 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
             if (GetThreadContext(handle, &context)) {
                 Sample& sample = samples.emplace_back();
                 sample.thread = i;
-                sample.depth = Walk(context, sample.frames, targets[i].tib);
+                sample.depth = Walk(context, sample.frames);
             }
             ResumeThread(handle);
         }
         Sleep(1);
     }
-    // DbgHelp is single-threaded: the debug server's `sample` and EDEN_NX2_SAMPLE can report at
-    // the same time.
-    static std::mutex report_mutex;
-    std::unique_lock report_lock{report_mutex};
     std::string text = Report(targets, samples, out.c_str());
-    report_lock.unlock();
     std::fprintf(stderr, "nx2 sampler: %zu samples written to %s\n", samples.size(), out.c_str());
     for (const auto& target : targets) {
         CloseHandle(target.handle);
@@ -394,6 +379,40 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
 
 std::string Sample(const char* names, double seconds, const std::string& out) {
     return SampleThreads(SplitNames(names), seconds, out);
+}
+
+void* OpenThreadForCapture(unsigned os_id) {
+    return OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
+                      FALSE, os_id);
+}
+
+unsigned CaptureSuspended(void* thread, unsigned long long* frames, unsigned max,
+                          bool (*still)(const void*), const void* context) {
+    if (thread == nullptr || max == 0) {
+        return 0;
+    }
+    const HANDLE handle = static_cast<HANDLE>(thread);
+    if (SuspendThread(handle) == static_cast<DWORD>(-1)) {
+        return 0;
+    }
+    unsigned depth = 0;
+    CONTEXT thread_context{};
+    thread_context.ContextFlags = CONTEXT_FULL;
+    // GetThreadContext waits for the suspension to take effect; only then is the test valid.
+    if (GetThreadContext(handle, &thread_context) && (still == nullptr || still(context))) {
+        std::array<DWORD64, MaxDepth> walked{};
+        depth = (std::min)(Walk(thread_context, walked), max);
+        for (unsigned i = 0; i < depth; ++i) {
+            frames[i] = walked[i];
+        }
+    }
+    ResumeThread(handle);
+    return depth;
+}
+
+std::string SymbolName(unsigned long long address) {
+    const std::scoped_lock symbolizer_lock{g_symbolizer_mutex};
+    return SharedSymbolizer().Name(address);
 }
 
 void StartFromEnvironment() {
@@ -414,10 +433,24 @@ void StartFromEnvironment() {
 
 #else
 
+#include <cstdio>
+
 namespace Nx2Sampler {
 void StartFromEnvironment() {}
 std::string Sample(const char*, double, const std::string&) {
     return "the sampler is Windows only";
+}
+void* OpenThreadForCapture(unsigned) {
+    return nullptr;
+}
+unsigned CaptureSuspended(void*, unsigned long long*, unsigned, bool (*)(const void*),
+                          const void*) {
+    return 0;
+}
+std::string SymbolName(unsigned long long address) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "0x%llx", address);
+    return text;
 }
 } // namespace Nx2Sampler
 

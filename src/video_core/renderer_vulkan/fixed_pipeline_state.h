@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -262,6 +261,37 @@ struct FixedPipelineState {
     u32 line_stipple_pattern;
 
     void Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features);
+
+    /// The part of Refresh a raised Dirty::Blending redoes without dynamic blend state: the
+    /// attachments. Clears the flag.
+    void RefreshBlending(Tegra::Engines::Maxwell3D& maxwell3d);
+
+    /// attachments[index] as RefreshBlending builds it from `regs` (the
+    /// ported BlendingFor).
+    [[nodiscard]] BlendingAttachment BlendingFor(const Maxwell& regs, size_t index) const;
+
+    /// Whether the attachments equal what RefreshBlending would build from `regs` (and, with
+    /// `canonical`, what CanonicalizeNative then keeps of them, against this state's colour
+    /// formats). Reads the registers, never Dirty::Blending, so a blend register written without
+    /// raising the flag is still seen. Only meaningful without dynamic blend state.
+    [[nodiscard]] bool BlendingMatches(const Maxwell& regs, bool canonical) const;
+
+    /// attribute_types as Refresh computes it with dynamic vertex input.
+    [[nodiscard]] static u64 DynamicAttributeTypes(const Maxwell& regs) noexcept;
+
+    /// attachment0_dual_source_blend as Refresh computes it.
+    [[nodiscard]] static bool DualSourceBlend(const Maxwell& regs) noexcept;
+
+    /// The topology Refresh stores in the key with extended dynamic state 1 and 2: its class's
+    /// representative (all triangle kinds are Triangles), the topology itself otherwise.
+    [[nodiscard]] static Maxwell::PrimitiveTopology KeyTopology(Maxwell::PrimitiveTopology topology,
+                                                                bool collapse_class) noexcept;
+
+    /// Native (Switch 2) pipelines: clears state that cannot change the pipeline, so draws that
+    /// differ only there share one and precompiled keys match them: attribute types of inputs the
+    /// vertex program does not read (vertex input is dynamic), blend equations and factors of
+    /// attachments without blending, and attachments past the last colour target.
+    void CanonicalizeNative(u32 generic_read_mask) noexcept;
 
     size_t Hash() const noexcept;
 

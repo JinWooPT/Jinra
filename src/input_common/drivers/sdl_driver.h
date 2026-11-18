@@ -115,7 +115,7 @@ private:
 
     /// Map of GUID of a list of corresponding virtual Joysticks
     ::Common::unordered_map<Common::UUID, std::vector<std::shared_ptr<SDLJoystick>>> joystick_map;
-    mutable std::mutex joystick_map_mutex;
+    std::mutex joystick_map_mutex;
 
     std::atomic<bool> initialized = false;
     bool start_thread;

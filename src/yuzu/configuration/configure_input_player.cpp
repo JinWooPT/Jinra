@@ -27,6 +27,7 @@
 #include "yuzu/configuration/configure_input_player_widget.h"
 #include "yuzu/configuration/configure_mouse_panning.h"
 #include "yuzu/configuration/input_profiles.h"
+#include "yuzu/fritchii/fritchii_ui.h"
 #include "yuzu/util/limitable_input_dialog.h"
 
 const std::array<std::string, ConfigureInputPlayer::ANALOG_SUB_BUTTONS_NUM>
@@ -56,10 +57,6 @@ QString GetKeyName(int key_code) {
 
 QString GetButtonName(Common::Input::ButtonNames button_name) {
     switch (button_name) {
-    case Common::Input::ButtonNames::XboxLB: return QStringLiteral("LB");
-    case Common::Input::ButtonNames::XboxLT: return QStringLiteral("LT");
-    case Common::Input::ButtonNames::XboxRB: return QStringLiteral("RB");
-    case Common::Input::ButtonNames::XboxRT: return QStringLiteral("RT");
     case Common::Input::ButtonNames::ButtonLeft:
         return QObject::tr("Left");
     case Common::Input::ButtonNames::ButtonRight:
@@ -324,6 +321,10 @@ ConfigureInputPlayer::ConfigureInputPlayer(QWidget* parent, std::size_t player_i
         emulated_controller->EnableConfiguration();
     }
     ui->setupUi(this);
+    if (FritchiiUi::Enabled()) {
+        // 60 characters made the device box push the controller preview off the page.
+        ui->comboDevices->setMinimumContentsLength(20);
+    }
 
     setFocusPolicy(Qt::ClickFocus);
 
@@ -838,19 +839,6 @@ ConfigureInputPlayer::~ConfigureInputPlayer() {
     } else {
         emulated_controller->DisableConfiguration();
     }
-}
-
-void ConfigureInputPlayer::UseHomeLayout() {
-    ui->comboDevices->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
-    ui->comboDevices->setMinimumContentsLength(14);
-    ui->comboProfiles->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
-    ui->comboProfiles->setMinimumContentsLength(10);
-    ui->main->setSpacing(12);
-    ui->top->setSpacing(8);
-    ui->bottom->layout()->removeWidget(ui->bottomMiddle);
-    ui->main->insertWidget(1, ui->bottomMiddle);
-    ui->bottom->layout()->setSpacing(10);
-    ui->controllerFrame->SetCompactLayout();
 }
 
 void ConfigureInputPlayer::ApplyConfiguration() {
@@ -1706,4 +1694,17 @@ void ConfigureInputPlayer::UpdateInputProfiles() {
 
     LOG_DEBUG(Frontend, "Setting the current input profile to index {}", profile_index);
     ui->comboProfiles->setCurrentIndex(profile_index);
+}
+
+void ConfigureInputPlayer::UseHomeLayout() {
+    ui->comboDevices->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    ui->comboDevices->setMinimumContentsLength(14);
+    ui->comboProfiles->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    ui->comboProfiles->setMinimumContentsLength(10);
+    ui->main->setSpacing(12);
+    ui->top->setSpacing(8);
+    ui->bottom->layout()->removeWidget(ui->bottomMiddle);
+    ui->main->insertWidget(1, ui->bottomMiddle);
+    ui->bottom->layout()->setSpacing(10);
+    ui->controllerFrame->setFixedHeight(220);
 }

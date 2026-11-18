@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -74,9 +73,12 @@ public:
 #ifdef _WIN32
 private:
     void TrimZeroPages(std::stop_token stop);
+    /// EDEN_NX2_MEM_OWNERS (on by default, =0 off): every 10 s, samples which guest pages are
+    /// resident and the process's heaps for the "Memory owners" log line.
+    void ProbeMemory(std::stop_token stop);
 
-    // Join before releasing the backing and guest views.
     std::jthread zero_trim_thread;
+    std::jthread memory_probe_thread;
 #endif
 };
 

@@ -1,14 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <utility>
 
 #include "common/settings.h"
 #include "core/core.h"
-#include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/service/am/am_results.h"
 #include "core/hle/service/am/applet.h"
@@ -96,7 +94,7 @@ void WindowSystem::UpdateCurrentApplicationLocked() {
     LOG_INFO(Service_AM, "Current application is now {:016X}", candidate->program_id);
 
     m_system.Kernel().SetApplicationProcess(process);
-    Settings::SetCurrentProgramID(candidate->program_id, process->GetOotSpeedScaleAddress() != 0);
+    Settings::SetCurrentProgramID(candidate->program_id);
 
     m_pending_application_notification = candidate->program_id;
 }

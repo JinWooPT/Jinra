@@ -1,160 +1,271 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include "performance_overlay.h"
-
-#include <algorithm>
-#include <cmath>
-#include <utility>
-
-#ifdef _WIN32
-#include <windows.h>
-#include <psapi.h>
-#elif defined(__linux__)
-#include <fstream>
-#include <unistd.h>
-#elif defined(__APPLE__)
-#include <mach/mach.h>
-#endif
-
-#include <QFontMetrics>
-#include <QGuiApplication>
-#include <QLocale>
-#include <QMouseEvent>
-#include <QPainter>
-#include <QPainterPath>
-#include <QWindow>
-
+#include "common/frame_budget.h"
 #include "core/perf_stats.h"
+#include "performance_overlay.h"
+#include "qt_common/config/uisettings.h"
+#include "ui_performance_overlay.h"
+#include "yuzu/render/frame_budget_view.h"
+
 #include "main_window.h"
 
-namespace {
-constexpr int Padding = 5;
-constexpr int LineSpacing = 3;
+#include <QChart>
+#include <QChartView>
+#include <QGraphicsLayout>
+#include <QLineSeries>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QValueAxis>
 
-QFont ReadingFont(QFont font, bool primary) {
-    font.setPixelSize(primary ? 23 : 17);
-    font.setWeight(primary ? QFont::Bold : QFont::DemiBold);
-    return font;
-}
-
-std::optional<u64> ProcessResidentMemory() {
-#ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS counters{};
-    counters.cb = sizeof(counters);
-    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, counters.cb)) {
-        return counters.WorkingSetSize;
-    }
-#elif defined(__linux__)
-    std::ifstream memory("/proc/self/statm");
-    u64 virtual_pages{}, resident_pages{};
-    const auto page_size = sysconf(_SC_PAGESIZE);
-    if (page_size > 0 && memory >> virtual_pages >> resident_pages) {
-        return resident_pages * static_cast<u64>(page_size);
-    }
-#elif defined(__APPLE__)
-    mach_task_basic_info_data_t info{};
-    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
-                  reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
-        return info.resident_size;
-    }
-#endif
-    return std::nullopt;
-}
-} // namespace
-
+// TODO: Reset samples when user changes turbo, slow, etc.
 PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
-    : QWidget(parent, Qt::FramelessWindowHint | Qt::Tool), main_window(parent) {
+    : QWidget(parent), m_mainWindow{parent}, ui(new Ui::PerformanceOverlay) {
+    ui->setupUi(this);
+
     setAttribute(Qt::WA_TranslucentBackground);
-    setAttribute(Qt::WA_ShowWithoutActivating);
-    setReadings({tr("— FPS"), tr("— ms"), tr("RAM —"), tr("VRAM —"), {}});
-    resetPosition();
+    setWindowFlags(Qt::FramelessWindowHint | Qt::Tool);
+    raise();
+
+    // chart setup
+    m_fpsSeries = new QLineSeries(this);
+
+    QPen pen(Qt::red);
+    pen.setWidth(2);
+    m_fpsSeries->setPen(pen);
+
+    m_fpsChart = new QChart;
+    m_fpsChart->addSeries(m_fpsSeries);
+    m_fpsChart->legend()->hide();
+    m_fpsChart->setBackgroundBrush(Qt::black);
+    m_fpsChart->setBackgroundVisible(true);
+    m_fpsChart->layout()->setContentsMargins(2, 2, 2, 2);
+    m_fpsChart->setMargins(QMargins{4, 4, 4, 4});
+
+    // axes
+    m_fpsX = new QValueAxis(this);
+    m_fpsX->setRange(0, NUM_FPS_SAMPLES);
+    m_fpsX->setVisible(false);
+
+    m_fpsY = new QValueAxis(this);
+    m_fpsY->setRange(0, 60);
+    m_fpsY->setLabelFormat(QStringLiteral("%d"));
+    m_fpsY->setLabelsColor(Qt::white);
+
+    QFont axisFont = m_fpsY->labelsFont();
+    axisFont.setPixelSize(10);
+    m_fpsY->setLabelsFont(axisFont);
+    m_fpsY->setTickCount(3);
+
+    // gray-ish label w/ white lines
+    m_fpsY->setLabelsVisible(true);
+    m_fpsY->setGridLineColor(QColor(50, 50, 50));
+    m_fpsY->setLinePenColor(Qt::white);
+
+    m_fpsChart->addAxis(m_fpsX, Qt::AlignBottom);
+    m_fpsChart->addAxis(m_fpsY, Qt::AlignLeft);
+    m_fpsSeries->attachAxis(m_fpsX);
+    m_fpsSeries->attachAxis(m_fpsY);
+
+    // chart view
+    m_fpsChartView = new QChartView(m_fpsChart, this);
+    m_fpsChartView->setRenderHint(QPainter::Antialiasing);
+    m_fpsChartView->setMinimumHeight(100);
+
+    ui->verticalLayout->addWidget(m_fpsChartView, 1);
+
+    // thanks Debian.
+    QFont font = ui->fps->font();
+    font.setWeight(QFont::DemiBold);
+
+    ui->fps->setFont(font);
+    ui->frametime->setFont(font);
+
+    m_dlssLabel = new QLabel(this);
+    m_dlssLabel->setFont(font);
+    m_dlssLabel->setStyleSheet(QStringLiteral("color: white;"));
+    m_dlssLabel->setVisible(false);
+    ui->verticalLayout->insertWidget(0, m_dlssLabel);
+
+    // frame times, under the fps line
+    m_timesLabel = new QLabel(this);
+    m_timesLabel->setFont(font);
+    m_timesLabel->setStyleSheet(QStringLiteral("color: white;"));
+    ui->verticalLayout->insertWidget(ui->verticalLayout->indexOf(m_fpsChartView), m_timesLabel);
+    applyTimes();
+
+    // pos/stats
+    resetPosition(m_mainWindow->pos());
     connect(parent, &MainWindow::positionChanged, this, &PerformanceOverlay::resetPosition);
+    connect(m_mainWindow, &MainWindow::statsUpdated, this, &PerformanceOverlay::updateStats);
 }
 
-void PerformanceOverlay::resetPosition() {
-    move(main_window->pos() + offset);
+PerformanceOverlay::~PerformanceOverlay() {
+    Common::FrameBudget::SetWanted(false);
+    delete ui;
 }
 
-void PerformanceOverlay::UpdateStats(const Core::PerfStatsResults& results, int shaders_building,
-                                     std::optional<VideoCore::VideoMemoryUsage> video_memory) {
-    const QLocale locale;
-    const auto format_bytes = [&locale](u64 bytes) {
-        return locale.formattedDataSize(static_cast<qint64>(bytes), 1, QLocale::DataSizeIecFormat);
-    };
-    const auto ram = ProcessResidentMemory();
-    QString vram = tr("VRAM —");
-    if (video_memory) {
-        const auto size = format_bytes(video_memory->bytes);
-        vram = video_memory->shared ? tr("GPU memory (shared) %1").arg(size)
-                                    : tr("VRAM %1").arg(size);
+void PerformanceOverlay::applyTimes() {
+    m_timesOn = UISettings::values.perf_overlay_times.GetValue();
+    m_timesLabel->setText(QStringLiteral("-"));
+    m_timesLabel->setVisible(m_timesOn);
+    adjustSize();
+    Common::FrameBudget::Reset();
+    Common::FrameBudget::SetWanted(m_timesOn && isVisible());
+}
+
+void PerformanceOverlay::showEvent(QShowEvent* event) {
+    QWidget::showEvent(event);
+    Common::FrameBudget::Reset();
+    Common::FrameBudget::SetWanted(m_timesOn);
+}
+
+void PerformanceOverlay::hideEvent(QHideEvent* event) {
+    QWidget::hideEvent(event);
+    Common::FrameBudget::SetWanted(false);
+}
+
+void PerformanceOverlay::resetPosition(const QPoint& _) {
+    auto pos = m_mainWindow->pos();
+    move(pos.x() + m_offset.x(), pos.y() + m_offset.y());
+}
+
+void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
+                                     const VideoCore::ShaderNotify& shaders) {
+    m_dlssLabel->setText(m_mainWindow->DlssStatusText());
+    m_dlssLabel->setVisible(!m_mainWindow->DlssStatusText().isEmpty());
+    if (UISettings::values.perf_overlay_times.GetValue() != m_timesOn) {
+        applyTimes();
+    } else if (m_timesOn && isVisible()) {
+        using Common::FrameBudget::Group;
+        using FrameBudgetView::Ms;
+        using FrameBudgetView::Percent;
+        const auto view =
+            FrameBudgetView::Make(Common::FrameBudget::Take(), results.average_game_fps);
+        const auto ms_of = [&](Group group) { return Ms(view.ms[static_cast<size_t>(group)]); };
+        const QString gpu = view.gpu_unsupported
+                                ? tr("GPU n/a")
+                                : tr("GPU %1 ms (%2)").arg(Ms(view.gpu_ms), Percent(view.gpu_share));
+        QString threads = tr("Front %1  Back %2  Game %3")
+                              .arg(ms_of(Group::Front), ms_of(Group::Back), ms_of(Group::Game));
+        if (view.ms[static_cast<size_t>(Group::Render)] >= 0) {
+            threads += tr("  Render %1").arg(ms_of(Group::Render));
+        }
+        QString text = tr("%1  CPU %2").arg(gpu, Percent(view.cpu_share)) + QLatin1Char('\n') +
+                       threads + tr(" ms");
+        const QString limit = FrameBudgetView::LimitText(view.limit);
+        if (!limit.isEmpty()) {
+            text += QLatin1Char('\n') + limit;
+        }
+        m_timesLabel->setText(text);
     }
-    setReadings({
-        std::isfinite(results.average_game_fps)
-            ? tr("%1 FPS").arg(locale.toString(results.average_game_fps, 'f', 0))
-            : tr("— FPS"),
-        std::isfinite(results.frametime)
-            ? tr("%1 ms").arg(locale.toString(results.frametime * 1000.0, 'f', 2))
-            : tr("— ms"),
-        ram ? tr("RAM %1").arg(format_bytes(*ram)) : tr("RAM —"),
-        std::move(vram),
-        shaders_building > 0 ? tr("Shaders building: %1").arg(locale.toString(shaders_building))
-                             : QString{},
-    });
+    auto fps = results.average_game_fps;
+    if (!std::isnan(fps)) {
+        // don't sample measurements < 3 fps because they are probably outliers or freezes
+        static constexpr double FPS_SAMPLE_THRESHOLD = 3.0;
+
+        QString fpsText = tr("%1 fps").arg(std::round(fps), 0, 'f', 0);
+        // if (!m_fpsSuffix.isEmpty()) fpsText = fpsText % QStringLiteral(" (%1)").arg(m_fpsSuffix);
+        ui->fps->setText(fpsText);
+
+        // sampling
+        if (fps > FPS_SAMPLE_THRESHOLD) {
+            m_fpsSamples.push_back(fps);
+            m_fpsPoints.push_back(QPointF{m_xPos++, fps});
+        }
+
+        if (m_fpsSamples.size() > NUM_FPS_SAMPLES) {
+            m_fpsSamples.pop_front();
+            m_fpsPoints.pop_front();
+        }
+
+        // For the average only go back 10 samples max
+        if (m_fpsSamples.size() >= 2) {
+            const int back_search = std::min(size_t(10), m_fpsSamples.size() - 1);
+            double sum = std::accumulate(m_fpsSamples.end() - back_search, m_fpsSamples.end(), 0.0);
+            double avg = sum / back_search;
+
+            ui->fps_avg->setText(tr("Avg: %1").arg(avg, 0, 'f', 0));
+        }
+
+        // chart it :)
+        if (!m_fpsPoints.empty()) {
+            auto [min_it, max_it] = std::minmax_element(m_fpsSamples.begin(), m_fpsSamples.end());
+            double min_fps = *min_it;
+            double max_fps = *max_it;
+
+            ui->fps_min->setText(tr("Min: %1").arg(min_fps, 0, 'f', 0));
+            ui->fps_max->setText(tr("Max: %1").arg(max_fps, 0, 'f', 0));
+
+            m_fpsSeries->replace(QList<QPointF>(m_fpsPoints.begin(), m_fpsPoints.end()));
+
+            qreal x_min = std::max(0.0, m_xPos - NUM_FPS_SAMPLES);
+            qreal x_max = std::max(qreal(10), m_xPos);
+            m_fpsX->setRange(x_min, x_max);
+            m_fpsY->setRange(0.0, max_fps);
+        }
+    }
+
+    auto ft = results.frametime;
+    if (!std::isnan(ft)) {
+        // don't sample measurements > 500 ms because they are probably outliers
+        static constexpr double FT_SAMPLE_THRESHOLD = 500.0;
+
+        double ft_ms = results.frametime * 1000.0;
+        ui->frametime->setText(tr("%1 ms").arg(ft_ms, 0, 'f', 2));
+
+        // sampling
+        if (ft_ms <= FT_SAMPLE_THRESHOLD)
+            m_frametimeSamples.push_back(ft_ms);
+
+        if (m_frametimeSamples.size() > NUM_FRAMETIME_SAMPLES)
+            m_frametimeSamples.pop_front();
+
+        if (!m_frametimeSamples.empty()) {
+            auto [min_it, max_it] =
+                std::minmax_element(m_frametimeSamples.begin(), m_frametimeSamples.end());
+            ui->ft_min->setText(tr("Min: %1").arg(*min_it, 0, 'f', 1));
+            ui->ft_max->setText(tr("Max: %1").arg(*max_it, 0, 'f', 1));
+        }
+
+        // For the average only go back 10 samples max
+        if (m_frametimeSamples.size() >= 2) {
+            const int back_search = std::min(size_t(10), m_frametimeSamples.size() - 1);
+            double sum = std::accumulate(m_frametimeSamples.end() - back_search,
+                                         m_frametimeSamples.end(), 0.0);
+            double avg = sum / back_search;
+
+            ui->ft_avg->setText(tr("Avg: %1").arg(avg, 0, 'f', 1));
+        }
+    }
 }
 
-void PerformanceOverlay::setReadings(std::array<QString, 5> next) {
-    if (readings == next) {
-        return;
-    }
-    readings = std::move(next);
-    int width = 0;
-    int height = 2 * Padding;
-    for (std::size_t i = 0; i < readings.size() && !readings[i].isEmpty(); ++i) {
-        const QFontMetrics metrics(ReadingFont(font(), i == 0));
-        width = std::max(width, metrics.horizontalAdvance(readings[i]));
-        height += metrics.height() + LineSpacing;
-    }
-    setFixedSize(width + 2 * Padding, height - LineSpacing);
-    update();
-}
-
-void PerformanceOverlay::paintEvent(QPaintEvent*) {
+void PerformanceOverlay::paintEvent(QPaintEvent* event) {
     QPainter painter(this);
+
     painter.setRenderHint(QPainter::Antialiasing);
-    const QPen outline(QColor(4, 9, 17, 245), 3.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-    int y = Padding;
-    for (std::size_t i = 0; i < readings.size() && !readings[i].isEmpty(); ++i) {
-        const auto reading_font = ReadingFont(font(), i == 0);
-        const QFontMetrics metrics(reading_font);
-        QPainterPath text;
-        text.addText(Padding, y + metrics.ascent(), reading_font, readings[i]);
-        painter.strokePath(text, outline);
-        painter.fillPath(text, i == 4 ? QColor("#71e5f2") : QColor("#f5faff"));
-        y += metrics.height() + LineSpacing;
-    }
+
+    painter.setBrush(m_background);
+    painter.setPen(Qt::NoPen);
+
+    painter.drawRoundedRect(rect(), 10.0, 10.0);
 }
 
 void PerformanceOverlay::mousePressEvent(QMouseEvent* event) {
-    if (event->button() != Qt::LeftButton) {
-        return;
+    if (event->button() == Qt::LeftButton) {
+        m_drag_start_pos = event->pos();
     }
-    if (QGuiApplication::platformName().startsWith(QStringLiteral("wayland")) && windowHandle() &&
-        windowHandle()->startSystemMove()) {
-        return;
-    }
-    drag_start = event->pos();
 }
 
 void PerformanceOverlay::mouseMoveEvent(QMouseEvent* event) {
+    // drag
     if (event->buttons() & Qt::LeftButton) {
-        const auto position = event->globalPosition().toPoint() - drag_start;
-        offset = position - main_window->pos();
-        move(position);
+        QPoint new_global_pos = event->globalPosition().toPoint() - m_drag_start_pos;
+        m_offset = new_global_pos - m_mainWindow->pos();
+        move(new_global_pos);
     }
 }
 
-void PerformanceOverlay::closeEvent(QCloseEvent*) {
+void PerformanceOverlay::closeEvent(QCloseEvent* event) {
     emit closed();
 }

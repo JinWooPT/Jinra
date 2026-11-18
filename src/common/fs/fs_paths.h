@@ -1,14 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 // yuzu data directories
 
-#define EDEN_DIR "eden"
+// Fritchii keeps its own profile (v5.8, the owner's call): imported from eden (Eden, Lichii
+// before build 150, earlier Fritchii) or lichii (Lichii 150+) on the first launch.
+#define EDEN_DIR "jinra"
+#define EDEN_LEGACY_DIR "eden"
+#define LICHII_DIR "lichii"
 #define PORTABLE_DIR "user"
 
 // Sub-directories contained within a yuzu data directory
@@ -20,7 +23,6 @@
 #define KEYS_DIR "keys"
 #define LOAD_DIR "load"
 #define LOG_DIR "log"
-#define LOSSLESS_DIR "lossless"
 #define NAND_DIR "nand"
 #define PLAY_TIME_DIR "play_time"
 #define POST_PRESET_DIR "post_presets"
@@ -29,6 +31,7 @@
 #define SDMC_DIR "sdmc"
 #define SHADER_DIR "shader"
 #define STREAMLINE_DIR "streamline"
+#define FIDELITYFX_DIR "fidelityfx"
 #define TAS_DIR "tas"
 #define ICONS_DIR "icons"
 
@@ -40,9 +43,4 @@
 #define RYUJINX_DIR "Ryujinx"
 
 // yuzu-specific files
-#define LOG_FILE "jinra_log.txt"
-#define LOG_PREVIOUS_FILE "jinra_log.old.txt"
-#define LEGACY_LOG_FILE "eden_log.txt"
-#define LEGACY_LOG_PREVIOUS_FILE "eden_log.txt.old.txt"
-#define LOSSLESS_DLL_FILE "Lossless.dll"
-#define LOSSLESS_CACHE_FILE "lsfg_spirv.cache"
+#define LOG_FILE "eden_log.txt"

@@ -36,7 +36,7 @@ constexpr std::size_t RandomSize = 160 * 1024 + 77;
 
 FileSys::VirtualFile OpenFixture(std::string_view name) {
     static const auto filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
-    return filesystem->OpenFile(std::string(JINRA_NX_FIXTURE_DIR) + "/" + std::string(name),
+    return filesystem->OpenFile(std::string(LICHII_NX_FIXTURE_DIR) + "/" + std::string(name),
                                 FileSys::OpenMode::Read);
 }
 
@@ -101,7 +101,7 @@ constexpr std::string_view InvalidFixtures[] = {
 } // Anonymous namespace
 
 TEST_CASE("NX: archives are identified by either header slot", "[core][nx]") {
-    CHECK(Loader::IdentifyFile(OpenFixture("synthetic_game.nx")) == Loader::FileType::NX);
+    CHECK(Loader::IdentifyFile(OpenFixture("lichii_synthetic.nx")) == Loader::FileType::NX);
     CHECK(Loader::AppLoader_NX::IdentifyType(OpenFixture("lost_header_page_0.nx")) ==
           Loader::FileType::NX);
     CHECK(Loader::GuessFromFilename("Game.NX") == Loader::FileType::NX);
@@ -110,7 +110,7 @@ TEST_CASE("NX: archives are identified by either header slot", "[core][nx]") {
 }
 
 TEST_CASE("NX: catalog-only queries", "[core][nx]") {
-    const auto file = OpenFixture("synthetic_game.nx");
+    const auto file = OpenFixture("lichii_synthetic.nx");
     CHECK(Loader::AppLoader_NX::IsBootable(file));
     CHECK(Loader::IsBootableGameContainer(file, Loader::FileType::NX));
     CHECK(Loader::AppLoader_NX::ReadPlatform(file, 0) == 2);
@@ -125,7 +125,7 @@ TEST_CASE("NX: catalog-only queries", "[core][nx]") {
 TEST_CASE("NX: tree snapshot loads the newest update", "[core][nx]") {
     ScopedSystemTestContext environment;
     Core::System system;
-    Loader::AppLoader_NX loader{system, OpenFixture("synthetic_game.nx")};
+    Loader::AppLoader_NX loader{system, OpenFixture("lichii_synthetic.nx")};
     u64 program_id{};
     REQUIRE(loader.ReadProgramId(program_id) == Loader::ResultStatus::Success);
     CHECK(program_id == ApplicationId);
@@ -153,7 +153,7 @@ TEST_CASE("NX: reads span blocks, codecs and the reader's read limit", "[core][n
     ScopedSystemTestContext environment;
     Core::System system;
     // Through the VFS (no host path) and through the pinned host file.
-    const auto real = OpenFixture("synthetic_game.nx");
+    const auto real = OpenFixture("lichii_synthetic.nx");
     for (const auto& file :
          {real, FileSys::VirtualFile{std::make_shared<FileSys::VectorVfsFile>(real->ReadAllBytes())}}) {
         Loader::AppLoader_NX loader{system, file};
@@ -285,7 +285,7 @@ TEST_CASE("NX: an extracted add-on is listed as add-on content after Load", "[co
     SCOPE_EXIT {
         kernel.UnregisterKernelObject(&process);
     };
-    Loader::AppLoader_NX loader{system, OpenFixture("synthetic_game.nx")};
+    Loader::AppLoader_NX loader{system, OpenFixture("lichii_synthetic.nx")};
     REQUIRE(loader.Load(process, system).first == Loader::ResultStatus::Success);
 
     // As the AoC service lists add-ons and the FS service opens their data.

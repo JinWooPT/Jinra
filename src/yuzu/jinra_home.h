@@ -21,6 +21,7 @@ class QStackedWidget;
 class QTimer;
 class QToolButton;
 class JinraControllerView;
+class JinraHomeLibrary;
 class JinraHomeSettings;
 class ConfigurationPages;
 namespace InputCommon {
@@ -35,6 +36,7 @@ public:
     void ReloadSettings();
     void SetEmulating(bool running);
     bool IsHomeChromeActive() const;
+    bool IsShowingSettings() const;
     void ShowSettings(std::unique_ptr<ConfigurationPages> settings, int category,
                       std::function<void(bool)> finished);
 
@@ -50,6 +52,7 @@ signals:
 
 protected:
     void changeEvent(QEvent* event) override;
+    bool eventFilter(QObject* object, QEvent* event) override;
 
 private:
     QWidget* CreateLibrary(QWidget* empty_library);
@@ -69,6 +72,7 @@ private:
     GameList* games;
     InputCommon::InputSubsystem* input;
     QStackedWidget* pages{};
+    JinraHomeLibrary* library_page{};
     JinraHomeSettings* home_settings{};
     QWidget* sidebar{};
     QWidget* desktop_header{};
@@ -91,6 +95,8 @@ private:
     QToolButton* home_save_data{};
     QToolButton* home_game_settings{};
     QToolButton* home_profile{};
+    QList<QAbstractButton*> home_dock_buttons;
+    QList<QAbstractButton*> home_action_buttons;
     std::array<QPushButton*, 4> navigation{};
     std::array<QLabel*, 4> headings{};
     QLabel* detail_image{};

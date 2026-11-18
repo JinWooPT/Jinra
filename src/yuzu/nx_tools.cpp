@@ -818,7 +818,7 @@ void NxTools::EditNxMetadata(const std::string& archive_path,
     }
     if (!new_icon.isEmpty()) {
         job->icon_file = std::make_unique<QTemporaryFile>(
-            QDir::tempPath() + QStringLiteral("/jinra-icon-XXXXXX"));
+            QDir::tempPath() + QStringLiteral("/lichii-icon-XXXXXX"));
         if (!job->icon_file->open() || job->icon_file->write(new_icon) != new_icon.size() ||
             !job->icon_file->flush()) {
             QMessageBox::warning(parent_widget, title, tr("The icon cannot be saved."));
@@ -966,7 +966,8 @@ void NxTools::ReplyOriginal(Job& job, const QString& text) {
     QMessageBox box(QMessageBox::Information, job.title, text, QMessageBox::Ok, parent_widget);
     auto* remove = new QCheckBox(label, &box);
     box.setCheckBox(remove);
-    if (box.exec() == QMessageBox::Ok && remove->isChecked()) {
+    box.exec();
+    if (remove->isChecked()) {
         // nxformat has returned; close what it read before moving the originals.
         job.ReleaseSources();
         // The game list's content provider keeps every package it scanned open, for updates and

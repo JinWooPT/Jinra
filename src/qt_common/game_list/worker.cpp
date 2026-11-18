@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -457,8 +456,7 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                        (file_type == Loader::FileType::XCI ||
                         file_type == Loader::FileType::XCZ ||
                         file_type == Loader::FileType::NSP ||
-                        file_type == Loader::FileType::NSZ ||
-                        file_type == Loader::FileType::NUP)) {
+                        file_type == Loader::FileType::NSZ)) {
                 void(provider->AddEntriesFromContainer(file));
             }
         } else {

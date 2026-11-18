@@ -984,7 +984,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 multiplier = insn.words[1];
             if (insn.Bits(64, 8) == 255 && !negate_c && multiplier > 1 && !(multiplier & (multiplier - 1)) &&
                 (insn.words[2] & ~0x2ffU) == 0x078e0000) {
-                // IMAD.SHL by a power of two: one shift (also the form Eden's jump-table tracking
+                // IMAD.SHL by a power of two: one shift (also the form the emulator's jump-table tracking
                 // expects between the clamp and the table load).
                 u32 shift = 0;
                 while ((1U << shift) != multiplier) ++shift;
@@ -1198,7 +1198,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0xb82: { // LDC indexed byte offset; bits 78-79 the mode as Maxwell's (2 = IS)
             // .IS: Ra + offset addresses all constant buffers as one space, the buffer in its high
-            // half (Kirby Air Riders' vertex shaders), which Eden's Maxwell LDC implements.
+            // half (Kirby Air Riders' vertex shaders), which the emulator's Maxwell LDC implements.
             const u32 width = insn.Bits(73, 3), mode = insn.Bits(78, 2);
             if (width > 5 || (mode != 0 && mode != 2) ||
                 (insn.words[2] & ~0xce00U) || (insn.words[1] & 0xf800003fU) ||
@@ -1389,7 +1389,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             restore_predicate(1U << scratch);
             break;
         }
-        case 0x80d: { // CSMTEST: a test of shading-mode state Eden does not model, taken as false.
+        case 0x80d: { // CSMTEST: a test of shading-mode state the emulator does not model, taken as false.
             // Kirby Air Riders' vertex-side shaders run "CSMTEST.A.FCSM_TR P0" then "@P0 EXIT":
             // never leave early. Outputs of PT discard the result.
             const u32 first = insn.Bits(81, 3), second = insn.Bits(84, 3);
@@ -2152,8 +2152,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const bool half = signed_half || (opcode == 0x305 && (mode & ~0x100U) == 0x0010f000);
             const bool small = (mode & ~0xc000U) == 0x00212800;
             const bool short_trunc = opcode == 0x305 && (mode & ~0x100U) == 0x0021e800;
-            const bool absolute = opcode == 0x305 && !half && insn.Bits(62, 1);
-            const bool negate = opcode == 0x305 && !half && insn.Bits(63, 1);
+            const bool absolute = opcode != 0xd05 && !half && insn.Bits(62, 1);
+            const bool negate = opcode != 0xd05 && !half && insn.Bits(63, 1);
             const bool byte = (mode & ~0x10100U) == 0x0020e000;
             const bool word = (mode & ~0x1c100U) == 0x00203000;
             const bool extended_word =
@@ -2162,9 +2162,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (signed_half && (insn.Bits(24, 8) || (insn.words[3] & 0xc00001ffU))) ||
                 ((byte || small || short_trunc || extended_word) &&
                  (insn.Bits(24, 8) || (insn.words[3] & 0xc00001ffU) ||
-                  (opcode == 0xb05 &&
-                   (insn.Bits(63, 1) || (!small && insn.Bits(62, 1)) ||
-                    (small && insn.Bits(59, 3)))) ||
+                  (opcode == 0xb05 && small && insn.Bits(59, 3)) ||
                   insn.Bits(91, 1) != static_cast<u32>(opcode == 0xd05))) ||
                 (opcode != 0xb05 && (insn.words[1] & ~(half ? 0x100000ffU :
                     0xffU | (absolute ? 0x40000000U : 0U) | (negate ? 0x80000000U : 0U)))) ||
@@ -2172,13 +2170,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 return fail(index, "native float-to-integer conversion mode");
             }
             const bool is_signed = insn.Bits(72, 1);
-            u32 source = opcode == 0xb05 ? materialize(2, 0, 252, small && insn.Bits(62, 1), false)
+            u32 source = opcode == 0xb05 ? materialize(2, 0, 252, absolute, negate)
                        : opcode == 0xd05 ? uniform_register(insn.Bits(32, 8)) : insn.Bits(32, 8);
             if (half) {
                 extract_half({source, insn.Bits(60, 1) ? 3U : 2U, false, false}, 0, 252);
                 source = 252;
             }
-            if (absolute || negate) source = materialize(0, source, 249, absolute, negate);
+            if (opcode == 0x305 && (absolute || negate))
+                source = materialize(0, source, 249, absolute, negate);
             if (signed_half) {
                 mov_imm(253, 0x47800000);
                 emit(0x5800000000000000ULL | predicate | 250 | (u64{252} << 8) |
@@ -3117,7 +3116,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 insn.Bits(80, 12) != (opcode == 0xd08 ? 0x800U : 0U))
                 return fail(index, "native MUFU mode");
             // SM70+ MUFU.COS/SIN take the angle in turns (compilers multiply by 1/2pi first);
-            // Eden's Maxwell MUFU takes radians (its RRO is a plain move), so scale by 2pi.
+            // The emulator's Maxwell MUFU takes radians (its RRO is a plain move), so scale by 2pi.
             const bool turns = operation == 0 || operation == 1;
             const auto to_radians = [&](u32 source) {
                 emit(0x1e00000000000000ULL | predicate | 250 | (u64{source} << 8) |
@@ -3832,15 +3831,15 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x945: case 0x941: case 0x942: case 0x948: // (+ WARPSYNC)
             // BSSY / BSYNC / BREAK only manage warp reconvergence: BSYNC waits for the other
-            // threads and falls through, BREAK drops the thread from that wait. Eden runs threads
+            // threads and falls through, BREAK drops the thread from that wait. The emulator runs threads
             // independently, so all three are no-ops (a SYNC would wrongly jump, and a branch
-            // out of a lowered SSY region would leave its token on Eden's flow stack).
+            // out of a lowered SSY region would leave its token on the emulator's flow stack).
             break;
         case 0x947: { // BRA
             // The offset's two low bits: .DIV (2) branches when the warp has diverged, .CONV (3)
             // when its active threads are the mask in the uniform register at 24-31 (bit 91;
             // URZ without it). The compiler puts warp-synchronous fast paths behind them (shuffles
-            // on a converged warp; the other path calls a WARPSYNC helper). Eden runs the warp's
+            // on a converged warp; the other path calls a WARPSYNC helper). The emulator runs the warp's
             // threads converged there: .CONV always branches and .DIV never does.
             const u32 mode = insn.Bits(32, 2);
             if ((mode <= 1 && insn.Bits(91, 1)) ||
@@ -3955,7 +3954,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 [&](const Relocation& relocation) { return !relocation.call && relocation.target > index; });
             if (!main_exited && pending_main_branch) break;
             if (main_exited) {
-                // A library function may end the shader instead of returning (Eden inlines
+                // A library function may end the shader instead of returning (the emulator inlines
                 // calls, so this is an ordinary exit at that point).
                 bool complete = std::none_of(relocations.begin(), relocations.end(),
                     [&](const Relocation& relocation) { return relocation.target > index; });
@@ -4004,6 +4003,12 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
     u32 high_uniforms = 0;
     for (;;) {
         LoweredProgram lowered = LowerToMaxwellWith(code, high_uniforms, options);
+        // Shadowing borrows aligned quartets below the mirrors: their base must be 4-aligned.
+        if (!lowered && lowered.error == "native program uses lowering scratch registers" &&
+            (high_uniforms & 3) != 0) {
+            high_uniforms = (high_uniforms + 3) & ~3U;
+            continue;
+        }
         if (lowered || lowered.high_uniform_registers <= high_uniforms) return lowered;
         high_uniforms = lowered.high_uniform_registers;
     }

@@ -38,13 +38,13 @@ public:
 
     explicit EmissionBudget(size_t capacity_) : capacity{capacity_} {}
 
-    std::unique_ptr<Reservation> TryAcquire(bool native) {
+    std::unique_ptr<Reservation> TryAcquire(bool enabled, bool native) {
         size_t count = pending->load(std::memory_order_relaxed);
-        if (!DefersShaderEmission(native, count, capacity)) {
+        if (!DefersShaderEmission(enabled, native, count, capacity)) {
             return nullptr;
         }
         auto reservation = std::unique_ptr<Reservation>{new Reservation};
-        while (DefersShaderEmission(native, count, capacity)) {
+        while (DefersShaderEmission(enabled, native, count, capacity)) {
             if (pending->compare_exchange_weak(count, count + 1, std::memory_order_relaxed)) {
                 reservation->pending = pending;
                 return reservation;
@@ -96,9 +96,9 @@ class PipelineBuild {
 
 public:
     PipelineBuild(Common::ThreadWorker* workers, std::function<void()> task)
-        : state{std::make_shared<State>(std::move(task))}, worker{workers} {
+        : state{std::make_shared<State>(std::move(task))} {
         if (workers) {
-            ticket = workers->QueueWork([state = state] { state->Run(); });
+            workers->QueueWork([state = state] { state->Run(); });
         } else {
             state->Run();
         }
@@ -116,12 +116,6 @@ public:
         return IsBuilt() && state->failed;
     }
 
-    bool Prioritize() {
-        const auto pending = ticket.exchange(0, std::memory_order_relaxed);
-        return pending != 0 && !state->claimed.load(std::memory_order_relaxed) &&
-               worker->PrioritizeWork(pending);
-    }
-
     void Wait(bool may_build = false) const {
         const auto shared = state;
         if (may_build) {
@@ -132,15 +126,13 @@ public:
                                [&] { return shared->complete.load(std::memory_order_acquire); });
     }
 
-    /// Waits up to `timeout` for the build, without running it on this thread. The worker sets
-    /// `complete` under the mutex before notifying, so the wakeup cannot be lost.
-    /// @return True when the pipeline is built.
-    bool WaitFor(std::chrono::microseconds timeout) const {
+    /// Waits at most `timeout` for the build, never running it on this thread (one build can
+    /// take seconds). True once built.
+    bool WaitFor(std::chrono::nanoseconds timeout) const {
         const auto shared = state;
         std::unique_lock lock{shared->mutex};
-        return shared->condition.wait_for(lock, timeout, [&] {
-            return shared->complete.load(std::memory_order_acquire);
-        });
+        return shared->condition.wait_for(
+            lock, timeout, [&] { return shared->complete.load(std::memory_order_acquire); });
     }
 
     PipelineBuild(const PipelineBuild&) = delete;
@@ -148,8 +140,6 @@ public:
 
 private:
     std::shared_ptr<State> state;
-    Common::ThreadWorker* worker;
-    std::atomic<size_t> ticket{};
 };
 
 } // namespace Vulkan

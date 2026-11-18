@@ -56,14 +56,15 @@ void GameCarousel::ApplyFilter(const QString& edit_filter_text, GameListModel* m
 
 void GameCarousel::UpdateIconSize() {
     if (home_mode) {
-        const int height = viewport()->height();
-        const int cover = std::clamp(std::min(viewport()->width() / 6, height - 105), 100, 340);
-        const int caption = std::clamp(cover / 3, 62, 102);
-        const QSize card(cover, cover + caption);
-        const QSize cell(cover + 42, std::max(height, card.height() + 12));
-        m_gameCard->setSize(cell, card, 0, 0);
-        setGridSize(cell);
-        viewport()->update();
+        const int width = viewport()->width();
+        const int height = std::clamp(viewport()->height() - 10, 80, 296);
+        const int cover_width = std::max(75, std::min(width / 8, height * 4 / 5));
+        const int banner_width = std::max(height, std::min(width * 7 / 20, height * 11 / 5));
+        m_gameCard->SetHomeSize(height, cover_width, banner_width);
+        doItemsLayout();
+        if (currentIndex().isValid()) {
+            scrollTo(currentIndex());
+        }
         return;
     }
     const u32 icon_size = UISettings::values.game_icon_size.GetValue();
@@ -116,6 +117,16 @@ void GameCarousel::SetHomeMode(bool enabled) {
     home_mode = enabled;
     m_gameCard->SetHomeMode(enabled);
     setObjectName(enabled ? QStringLiteral("JinraHomeCarousel") : QString{});
+    viewport()->setObjectName(enabled ? QStringLiteral("JinraHomeCarouselViewport") : QString{});
+    setUniformItemSizes(!enabled);
+    setSpacing(enabled ? 0 : 10);
+    if (enabled) {
+        setGridSize({});
+        setMinimumHeight(95);
+    } else {
+        setMinimumHeight(0);
+    }
+    m_gameCard->SetHomeBanner(enabled ? GameCard::LoadHomeArtwork(currentIndex(), true) : QPixmap{});
     setFrameShape(enabled ? QFrame::NoFrame : QFrame::StyledPanel);
     setHorizontalScrollBarPolicy(enabled ? Qt::ScrollBarAlwaysOff : Qt::ScrollBarAsNeeded);
     UpdateIconSize();
@@ -126,6 +137,36 @@ void GameCarousel::resizeEvent(QResizeEvent* event) {
     QListView::resizeEvent(event);
     if (home_mode)
         UpdateIconSize();
+}
+
+void GameCarousel::currentChanged(const QModelIndex& current, const QModelIndex& previous) {
+    QListView::currentChanged(current, previous);
+    if (home_mode) {
+        m_gameCard->SetHomeBanner(GameCard::LoadHomeArtwork(current, true));
+        doItemsLayout();
+        if (current.isValid()) {
+            scrollTo(current);
+        }
+    }
+}
+
+QModelIndex GameCarousel::moveCursor(CursorAction action, Qt::KeyboardModifiers modifiers) {
+    const auto current = currentIndex();
+    if (home_mode && current.isValid() && (action == MoveLeft || action == MoveRight)) {
+        const int step = (action == MoveRight) != isRightToLeft() ? 1 : -1;
+        const int count = model()->rowCount(rootIndex());
+        for (int row = current.row() + step; row >= 0 && row < count; row += step) {
+            if (!isRowHidden(row)) {
+                const auto next = model()->index(row, current.column(), rootIndex());
+                if (next.flags().testFlag(Qt::ItemIsEnabled) &&
+                    next.flags().testFlag(Qt::ItemIsSelectable)) {
+                    return next;
+                }
+            }
+        }
+        return current;
+    }
+    return QListView::moveCursor(action, modifiers);
 }
 
 QModelIndex GameCarousel::indexAt(const QPoint& point) const {

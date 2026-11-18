@@ -1,20 +1,24 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
 #include "common/algorithm.h"
+#include "common/alignment.h"
 #include "common/assert.h"
+#include "common/fritchii_write_ring.h"
 #include "common/logging.h"
 #include <ranges>
 #include "common/settings.h"
 #include "core/core.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memstage_stats.h"
+#include "video_core/nx2_qmd_prediction.h"
 #include "video_core/renderer_base.h"
 #include "video_core/textures/decoders.h"
 
@@ -62,7 +66,104 @@ void MaxwellDMA::CallMultiMethod(Core::System& system, u32 method, const u32* ba
     }
 }
 
+void MaxwellDMA::FrontMethod(VideoCommon::GpuSplit& split, u32 method, const u32* arguments,
+                             u32 amount) {
+    if (!front_regs) [[unlikely]] {
+        // Copy the back's registers while it is idle, with the writes its method sink holds.
+        split.Drain(VideoCommon::DrainSite::FrontStart);
+        front_regs = std::make_unique<std::array<u32, 0x200>>();
+        std::copy_n(regs.reg_array.begin(), front_regs->size(), front_regs->begin());
+        for (const auto& [sink_method, value] : method_sink) {
+            if (sink_method < front_regs->size()) {
+                (*front_regs)[sink_method] = value;
+            }
+        }
+    }
+    for (u32 i = 0; i < amount; ++i) {
+        if (method < front_regs->size()) {
+            (*front_regs)[method] = arguments[i];
+        }
+        if (method == offsetof(Regs, launch_dma) / sizeof(u32)) {
+            FrontNoteLaunch(split, arguments[i]);
+        }
+    }
+}
+
+void MaxwellDMA::FrontNoteLaunch(VideoCommon::GpuSplit& split, u32 launch) {
+    // What Launch and ReleaseSemaphore write, from the same registers, never less.
+    using Kind = VideoCommon::GpuSplit::WriterKind;
+    const auto& r = *front_regs;
+    const auto reg = [&r](size_t offset) { return r[offset / sizeof(u32)]; };
+    const auto address = [&reg](size_t offset) {
+        return (GPUVAddr{reg(offset) & 0xff} << 32) | reg(offset + sizeof(u32));
+    };
+    // LaunchDMA: semaphore_type, dst_memory_layout, multi_line_enable, remap_enable, src/dst_type.
+    const u32 semaphore_type = (launch >> 3) & 3;
+    const bool dst_pitch = ((launch >> 8) & 1) != 0;
+    const bool multi_line = ((launch >> 9) & 1) != 0;
+    const bool remap = ((launch >> 10) & 1) != 0;
+    const bool physical = ((launch >> 12) & 3) != 0;
+    if (semaphore_type != 0) {
+        const GPUVAddr semaphore = address(offsetof(Regs, semaphore));
+        split.NoteWriterRange(memory_manager, semaphore, 16, Kind::Copy);
+        // EXP13: a one- or four-word release writes the payload (ReleaseSemaphore).
+        if ((semaphore_type == 1 || semaphore_type == 2) &&
+            VideoCommon::QmdPrediction::Enabled()) {
+            if (const auto device = memory_manager.GpuToCpuAddress(semaphore)) {
+                VideoCommon::QmdPrediction::Predict(
+                    VideoCommon::QmdPrediction::Writer::Dma, *device,
+                    reg(offsetof(Regs, semaphore) + 2 * sizeof(u32)), split.SentPosition(), 0,
+                    false);
+            }
+        }
+    }
+    if (physical) {
+        split.NoteUnboundedWriter(Kind::Copy);
+        return;
+    }
+    // RemapConst word 2: dst_x bits 0-2, component size bits 16-17, dst components bits 24-25.
+    const u32 components = reg(offsetof(Regs, remap_const) + 2 * sizeof(u32));
+    const u64 remap_bytes =
+        remap ? u64{((components >> 16) & 3) + 1} * (((components >> 24) & 3) + 1) : 1;
+    const GPUVAddr destination = address(offsetof(Regs, offset_out));
+    const u64 length = reg(offsetof(Regs, line_length_in));
+    const u64 lines = (std::max)(reg(offsetof(Regs, line_count)), 1U);
+    GPUVAddr begin = destination;
+    u64 size = 0;
+    if (!multi_line) {
+        // A constant fill writes up to 4 bytes an element (BufferClear); a copy to a block linear
+        // page moves 16-byte pieces within their 512-byte GOB.
+        const bool fill = remap && (components & 7) == 4;
+        begin = destination & ~GPUVAddr{0x1ff};
+        size = Common::AlignUp(destination + length * (fill ? 4 : remap_bytes), 0x200) - begin;
+    } else if (dst_pitch) {
+        const s32 pitch = static_cast<s32>(reg(offsetof(Regs, pitch_out)));
+        if (pitch < 0) {
+            split.NoteUnboundedWriter(Kind::Copy);
+            return;
+        }
+        const u64 pitch_bytes = static_cast<u64>(pitch);
+        size = (std::max)(pitch_bytes * lines, pitch_bytes * (lines - 1) + length * remap_bytes);
+    } else {
+        constexpr size_t params = offsetof(Regs, dst_params);
+        const u32 block = reg(params);
+        const u64 row_bytes = u64{reg(params + 4)} * remap_bytes;
+        const u32 height = reg(params + 8);
+        const u32 depth = (std::max)(reg(params + 12), 1U);
+        const u32 layer = reg(params + 16);
+        if ((block & 0xf) != 0 || layer != 0 || row_bytes >= (u64{1} << 20) ||
+            height >= (1U << 16) || depth >= (1U << 12)) {
+            split.NoteUnboundedWriter(Kind::Copy);
+            return;
+        }
+        size = CalculateSize(true, 1, static_cast<u32>(row_bytes), height, depth,
+                             (block >> 4) & 0xf, (block >> 8) & 0xf);
+    }
+    split.NoteWriterRange(memory_manager, begin, size, Kind::Copy);
+}
+
 void MaxwellDMA::Launch() {
+    const Common::WriteRing::SiteScope write_site{"DMA engine (MaxwellDMA::Launch)", false};
     LOG_TRACE(Render_OpenGL, "DMA copy {:#x} -> {:#x}", static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out));
     // EDEN_NX2_TRACE_DST=<hex>: also log copies writing within 32 MiB above that GPU address.
     static const u64 trace_destination = [] {
@@ -94,6 +195,32 @@ void MaxwellDMA::Launch() {
     // TODO(Subv): Perform more research and implement all features of this engine.
     const LaunchDMA& launch = regs.launch_dma;
     ASSERT(launch.interrupt_type == LaunchDMA::InterruptType::NONE);
+
+    // EDEN_NX2_MEMSTAGE_STATS: what this launch writes. Copies and fills between linear memory are
+    // stream writes (tested against texture pages, join 2); copies with a block linear side are
+    // image copies (the texture cache writes them; counted only, bytes approximate).
+    if (VideoCommon::MemStageStats::Enabled()) [[unlikely]] {
+        namespace Stats = VideoCommon::MemStageStats;
+        const u64 device = memory_manager.GpuToCpuAddress(regs.offset_out).value_or(0);
+        if (!launch.multi_line_enable) {
+            const bool fill = launch.remap_enable != 0 &&
+                              regs.remap_const.dst_x == RemapConst::Swizzle::CONST_A;
+            const u64 bytes =
+                fill ? u64{regs.line_length_in} * (regs.remap_const.component_size_minus_one + 1)
+                     : u64{regs.line_length_in};
+            Stats::StreamWrite(Stats::Write::DmaLinear, device, bytes);
+        } else if (launch.src_memory_layout == LaunchDMA::MemoryLayout::PITCH &&
+                   launch.dst_memory_layout == LaunchDMA::MemoryLayout::PITCH) {
+            const u64 lines = regs.line_count;
+            const u64 span =
+                lines == 0 ? 0 : u64{regs.pitch_out} * (lines - 1) + regs.line_length_in;
+            Stats::StreamWrite(Stats::Write::DmaLinear, device, u64{regs.line_length_in} * lines,
+                               span);
+        } else {
+            Stats::StreamWrite(Stats::Write::DmaImage, 0,
+                               u64{regs.line_length_in} * regs.line_count);
+        }
+    }
 
     if (launch.multi_line_enable) {
         const bool is_src_pitch = launch.src_memory_layout == LaunchDMA::MemoryLayout::PITCH;
@@ -380,6 +507,16 @@ void MaxwellDMA::ReleaseSemaphore() {
     const GPUVAddr address = regs.semaphore.address;
     const u32 payload = regs.semaphore.payload;
     VideoCommon::QueryPropertiesFlags flags{VideoCommon::QueryPropertiesFlags::IsAFence};
+    if ((type == LaunchDMA::SemaphoreType::RELEASE_ONE_WORD_SEMAPHORE ||
+         type == LaunchDMA::SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) &&
+        VideoCommon::QmdPrediction::Enabled() && VideoCommon::GpuSplit::OnBackThread()) {
+        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+            VideoCommon::QmdPrediction::Verify(VideoCommon::QmdPrediction::Writer::Dma, *device,
+                                               payload, 0,
+                                               VideoCommon::GpuSplit::Get().BackEntryPosition(),
+                                               false);
+        }
+    }
     switch (type) {
     case LaunchDMA::SemaphoreType::NONE:
         break;

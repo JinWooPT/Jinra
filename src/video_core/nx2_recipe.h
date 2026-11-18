@@ -28,7 +28,6 @@
 
 #include <optional>
 #include <span>
-#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -97,7 +96,6 @@ struct CodeMatch {
 /// A precompiled file of `cache_version` from a recipe and the programs of the player's game.
 [[nodiscard]] std::vector<u8> Assemble(std::span<const u8> recipe,
                                        const FileSys::Nx2ShaderExtract::Result& programs,
-                                       u32 cache_version, Report& report, unsigned threads = 0,
-                                       std::stop_token stop = {});
+                                       u32 cache_version, Report& report, unsigned threads = 0);
 
 } // namespace VideoCommon::Nx2Recipe

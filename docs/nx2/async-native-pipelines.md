@@ -1,8 +1,9 @@
 # Native graphics pipeline worker emission
 
-Native graphics SPIR-V emission and shader-module creation run on `VkPipelineBuilder` when
-an emission reservation is available. Guest-dependent IR translation remains on GPUBack.
-Legacy programs and a full reservation budget retain synchronous emission.
+This experimental track moves native graphics SPIR-V emission and shader-module creation from
+GPUBack to `VkPipelineBuilder`. It does **not** move guest-dependent IR translation. The
+`async_pipelines` Nx2Perf switch defaults on. `EDEN_NX2_PERF_OFF=async_pipelines` or
+`EDEN_NX2_PERF_OPT=0` restores the original build path.
 
 ## Why the old path still stalls GPUBack
 
@@ -53,10 +54,10 @@ The pipeline cache drains its workers and explicitly destroys graphics pipelines
 pool cache and other build dependencies are still alive. Destruction may claim a queued native
 build; ordinary native draw waits never do.
 
-## Upstream alternative
+## Alternative design
 
-[Eglantine PR #503](https://github.com/Djihads80/Eglantine/pull/503), inspected at
-`7584d618f8dec5fc1fa8c76fde68489ab5f76c9c`, implements full async translation with detached
+A related change in another build, inspected at its latest revision,
+implements full async translation with detached
 environments. Its desktop timeout discards native draws, and its texture snapshots still read
 live descriptor memory later without synchronization. Porting that behavior would violate this
 track's correctness requirements. Making GPUBack wait for the entire translation instead would
@@ -94,5 +95,4 @@ and emission. No Ocarina runtime measurements or Windows build are claimed for t
 The reported 0.2–2.3 seconds per 10 seconds does not establish an FPS improvement. This change
 can overlap only the emission fraction with useful GPUBack work, and queue delays, allocation,
 and remaining draw holds can reduce that benefit. Its actual savings require
-equivalent cold-cache sessions against the original synchronous implementation, not a
-warmed-cache second run.
+equivalent cold-cache sessions with the switch on and off, not a warmed-cache second run.

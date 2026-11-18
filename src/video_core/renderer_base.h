@@ -9,8 +9,6 @@
 #include <atomic>
 #include <functional>
 #include <memory>
-#include <optional>
-#include <string>
 
 #include "common/common_funcs.h"
 #include "common/common_types.h"
@@ -26,37 +24,15 @@ class GraphicsContext;
 
 namespace VideoCore {
 
-struct RendererDeviceInfo {
-    std::string model;
-    std::string driver;
-    std::string api;
-};
-
-enum class FrameGenState : u8 {
-    Pending,
-    Running,
-    UnsupportedRenderer,
-    UnsupportedBuild,
-    UnsupportedGpu,
-    UnsupportedSurface,
-    MissingLosslessDll,
-};
-
-struct FrameGenStatus {
-    FrameGenState state{FrameGenState::UnsupportedRenderer};
-    u64 generated_frames{};
-};
-
 struct DlssStatus {
     u64 evaluations{};
+    /// The last evaluation's settings: the mode it ran in, and the mode and preset the user chose
     Settings::NvidiaDlssQuality mode{};
     Settings::NvidiaDlssQuality requested{};
-    Settings::NvidiaDlssPreset preset{};
-};
-
-struct VideoMemoryUsage {
-    u64 bytes{};
-    bool shared{};
+    Settings::DlssPreset preset{};
+    /// The last evaluation's input and output heights (e.g. 1440 and 2160)
+    u32 render_height{};
+    u32 output_height{};
 };
 
 struct RendererSettings {
@@ -87,21 +63,9 @@ public:
 
     [[nodiscard]] virtual std::string GetDeviceVendor() const = 0;
 
-    /// Whether frame generation can run and how many frames it has generated so far
-    [[nodiscard]] virtual FrameGenStatus GetFrameGenStatus() const {
-        return {};
-    }
-
+    /// How many NVIDIA DLSS evaluations ran so far and the mode of the last one
     [[nodiscard]] virtual DlssStatus GetDlssStatus() const {
         return {};
-    }
-
-    [[nodiscard]] virtual std::optional<VideoMemoryUsage> GetVideoMemoryUsage() const {
-        return std::nullopt;
-    }
-
-    [[nodiscard]] const RendererDeviceInfo& GetDeviceInfo() const {
-        return device_info;
     }
 
     // Getter/setter functions:
@@ -158,7 +122,6 @@ protected:
     int m_current_frame = 0;  ///< Current frame, should be set by the renderer
 
     RendererSettings renderer_settings;
-    RendererDeviceInfo device_info;
 
 private:
     /// Updates the framebuffer layout of the contained render window handle.

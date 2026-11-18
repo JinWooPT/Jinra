@@ -1,12 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <utility>
 #include <QAbstractItemView>
+#include <QDateTime>
 #include <QFileInfo>
+#include <QImageReader>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPixmapCache>
 #include <QTextLayout>
 #include "game_card.h"
+#include "common/fs/path_util.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/game_list/game_list_p.h"
 
@@ -94,71 +100,66 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
 
 void GameCard::PaintHomeCard(QPainter* painter, const QStyleOptionViewItem& option,
                              const QModelIndex& index, const QRect& card) const {
-    const auto* view = qobject_cast<const QAbstractItemView*>(option.widget);
-    const bool selected = (option.state & QStyle::State_Selected) ||
-                          (view && view->currentIndex() == index);
+    const auto* view = static_cast<const QAbstractItemView*>(parent());
+    const bool selected = view->currentIndex() == index;
+    const bool has_banner = selected && !home_banner.isNull();
+    const auto image = has_banner ? home_banner : index.data(Qt::DecorationRole).value<QPixmap>();
     QPainterPath shape;
-    shape.addRoundedRect(card, 13, 13);
+    shape.addRoundedRect(card, 12, 12);
     painter->save();
     painter->setClipPath(shape);
-    painter->fillRect(card, selected ? QColor("#162f4c") : QColor("#141e30"));
-    const QRect artwork{card.topLeft(), QSize{card.width(), card.width()}};
-    auto image = index.data(Qt::DecorationRole).value<QPixmap>();
-    if (image.isNull()) {
-        painter->fillRect(artwork, QColor("#111a2a"));
-        image = QPixmap(QStringLiteral(":/jinra/icon.png"));
-        const int edge = artwork.width() / 3;
-        QRect fallback(0, 0, edge, edge);
-        fallback.moveCenter(artwork.center());
-        painter->setRenderHint(QPainter::SmoothPixmapTransform);
-        painter->drawPixmap(fallback, image, image.rect());
-    } else {
-        const int edge = std::min(image.width(), image.height());
-        const QRect crop((image.width() - edge) / 2, (image.height() - edge) / 2, edge, edge);
-        painter->setRenderHint(QPainter::SmoothPixmapTransform);
-        painter->drawPixmap(artwork, image, crop);
-    }
+    painter->fillRect(card, QColor("#141e30"));
+    DrawCroppedArtwork(*painter, card, image);
 
-    const int left = card.left() + 12;
-    const int text_width = card.width() - 24;
-    auto title = index.data(GameListItemPath::TitleRole).toString();
-    bool numeric_title{};
-    title.toULongLong(&numeric_title);
-    if (title.isEmpty() || numeric_title) {
-        title = QFileInfo(index.data(GameListItemPath::FullPathRole).toString()).completeBaseName();
+    if (!has_banner) {
+        QLinearGradient shade(card.topLeft(), card.bottomLeft());
+        shade.setColorAt(0.46, Qt::transparent);
+        shade.setColorAt(1.0, QColor(8, 13, 24, 247));
+        painter->fillRect(card, shade);
+        QFont font = option.font;
+        font.setPixelSize(std::clamp(card.height() / 13, 12, 19));
+        font.setWeight(QFont::DemiBold);
+        painter->setFont(font);
+        painter->setPen(QColor("#f3f8ff"));
+        const auto metrics = painter->fontMetrics();
+        const int text_width = card.width() - 22;
+        const int baseline = card.bottom() - 10 - metrics.descent();
+        const auto title = HomeTitle(index);
+        QTextLayout lines(title, font);
+        lines.beginLayout();
+        auto first = lines.createLine();
+        if (first.isValid()) {
+            first.setLineWidth(text_width);
+            const auto split = first.textLength();
+            const auto rest = title.mid(split).trimmed();
+            painter->drawText(card.left() + 11, baseline - (rest.isEmpty() ? 0 : metrics.height()),
+                              metrics.elidedText(title.left(split).trimmed(), Qt::ElideRight,
+                                                 text_width));
+            if (!rest.isEmpty()) {
+                painter->drawText(card.left() + 11, baseline,
+                                  metrics.elidedText(rest, Qt::ElideRight, text_width));
+            }
+        }
+        lines.endLayout();
     }
-    QFont font = option.font;
-    font.setPixelSize(std::clamp(card.width() / 14, 14, 22));
-    font.setWeight(QFont::DemiBold);
-    QTextLayout lines(title, font);
-    lines.beginLayout();
-    const auto first = lines.createLine();
-    painter->setFont(font);
-    painter->setPen(QColor("#e8f1fc"));
-    const int baseline = artwork.bottom() + 9 + painter->fontMetrics().ascent();
-    if (first.isValid()) {
-        auto first_line = first;
-        first_line.setLineWidth(text_width);
-        const int split = first_line.textLength();
-        painter->drawText(left, baseline, title.left(split));
-        painter->drawText(left, baseline + painter->fontMetrics().height(),
-                          painter->fontMetrics().elidedText(title.mid(split).trimmed(),
-                                                           Qt::ElideRight, text_width));
-    }
-    lines.endLayout();
     painter->restore();
 
     painter->setBrush(Qt::NoBrush);
-    painter->setPen(QPen(selected ? QColor("#35d9ed") : QColor("#283a54"), selected ? 3 : 1));
-    const int ring = selected ? 4 : 0;
-    painter->drawRoundedRect(card.adjusted(-ring, -ring, ring, ring), 13 + ring, 13 + ring);
+    painter->setPen(QPen(selected ? QColor("#35d9ed") : QColor("#344157"), selected ? 2 : 1));
+    const int ring = selected ? 3 : 0;
+    painter->drawRoundedRect(card.adjusted(-ring, -ring, ring, ring), 12 + ring, 12 + ring);
 }
 
 QRect GameCard::getCardRect(const QStyleOptionViewItem& option, const QModelIndex& index) const {
     if (home_mode) {
-        return {option.rect.left() + 18,
-                option.rect.top() + (option.rect.height() - m_contentSize.height()) / 2,
-                m_contentSize.width(), m_contentSize.height()};
+        const auto* view = static_cast<const QAbstractItemView*>(parent());
+        const bool show_banner = view->currentIndex() == index && !home_banner.isNull();
+        const int width = show_banner
+                              ? std::clamp(qRound(qreal(home_height) * home_banner.width() /
+                                                   home_banner.height()),
+                                           home_cover_width, home_banner_width)
+                              : home_cover_width;
+        return {option.rect.left() + 5, option.rect.top() + 5, width, home_height};
     }
     const int cell_width = option.rect.width();
 
@@ -208,7 +209,82 @@ bool GameCard::hitTest(const QPoint& point, const QModelIndex& index, const QWid
 }
 
 QSize GameCard::sizeHint(const QStyleOptionViewItem& option, const QModelIndex& index) const {
+    if (home_mode) {
+        const auto card = getCardRect(option, index);
+        return {card.width() + 17, card.height() + 10};
+    }
     return m_size;
+}
+
+void GameCard::SetHomeSize(int height, int cover_width, int banner_width) {
+    home_height = height;
+    home_cover_width = cover_width;
+    home_banner_width = banner_width;
+}
+
+void GameCard::SetHomeBanner(QPixmap banner) {
+    home_banner = std::move(banner);
+}
+
+QString GameCard::HomeTitle(const QModelIndex& index) {
+    const auto title = index.data(GameListItemPath::TitleRole).toString();
+    bool numeric{};
+    title.toULongLong(&numeric);
+    return title.isEmpty() || numeric
+               ? QFileInfo(index.data(GameListItemPath::FullPathRole).toString()).completeBaseName()
+               : title;
+}
+
+QPixmap GameCard::LoadHomeArtwork(const QModelIndex& index, bool banner) {
+    const auto title = index.data(GameListItemPath::ProgramIdRole).toULongLong();
+    if (!title) {
+        return {};
+    }
+    const auto directory = Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / "artwork";
+    const auto id = QStringLiteral("%1").arg(title, 16, 16, QLatin1Char('0')).toUpper();
+    const auto stem = QStringLiteral("%1/%2/%3")
+                          .arg(QString::fromStdU16String(directory.u16string()), id,
+                               banner ? QStringLiteral("banner") : QStringLiteral("background"));
+    for (const auto& extension : {QStringLiteral(".jpg"), QStringLiteral(".png")}) {
+        const QString path = stem + extension;
+        const QFileInfo file(path);
+        if (!file.isFile()) {
+            continue;
+        }
+        const auto key = path + QString::number(file.lastModified().toMSecsSinceEpoch());
+        QPixmap artwork;
+        if (QPixmapCache::find(key, &artwork)) {
+            return artwork;
+        }
+        QImageReader reader(path);
+        reader.setAutoTransform(true);
+        const QSize size = reader.size();
+        if (!size.isValid()) {
+            continue;
+        }
+        const QSize limit = banner ? QSize(920, 540) : QSize(1600, 1000);
+        if (size.width() > limit.width() || size.height() > limit.height()) {
+            reader.setScaledSize(size.scaled(limit, Qt::KeepAspectRatio));
+        }
+        artwork = QPixmap::fromImage(reader.read());
+        if (!artwork.isNull()) {
+            QPixmapCache::insert(key, artwork);
+            return artwork;
+        }
+    }
+    return QPixmap(QStringLiteral(":/jinra/banners/%1.jpg").arg(id));
+}
+
+void GameCard::DrawCroppedArtwork(QPainter& painter, const QRectF& rect, const QPixmap& artwork) {
+    if (artwork.isNull() || rect.isEmpty()) {
+        return;
+    }
+    const auto scale = std::max(rect.width() / artwork.width(), rect.height() / artwork.height());
+    const QSizeF extent(rect.width() / scale, rect.height() / scale);
+    const QRectF crop((artwork.width() - extent.width()) / 2,
+                      (artwork.height() - extent.height()) / 2, extent.width(), extent.height());
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+    painter.drawPixmap(rect, artwork, crop);
 }
 
 void GameCard::setSize(const QSize& newSize, const QSize& contentSize, const int padding,

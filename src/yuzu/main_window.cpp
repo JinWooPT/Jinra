@@ -11,6 +11,8 @@
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
+#include "common/shutdown_progress.h"
+#include "common/shutdown_watch.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "frontend_common/settings_generator.h"
@@ -20,9 +22,7 @@
 #include "video_core/post_processing/fx_preset.h"
 #endif
 #include "updater/jinra_updater.h"
-#ifdef ENABLE_UPDATE_CHECKER
 #include "updater/update_dialog.h"
-#endif
 
 #include "common/fs/ryujinx_compat.h"
 #include "main_window.h"
@@ -30,7 +30,7 @@
 #include "qt_common/discord/discord.h"
 #include "ui_main.h"
 
-// Other Yuzu stuff //
+// Other frontend stuff //
 #include "debugger/console.h"
 #include "debugger/controller.h"
 
@@ -46,10 +46,10 @@
 #include "set_play_time_dialog.h"
 #include "util/util.h"
 #include "yuzu/game/game_list.h"
-#include "yuzu/game/shader_sync.h"
-#include "yuzu/nup_dialogs.h"
 #include "yuzu/jinra_home.h"
-#ifdef JINRA_NX_TOOLS
+#include "yuzu/nup_dialogs.h"
+#include "yuzu/shader_warm_dialog.h"
+#ifdef LICHII_NX_TOOLS
 #include "core/file_sys/registered_cache.h"
 #include "yuzu/nx_tools.h"
 #endif
@@ -68,6 +68,12 @@
 
 #include "util/clickable_label.h"
 #include "util/controller_navigation.h"
+#include "util/export_log.h"
+#include "util/profiling_mode.h"
+#include "fritchii/max_resolution.h"
+#include "fritchii/fritchii_ui.h"
+#include "fritchii/perf_overlay.h"
+#include "fritchii/switches_window.h"
 #include "util/overlay_dialog.h"
 
 #include "multiplayer/state.h"
@@ -96,7 +102,6 @@
 #include <QProgressDialog>
 #include <QScreen>
 #include <QShortcut>
-#include <QStandardPaths>
 #include <QStatusBar>
 #include <QtConcurrentRun>
 
@@ -113,7 +118,6 @@
 #include "qt_common/qt_common.h"
 #include "qt_common/qt_string_lookup.h"
 
-#include "qt_common/util/compress.h"
 #include "qt_common/util/content.h"
 #include "qt_common/util/fs.h"
 #include "qt_common/util/meta.h"
@@ -139,17 +143,19 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 
 #ifdef ENABLE_UPDATE_CHECKER
 #include "frontend_common/update_checker.h"
-#include "frontend_common/update_installer.h"
 #endif
 
 // Common //
+#include "common/frizti_settings.h"
+#include "common/fs/file.h"
 #include "common/fs/fs.h"
-#include "common/fs/fs_paths.h"
 #include "common/logging.h"
 #include "common/memory_detect.h"
+#include "common/build_stamp.h"
 #include "common/scm_rev.h"
 #include "common/scope_exit.h"
 #include "common/string_util.h"
+#include "common/thread.h"
 
 #ifdef ARCHITECTURE_x86_64
 #include "common/cpu_features.h"
@@ -168,6 +174,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/common_funcs.h"
 #include "core/file_sys/nup_writer.h"
+#include "core/file_sys/patch_manager.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/savedata_factory.h"
 
@@ -184,8 +191,10 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 
 // Video Core //
 #include "video_core/gpu.h"
+#include "video_core/ocarina_upscale.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#include "video_core/small_card.h"
 
 #include <SDL3/SDL.h>
 
@@ -332,9 +341,93 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 #endif
 
+// main.cpp: the test switches this launch runs with, grouped by where each came from.
+std::string Nx2SwitchSummary();
+
+#ifdef _WIN32
+// The Windows power plan and power mode (Settings > Power: Best power efficiency, Balanced, Best
+// performance), logged at each game start: the mode changes how fast the cores clock up, so two
+// runs on different modes can differ in fps. powrprof.dll is loaded here, not linked; the mode
+// call (PowerGetEffectiveOverlayScheme) exists from Windows 10 1709 on.
+static std::string WindowsPowerText() {
+    std::string text;
+    if (const HMODULE powrprof = LoadLibraryW(L"powrprof.dll")) {
+        using GetActiveScheme = DWORD(WINAPI*)(HKEY, GUID**);
+        using ReadFriendlyName = DWORD(WINAPI*)(HKEY, const GUID*, const GUID*, const GUID*,
+                                                UCHAR*, DWORD*);
+        using GetOverlay = DWORD(WINAPI*)(GUID*);
+        const auto get_active = reinterpret_cast<GetActiveScheme>(
+            reinterpret_cast<void*>(GetProcAddress(powrprof, "PowerGetActiveScheme")));
+        const auto read_name = reinterpret_cast<ReadFriendlyName>(
+            reinterpret_cast<void*>(GetProcAddress(powrprof, "PowerReadFriendlyName")));
+        const auto get_overlay = reinterpret_cast<GetOverlay>(
+            reinterpret_cast<void*>(GetProcAddress(powrprof, "PowerGetEffectiveOverlayScheme")));
+        GUID* scheme = nullptr;
+        if (get_active != nullptr && get_active(nullptr, &scheme) == ERROR_SUCCESS && scheme) {
+            DWORD size = 0;
+            std::wstring name;
+            if (read_name != nullptr &&
+                read_name(nullptr, scheme, nullptr, nullptr, nullptr, &size) == ERROR_SUCCESS &&
+                size >= sizeof(wchar_t)) {
+                name.resize(size / sizeof(wchar_t));
+                if (read_name(nullptr, scheme, nullptr, nullptr,
+                              reinterpret_cast<UCHAR*>(name.data()), &size) != ERROR_SUCCESS) {
+                    name.clear();
+                }
+            }
+            text += fmt::format("plan {}",
+                                name.empty() ? std::string{"unknown"}
+                                             : QString::fromWCharArray(name.c_str()).toStdString());
+            LocalFree(scheme);
+        }
+        GUID overlay{};
+        if (get_overlay != nullptr && get_overlay(&overlay) == ERROR_SUCCESS) {
+            struct Mode {
+                GUID guid;
+                const char* name;
+            };
+            static constexpr Mode Modes[] = {
+                {{0x961cc777, 0x2547, 0x4f9d, {0x81, 0x74, 0x7d, 0x86, 0x18, 0x1b, 0x8a, 0x7a}},
+                 "best power efficiency"},
+                {{0x00000000, 0x0000, 0x0000, {0, 0, 0, 0, 0, 0, 0, 0}}, "balanced"},
+                {{0x3af9b8d9, 0x7c97, 0x431d, {0xad, 0x78, 0x34, 0xa8, 0xbf, 0xea, 0x43, 0x9f}},
+                 "better performance"},
+                {{0xded574b5, 0x45a0, 0x4f42, {0x87, 0x37, 0x46, 0x34, 0x5c, 0x09, 0xc2, 0x38}},
+                 "best performance"},
+            };
+            std::string mode;
+            for (const Mode& known : Modes) {
+                if (IsEqualGUID(overlay, known.guid)) {
+                    mode = known.name;
+                }
+            }
+            if (mode.empty()) {
+                const auto& d = overlay.Data4;
+                mode = fmt::format("{:08x}-{:04x}-{:04x}-{:02x}{:02x}-"
+                                   "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                                   overlay.Data1, overlay.Data2, overlay.Data3, d[0], d[1], d[2],
+                                   d[3], d[4], d[5], d[6], d[7]);
+            }
+            text += fmt::format("{}mode {}", text.empty() ? "" : ", ", mode);
+        }
+        FreeLibrary(powrprof);
+    }
+    SYSTEM_POWER_STATUS status{};
+    if (GetSystemPowerStatus(&status) && status.BatteryFlag != 128 && status.BatteryFlag != 255) {
+        text += fmt::format("{}{}{}", text.empty() ? "" : ", ",
+                            status.ACLineStatus == 0 ? "on battery" : "plugged in",
+                            status.SystemStatusFlag == 1 ? ", battery saver on" : "");
+    }
+    return text.empty() ? std::string{"unknown"} : text;
+}
+#endif
+
 constexpr int default_mouse_hide_timeout = 2500;
 constexpr int default_input_update_timeout = 1;
 constexpr int EmuThreadStopTimeoutMs = 10'000;
+// A teardown that keeps making progress (Common::ShutdownProgress) is waited for this long at
+// most before its thread is terminated.
+constexpr qint64 MaxEmuThreadShutdownMs = 180'000;
 
 constexpr size_t CopyBufferSize = 1_MiB;
 
@@ -366,7 +459,7 @@ QString GetTranslatedGameIconSize(size_t index) {
 } // namespace
 
 #ifndef _WIN32
-// TODO(crueter): carboxyl does this, is it needed in qml?
+// TODO: carboxyl does this, is it needed in qml?
 inline static bool isDarkMode() {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
     const auto scheme = QGuiApplication::styleHints()->colorScheme();
@@ -387,28 +480,22 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     Common::FS::CreateEdenPaths();
     this->config = std::make_unique<QtConfig>();
+    MigrateFriztiSettings();
+    // New mods start disabled: saved at once (from the GUI thread), so a crash keeps it.
+    FileSys::PatchManager::SetNewModsCallback([this](u64 title_id) {
+        QMetaObject::invokeMethod(
+            this,
+            [this, title_id] {
+                Common::FS::RemoveFile(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
+                                       "game_list" / fmt::format("{:016X}.pv.txt", title_id));
+                config->SaveAddOnValues();
+            },
+            Qt::QueuedConnection);
+    });
 
     Common::Log::Filter filter;
     filter.ParseFilterString(Settings::values.log_filter.GetValue());
     Common::Log::SetGlobalFilter(filter);
-
-    if (user_data_migrator.migrated) {
-        // Sort-of hack whereby we only move the old dir if it's a subfolder of the user dir
-
-        using namespace Common::FS;
-
-        static constexpr const std::array<const EdenPath, 4> paths = {
-            EdenPath::NANDDir, EdenPath::SDMCDir, EdenPath::DumpDir, EdenPath::LoadDir};
-
-        for (const EdenPath& path : paths) {
-            std::string str_path = Common::FS::GetEdenPathString(path);
-            if (str_path.starts_with(user_data_migrator.selected_emu.get_user_dir())) {
-                boost::replace_all(
-                    str_path, user_data_migrator.selected_emu.lower_name().toStdString(), "eden");
-                Common::FS::SetEdenPath(path, str_path);
-            }
-        }
-    }
 
 #ifdef __unix__
     SetupSigInterrupts();
@@ -448,6 +535,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     ConnectMenuEvents();
     ConnectWidgetEvents();
+    SetUpShaderPreparation();
+    SetUpProfilingMode();
+    SetUpSwitchesWindow();
 
     QtCommon::SetupHID();
     controller_dialog->refreshConfiguration();
@@ -456,6 +546,10 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     show();
 
+    // v5.9: the shader cache v5.8's import left in eden/lichii, before a game boots.
+    UserDataMigrator::CatchUpShaderCache(this);
+
+#ifdef _WIN32
     auto* update_action = ui->menu_Help->addAction(tr("Check for updates..."));
     auto* updater = new JinraUpdater(
         this, update_action,
@@ -467,6 +561,20 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     if (UISettings::values.check_for_updates.GetValue()) {
         QTimer::singleShot(5000, updater, [updater] { updater->Check(false); });
     }
+#elif defined(ENABLE_UPDATE_CHECKER)
+    connect(&update_watcher, &QFutureWatcher<UpdateChecker::CheckResult>::finished, this,
+            &MainWindow::OnEmulatorUpdateAvailable);
+    // A swap that a crash interrupted is finished or undone before anything else.
+    if (!Updater::FinishPendingSwap(this)) {
+        if (auto note = Updater::TakeRestartNote()) {
+            restart_note = std::move(*note);
+            QTimer::singleShot(0, this, &MainWindow::ShowRestartNote);
+        }
+        if (UISettings::values.check_for_updates) {
+            StartUpdateCheck(false);
+        }
+    }
+#endif
 
     // Setup content providers.
     QtCommon::SetupContentProviders();
@@ -525,7 +633,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     // Set a screensaver inhibition reason string. Currently passed to DBus by SDL and visible to
     // the user through their desktop environment.
-    //: TRANSLATORS: This string is shown to the user to explain why yuzu needs to prevent the
+    //: TRANSLATORS: This string is shown to the user to explain why Fritchii needs to prevent the
     //: computer from sleeping
     QByteArray wakelock_reason = tr("Running a game").toUtf8();
     SDL_SetHint(SDL_HINT_SCREENSAVER_INHIBIT_ACTIVITY_NAME, wakelock_reason.data());
@@ -543,6 +651,12 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     // to prevent the UI from blowing up.
     UpdateUITheme();
 
+    // v6 turns OoT's Max Resolution add-on off once for everyone, before a game from the command
+    // line boots with it; the question whether to turn it back on comes on a plain launch.
+    if (FritchiiMaxResolution::SwitchOffOnce()) {
+        OnSaveConfig();
+    }
+
     if (QStringList args = QApplication::arguments(); args.size() >= 2) {
         QList<QByteArray> qba{};
         for (auto const& e : args)
@@ -559,6 +673,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         }
 
         if (!lp.filepath.empty()) {
+            launched_with_game = true;
             BootGame(QString::fromStdString(lp.filepath), ApplicationAppletParameters());
         } else if (lp.launch_setup) {
             LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::Starter), std::nullopt);
@@ -573,9 +688,121 @@ MainWindow::MainWindow(bool has_broken_vulkan)
                 LibraryAppletParameters(0x010000000000100Dull, Service::AM::AppletId::QLaunch));
         }
     }
+
+    // Once per major version, before a game boots: clear the old shader caches? (Not when started
+    // with a game: the next plain launch asks.)
+    if (!launched_with_game && FritchiiMaxResolution::OfferOnce(this, vk_device_records)) {
+        OnSaveConfig();
+    }
+
+    // The first launch asks for Ocarina of Time's frame rate (not when started with a game,
+    // e.g. from a shortcut or script: that keeps the 60 FPS default until the next plain launch).
+    if (!launched_with_game && !Settings::values.oot_fps_asked.GetValue()) {
+        QTimer::singleShot(0, this, &MainWindow::AskOotFrameRate);
+    }
+}
+
+namespace {
+std::filesystem::path FriztiRecordPath() {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "frizti.ini";
+}
+
+Settings::Frizti::Record LoadFriztiRecord() {
+    return Settings::Frizti::ParseRecord(
+        Common::FS::ReadStringFromFile(FriztiRecordPath(), Common::FS::FileType::TextFile));
+}
+
+void SaveFriztiRecord(const Settings::Frizti::Record& record) {
+    const std::string text = Settings::Frizti::SerializeRecord(record);
+    if (Common::FS::WriteStringToFile(FriztiRecordPath(), Common::FS::FileType::TextFile, text) !=
+        text.size()) {
+        LOG_WARNING(Frontend, "Could not write {}",
+                    Common::FS::PathToUTF8String(FriztiRecordPath()));
+    }
+}
+
+// After each config write: what this build wrote for the tuned settings, so a later difference
+// shows that another build (or a hand edit) changed them.
+void RecordFriztiWrite(const Config& written) {
+    namespace Frizti = Settings::Frizti;
+    const auto tuned = Frizti::TunedSettings(Settings::values);
+    auto record = LoadFriztiRecord();
+    if (written.GetType() != Config::ConfigType::GlobalConfig) {
+        return;
+    }
+    auto values = Frizti::GlobalValues(tuned);
+    if (values == record.global) {
+        return;
+    }
+    record.global = std::move(values);
+    SaveFriztiRecord(record);
+}
+
+} // namespace
+
+// Frizti builds change the defaults Ocarina of Time needs, but a default only reaches a config
+// that never saved its own value, and the other Eden/Lichii builds sharing the config save (seed)
+// theirs. Once per revision, set the tuned global values.
+// Between revisions the player's changes in Frizti are kept, and those another build made are
+// undone: config/frizti.ini, which only Frizti writes, holds what Frizti last wrote.
+void MainWindow::MigrateFriztiSettings() {
+    namespace Frizti = Settings::Frizti;
+    const auto tuned = Frizti::TunedSettings(Settings::values);
+    auto record = LoadFriztiRecord();
+    // Other builds keep qt-config.ini's revision key but never write frizti.ini; either one
+    // missing or older applies the whole set again.
+    const u32 applied =
+        (std::min)(Settings::values.frizti_settings_revision.GetValue(), record.revision);
+    const bool full = applied < Frizti::Revision;
+
+    auto changes = Frizti::ReconcileGlobal(tuned, record, full);
+    for (auto& change : Frizti::FixDockedController(Settings::values)) {
+        changes.push_back(std::move(change));
+    }
+
+    // A newer Frizti build's revision is kept.
+    const u32 revision = (std::max)(applied, Frizti::Revision);
+    if (!changes.empty() ||
+        Settings::values.frizti_settings_revision.GetValue() != revision) {
+        Settings::values.frizti_settings_revision.SetValue(revision);
+        config->SaveAllValues();
+    }
+    record.revision = revision;
+    record.global = Frizti::GlobalValues(tuned);
+    SaveFriztiRecord(record);
+    Config::on_written = RecordFriztiWrite;
+
+    if (full) {
+        LOG_INFO(Frontend, "Frizti settings revision {} -> {}: {}", applied, revision,
+                 changes.empty() ? std::string{"already set"} : Frizti::FormatChanges(changes));
+    } else if (!changes.empty()) {
+        LOG_INFO(Frontend, "Frizti settings changed by another build, restored: {}",
+                 Frizti::FormatChanges(changes));
+    }
+}
+
+void MainWindow::AskOotFrameRate() {
+    QMessageBox box(this);
+    box.setWindowTitle(tr("Ocarina of Time frame rate"));
+    box.setIcon(QMessageBox::Question);
+    box.setText(tr("Which frame rate should Ocarina of Time run at?"));
+    box.setInformativeText(
+        tr("60 FPS needs a fast, recent CPU.\n"
+           "30 FPS is for lower-end PCs. The game keeps its normal speed either way.\n\n"
+           "Switch any time with the 60 FPS / 30 FPS button at the bottom of the window."));
+    QPushButton* const fps60 = box.addButton(tr("60 FPS"), QMessageBox::AcceptRole);
+    QPushButton* const fps30 = box.addButton(tr("30 FPS (lower-end PCs)"), QMessageBox::AcceptRole);
+    box.setDefaultButton(fps60);
+    box.exec();
+    Settings::values.oot_30fps.SetValue(box.clickedButton() == fps30);
+    Settings::values.oot_fps_asked.SetValue(true);
+    UpdateOotFpsButton();
+    config->SaveAllValues();
 }
 
 MainWindow::~MainWindow() {
+    FileSys::PatchManager::SetNewModsCallback(nullptr);
+    Common::ShutdownWatch::Exiting("main window destructor: waiting for the NUP task");
     if (nup_cancel) {
         nup_cancel->store(true);
     }
@@ -585,6 +812,7 @@ MainWindow::~MainWindow() {
 #endif
 
     // will get automatically deleted otherwise
+    Common::ShutdownWatch::Exiting("main window destructor: render window");
     if (render_window->parent() == nullptr) {
         delete render_window;
     }
@@ -593,6 +821,7 @@ MainWindow::~MainWindow() {
     ::close(sig_interrupt_fds[0]);
     ::close(sig_interrupt_fds[1]);
 #endif
+    Common::ShutdownWatch::Exiting("main window members (input subsystem, game list, widgets)");
 }
 
 void MainWindow::AmiiboSettingsShowDialog(const Core::Frontend::CabinetParameters& parameters,
@@ -956,6 +1185,7 @@ void MainWindow::InitializeWidgets() {
 
     game_list = new GameList(QtCommon::vfs, QtCommon::provider.get(), *play_time_manager,
                              *QtCommon::system, this);
+
     game_list_placeholder = new GameListPlaceholder(this);
     game_list_placeholder->setVisible(false);
     jinra_home = new JinraHome(game_list, game_list_placeholder, input_subsystem.get(), this);
@@ -963,7 +1193,11 @@ void MainWindow::InitializeWidgets() {
     connect(jinra_home, &JinraHome::AddDirectory, this, &MainWindow::OnGameListAddDirectory);
     connect(jinra_home, &JinraHome::InstallContentRequested, this, &MainWindow::OnMenuInstallToNAND);
     connect(jinra_home, &JinraHome::HomeChromeChanged, this,
-            [this](bool active) { ui->menubar->setVisible(!active); });
+            [this](bool active) {
+                const bool desktop_chrome = !active && !isFullScreen();
+                ui->menubar->setVisible(desktop_chrome);
+                statusBar()->setVisible(desktop_chrome && ui->action_Show_Status_Bar->isChecked());
+            });
     ui->menubar->setVisible(!jinra_home->IsHomeChromeActive());
     connect(jinra_home, &JinraHome::BootRequested, this, [this](const QString& path) {
         BootGameFromList(path, StartGameType::Normal);
@@ -971,13 +1205,7 @@ void MainWindow::InitializeWidgets() {
     connect(jinra_home, &JinraHome::PropertiesRequested, this, [this](const QString& path) {
         OnGameListOpenPerGameProperties(path.toStdString());
     });
-    connect(jinra_home, &JinraHome::ConfigureRequested, this, [this](int category) {
-        if (jinra_home->IsHomeChromeActive()) {
-            OpenHomeSettings(category);
-        } else {
-            OpenDesktopSettings(category);
-        }
-    });
+    connect(jinra_home, &JinraHome::ConfigureRequested, this, &MainWindow::OpenConfiguration);
     connect(jinra_home, &JinraHome::LanguageRequested, this, &MainWindow::OnLanguageChanged);
     connect(jinra_home, &JinraHome::SaveSettings, this, [this] {
         QtCommon::system->ApplySettings();
@@ -988,11 +1216,6 @@ void MainWindow::InitializeWidgets() {
     loading_screen = new LoadingScreen(this);
     loading_screen->hide();
     ui->horizontalLayout->addWidget(loading_screen);
-    connect(loading_screen, &LoadingScreen::PlayNowRequested, this, [this] {
-        if (emulation_running && QtCommon::emu_thread) {
-            QtCommon::system->GPU().ShaderNotify().SetPrepareInBackground(true);
-        }
-    });
     connect(loading_screen, &LoadingScreen::Hidden, this, [&] {
         loading_screen->Clear();
         if (emulation_running) {
@@ -1013,6 +1236,11 @@ void MainWindow::InitializeWidgets() {
     message_label->setAlignment(Qt::AlignLeft);
     statusBar()->addPermanentWidget(message_label, 1);
 
+    shader_warm_label = new QLabel();
+    shader_warm_label->setToolTip(
+        tr("Shaders prepared ahead of time so the game stutters less when it first uses them.\n"
+           "It never slows the game down: it builds while the game is paused, or right away "
+           "from Emulation > Prepare Shaders Now."));
     shader_building_label = new QLabel();
     shader_building_label->setToolTip(tr("The amount of shaders currently being built"));
     res_scale_label = new QLabel();
@@ -1025,14 +1253,16 @@ void MainWindow::InitializeWidgets() {
     game_fps_label->setToolTip(tr("How many frames per second the game is currently displaying. "
                                   "This will vary from game to game and scene to scene."));
     dlss_status_label = new QLabel();
-    dlss_status_label->setToolTip(tr("Active NVIDIA DLSS mode and requested model preset."));
+    dlss_status_label->setToolTip(
+        tr("NVIDIA DLSS is upscaling the game, in the mode shown. The window adapting filter "
+           "runs after it."));
     emu_frametime_label = new QLabel();
     emu_frametime_label->setToolTip(
         tr("Time taken to emulate a Switch frame, not counting framelimiting or v-sync. For "
            "full-speed emulation this should be at most 16.67 ms."));
 
-    for (auto& label : {shader_building_label, res_scale_label, emu_speed_label, game_fps_label,
-                        dlss_status_label, emu_frametime_label}) {
+    for (auto& label : {shader_warm_label, shader_building_label, res_scale_label, emu_speed_label,
+                        game_fps_label, dlss_status_label, emu_frametime_label}) {
         label->setVisible(false);
         label->setFrameStyle(QFrame::NoFrame);
         label->setContentsMargins(4, 0, 4, 0);
@@ -1105,31 +1335,6 @@ void MainWindow::InitializeWidgets() {
     connect(volume_button, &VolumeButton::VolumeChanged, this, &MainWindow::UpdateVolumeUI);
 
     statusBar()->insertPermanentWidget(0, volume_button);
-
-    frame_gen_status_button = new QPushButton();
-    frame_gen_status_button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
-    frame_gen_status_button->setFocusPolicy(Qt::NoFocus);
-    frame_gen_status_button->setCheckable(true);
-    connect(frame_gen_status_button, &QPushButton::clicked, this, [this] {
-        Settings::values.frame_gen.SetValue(!Settings::values.frame_gen.GetValue());
-        UpdateFrameGenButton();
-    });
-    UpdateFrameGenButton();
-    frame_gen_status_button->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(frame_gen_status_button, &QPushButton::customContextMenuRequested,
-            [this](const QPoint& menu_location) {
-                QMenu context_menu;
-                for (auto const& [type, text] : ConfigurationShared::frame_gen_type_texts_map) {
-                    context_menu.addAction(text, [this, type] {
-                        Settings::values.frame_gen_type.SetValue(type);
-                        Settings::values.frame_gen.SetValue(true);
-                        UpdateFrameGenButton();
-                    });
-                }
-                context_menu.exec(frame_gen_status_button->mapToGlobal(menu_location));
-                frame_gen_status_button->repaint();
-            });
-    statusBar()->insertPermanentWidget(0, frame_gen_status_button);
 
 #ifdef HAS_RESHADE
     post_shader_status_button = new QPushButton();
@@ -1267,6 +1472,17 @@ void MainWindow::InitializeWidgets() {
             });
     statusBar()->insertPermanentWidget(0, gpu_accuracy_button);
 
+    // Ocarina of Time frame rate: one click switches 60 / 30 FPS, at once (also in game).
+    oot_fps_button = new QPushButton();
+    oot_fps_button->setObjectName(QStringLiteral("OotFpsStatusBarButton"));
+    oot_fps_button->setCheckable(true);
+    oot_fps_button->setFocusPolicy(Qt::NoFocus);
+    oot_fps_button->setToolTip(tr("Ocarina of Time frame rate. Click to switch between 60 FPS and "
+                                  "30 FPS (lower-end PCs); it takes effect at once."));
+    connect(oot_fps_button, &QPushButton::clicked, this, &MainWindow::OnToggleOotFrameRate);
+    UpdateOotFpsButton();
+    statusBar()->insertPermanentWidget(0, oot_fps_button);
+
     // Setup Renderer API button
     renderer_status_button = new QPushButton();
     renderer_status_button->setObjectName(QStringLiteral("RendererStatusBarButton"));
@@ -1307,7 +1523,7 @@ void MainWindow::InitializeWidgets() {
 
     statusBar()->insertPermanentWidget(0, refresh_button);
 
-    statusBar()->setVisible(false);
+    statusBar()->setVisible(true);
     setStyleSheet(QStringLiteral("QStatusBar::item{border: none;}"));
 }
 
@@ -1417,7 +1633,10 @@ void MainWindow::InitializeHotkeys() {
     connect_shortcut(QStringLiteral("Audio Volume Up"), &MainWindow::OnIncreaseVolume);
 
     connect_shortcut(QStringLiteral("Toggle Framerate Limit"), [this] {
-        Settings::ToggleStandardMode();
+        // Ocarina of Time: its high refresh rate mode instead (unlocked, its logic ran fast).
+        if (!ToggleOotHighRefresh()) {
+            Settings::ToggleStandardMode();
+        }
         SetFPSSuffix();
     });
 
@@ -1478,13 +1697,15 @@ void MainWindow::RestoreUIState() {
     ui->action_Enable_Overlay_Applet->setChecked(Settings::values.enable_overlay.GetValue());
 
     ui->action_Show_Filter_Bar->setChecked(UISettings::values.show_filter_bar.GetValue());
-    game_list->SetFilterVisible(ui->action_Show_Filter_Bar->isChecked());
+    jinra_home->ReloadSettings();
 
     ui->action_Show_Status_Bar->setChecked(UISettings::values.show_status_bar.GetValue());
-    statusBar()->setVisible(emulation_running && ui->action_Show_Status_Bar->isChecked());
+    statusBar()->setVisible(!jinra_home->IsHomeChromeActive() &&
+                            ui->action_Show_Status_Bar->isChecked());
 
     ui->action_Show_Performance_Overlay->setChecked(
         UISettings::values.show_perf_overlay.GetValue());
+    ui->action_Show_Frame_Times->setChecked(UISettings::values.perf_overlay_times.GetValue());
     if (perf_overlay)
         perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
     Debugger::ToggleConsole();
@@ -1502,6 +1723,7 @@ void MainWindow::OnAppFocusStateChanged(Qt::ApplicationState state) {
         if (QtCommon::emu_thread->IsRunning() &&
             (state & (Qt::ApplicationHidden | Qt::ApplicationInactive))) {
             auto_paused = true;
+            LOG_INFO(Frontend, "Pausing: the window lost focus (Pause when in background is on)");
             OnPauseGame();
         } else if (!QtCommon::emu_thread->IsRunning() && auto_paused &&
                    (state & Qt::ApplicationActive)) {
@@ -1529,19 +1751,6 @@ void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::OpenFolderRequested, this, &MainWindow::OnGameListOpenFolder);
     connect(game_list, &GameList::OpenTransferableShaderCacheRequested, this,
             [this](u64 program_id) { QtCommon::Path::OpenShaderCache(program_id, this); });
-    connect(game_list, &GameList::SyncShadersRequested, this, [this](u64 program_id) {
-        if (shader_sync_active) {
-            return;
-        }
-        if (emulation_running || boot_in_progress || close_pending) {
-            QMessageBox::information(this, tr("Sync Shaders"),
-                                     tr("Stop emulation before syncing shaders."));
-            return;
-        }
-        shader_sync_active = true;
-        SCOPE_EXIT { shader_sync_active = false; };
-        ShowShaderSync(this, program_id);
-    });
     connect(game_list, &GameList::RemoveInstalledEntryRequested, this,
             &MainWindow::OnGameListRemoveInstalledEntry);
     connect(game_list, &GameList::RemoveFileRequested, this, &MainWindow::OnGameListRemoveFile);
@@ -1553,10 +1762,14 @@ void MainWindow::ConnectWidgetEvents() {
             &MainWindow::OnGameListVerifyIntegrity);
     connect(game_list, &GameList::ConvertToNupRequested, this,
             &MainWindow::OnGameListConvertToNup);
+    connect(game_list, &GameList::PrepareShaderWarmRequested, this,
+            &MainWindow::OnGameListPrepareShaderWarm);
+    connect(game_list, &GameList::DeleteShaderWarmRequested, this,
+            &MainWindow::OnGameListDeleteShaderWarm);
     connect(game_list, &GameList::ExtractNupRequested, this, &MainWindow::OnGameListExtractNup);
     connect(game_list, &GameList::EditNupMetadataRequested, this,
             &MainWindow::OnGameListEditNupMetadata);
-#ifdef JINRA_NX_TOOLS
+#ifdef LICHII_NX_TOOLS
     nx_tools = new NxTools(QtCommon::vfs, this);
     connect(nx_tools, &NxTools::RunningChanged, game_list, &GameList::SetNxToolRunning);
     connect(nx_tools, &NxTools::ArchivesChanged, this, &MainWindow::OnGameListRefresh);
@@ -1625,6 +1838,11 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Open_Mods_Page, &MainWindow::OnOpenModsPage);
     connect_menu(ui->action_Open_UserHandbook, &MainWindow::OnOpenUserHandbook);
     connect_menu(ui->action_Restart, &MainWindow::OnRestartGame);
+    action_prepare_shaders_now = new QAction(tr("Prepare &Shaders Now"), this);
+    action_prepare_shaders_now->setEnabled(false);
+    ui->menu_Emulation->insertAction(ui->action_Configure, action_prepare_shaders_now);
+    ui->menu_Emulation->insertSeparator(ui->action_Configure);
+    connect_menu(action_prepare_shaders_now, &MainWindow::OnPrepareShadersNow);
     connect_menu(ui->action_Configure, &MainWindow::OnConfigure);
     connect_menu(ui->action_Configure_Current_Game, &MainWindow::OnConfigurePerGame);
 
@@ -1634,6 +1852,9 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Show_Filter_Bar, &MainWindow::OnToggleFilterBar);
     connect_menu(ui->action_Show_Status_Bar, &MainWindow::OnToggleStatusBar);
     connect_menu(ui->action_Show_Performance_Overlay, &MainWindow::OnTogglePerfOverlay);
+    // The overlays read the setting with their next update (about once a second).
+    connect(ui->action_Show_Frame_Times, &QAction::toggled, this,
+            [](bool checked) { UISettings::values.perf_overlay_times = checked; });
 #ifdef HAS_RESHADE
     connect_menu(ui->action_Post_Processing_Shaders, &MainWindow::OnPostProcessingShaders);
 #else
@@ -1741,7 +1962,6 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_SDMC_Folder, &MainWindow::OnOpenSDMCFolder);
     connect_menu(ui->action_Mod_Folder, &MainWindow::OnOpenModFolder);
     connect_menu(ui->action_Log_Folder, &MainWindow::OnOpenLogFolder);
-    connect_menu(ui->action_Export_Logs, &MainWindow::OnExportLogs);
 
     connect_menu(ui->action_Verify_installed_contents, &MainWindow::OnVerifyInstalledContents);
     connect_menu(ui->action_Firmware_From_Folder, &MainWindow::OnInstallFirmware);
@@ -1751,62 +1971,22 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Eden_Dependencies, &MainWindow::OnEdenDependencies);
     connect_menu(ui->action_Data_Manager, &MainWindow::OnDataDialog);
 
-#if defined(ENABLE_UPDATE_CHECKER) && (defined(__linux__) || defined(_WIN32))
-    auto* restore_action = ui->menu_Help->addAction(tr("Restore Previous Version..."));
-    restore_action->setVisible(false);
-#ifdef __linux__
-    const auto previous_version = [] {
-        const std::filesystem::path target{qEnvironmentVariable("APPIMAGE").toStdString()};
-        std::error_code ec;
-        return !target.empty() && std::filesystem::is_regular_file(
-                                      UpdateInstaller::PreviousPath(target), ec)
-                   ? target
-                   : std::filesystem::path{};
-    };
-#else
-    const auto previous_version = [] {
-        const std::filesystem::path backup =
-            std::filesystem::path{QCoreApplication::applicationDirPath().toStdWString()} /
-            UpdateInstaller::BackupName;
-        std::error_code ec;
-        return std::filesystem::is_directory(backup, ec) ? backup : std::filesystem::path{};
-    };
-#endif
-    connect(ui->menu_Help, &QMenu::aboutToShow, restore_action,
-            [restore_action, previous_version] {
-                restore_action->setVisible(!previous_version().empty());
-            });
-    connect(restore_action, &QAction::triggered, this, [this, previous_version] {
-        const auto previous = previous_version();
-        if (previous.empty()) {
-            return;
+#ifdef ENABLE_UPDATE_CHECKER
+    auto* check_action = new QAction(tr("Check for Updates..."), this);
+    ui->menu_Help->insertAction(ui->action_About, check_action);
+    connect(check_action, &QAction::triggered, this, &MainWindow::OnCheckForUpdates);
+
+    auto* rollback_action = new QAction(tr("Roll Back to the Previous Version..."), this);
+    rollback_action->setVisible(false);
+    ui->menu_Help->insertAction(ui->action_About, rollback_action);
+    connect(ui->menu_Help, &QMenu::aboutToShow, this, [this, rollback_action] {
+        rollback_action->setVisible(Updater::RollbackVersion().has_value());
+        rollback_action->setEnabled(!emulation_running && !boot_in_progress);
+    });
+    connect(rollback_action, &QAction::triggered, this, [this] {
+        if (!emulation_running && !boot_in_progress) {
+            Updater::RollBack(this);
         }
-        const auto answer = QtCommon::Frontend::Question(
-            tr("Restore Previous Version"),
-            tr("Go back to the version this one replaced? Your settings and data are not "
-               "changed."),
-            QtCommon::Frontend::Yes | QtCommon::Frontend::No);
-        if (answer != QtCommon::Frontend::Yes) {
-            return;
-        }
-#ifdef __linux__
-        const UpdateInstaller::Lock lock{UpdateInstaller::LockPath(previous)};
-        std::error_code ec;
-        if (!lock.Held()) {
-            ec = std::make_error_code(std::errc::device_or_resource_busy);
-        }
-        if (!lock.Held() || !UpdateInstaller::Rollback(previous, ec)) {
-            LOG_ERROR(Frontend, "Could not restore the previous version: {}", ec.message());
-            QtCommon::Frontend::Critical(tr("Failed to restore"),
-                                         tr("Could not restore the previous version: %1")
-                                             .arg(QString::fromStdString(ec.message())));
-            return;
-        }
-        LOG_INFO(Frontend, "Restored the previous version of {}", previous.string());
-        UpdateDialog::Restart(this, QString::fromStdString(previous.string()));
-#else
-        UpdateDialog::LaunchInstaller(this, QString::fromStdWString(previous.wstring()));
-#endif
     });
 #endif
 }
@@ -1831,6 +2011,9 @@ void MainWindow::UpdateMenuState() {
 
     for (QAction* action : running_actions) {
         action->setEnabled(emulation_running);
+    }
+    if (action_prepare_shaders_now) {
+        action_prepare_shaders_now->setEnabled(emulation_running);
     }
 
     ui->action_Firmware_From_Folder->setEnabled(!emulation_running);
@@ -1885,6 +2068,7 @@ void MainWindow::OnPrepareForSleep(bool prepare_sleep) {
     if (prepare_sleep) {
         if (QtCommon::emu_thread->IsRunning()) {
             auto_paused = true;
+            LOG_INFO(Frontend, "Pausing: the PC is going to sleep");
             OnPauseGame();
         }
     } else {
@@ -2007,25 +2191,16 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
 
     if (result != Core::SystemResultStatus::Success) {
         switch (result) {
-        case Core::SystemResultStatus::ErrorMemoryAllocation:
-            QMessageBox::critical(
-                this, tr("Not enough memory to start the game"),
-                tr("Jinra could not allocate the game's memory. Close other applications and "
-                   "check that your system has enough available memory and paging-file space, "
-                   "then try again."));
-            break;
         case Core::SystemResultStatus::ErrorGetLoader:
             LOG_CRITICAL(Frontend, "Failed to obtain loader for {}!", filename.toStdString());
-            QMessageBox::critical(this, tr("Error while loading ROM!"),
-                                  tr("The ROM format is not supported."));
+            ShowErrorWithExportLog(tr("Error while loading ROM!"),
+                                   tr("The ROM format is not supported."));
             break;
         case Core::SystemResultStatus::ErrorVideoCore:
-            QMessageBox::critical(
-                this, tr("An error occurred initializing the video core."),
+            ShowErrorWithExportLog(
+                tr("An error occurred initializing the video core."),
                 tr("This is usually caused by outdated GPU drivers. "
-                   "Please see the log for more details. See: "
-                   "<a href='https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/user/HowToAccessLogs.md'>"
-                   "How to access log files</a>."));
+                   "Please see the log for more details."));
             break;
         default:
             if (result > Core::SystemResultStatus::ErrorLoader) {
@@ -2043,10 +2218,10 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
                         .arg(QString::fromStdString(
                             GetResultStatusString(static_cast<Loader::ResultStatus>(error_id))));
 
-                QMessageBox::critical(this, title, description);
+                ShowErrorWithExportLog(title, description);
             } else {
-                QMessageBox::critical(
-                    this, tr("Error while loading ROM!"),
+                ShowErrorWithExportLog(
+                    tr("Error while loading ROM!"),
                     tr("An unknown error occurred. Please see the log for more details."));
             }
             break;
@@ -2075,7 +2250,7 @@ bool MainWindow::SelectAndSetCurrentUser(
 
 void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletParameters params,
                           StartGameType type) {
-#ifdef JINRA_NX_TOOLS
+#ifdef LICHII_NX_TOOLS
     if (nx_metadata_write_in_progress) {
         QMessageBox::information(this, tr("NX Archive"),
                                  tr("Wait for the NX metadata edit to finish before starting a game."));
@@ -2088,7 +2263,15 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                                     "converted."));
         return;
     }
-    if (boot_in_progress || close_pending || shader_sync_active) {
+    if (shader_warm_dialog && shader_warm_dialog->IsRunning()) {
+        QMessageBox::information(this, tr("Shader Warm-up in Progress"),
+                                 tr("Games cannot be started while the shader warm-up is being "
+                                    "prepared. Wait for it to finish or cancel it."));
+        shader_warm_dialog->raise();
+        shader_warm_dialog->activateWindow();
+        return;
+    }
+    if (boot_in_progress || close_pending) {
         return;
     }
     boot_in_progress = true;
@@ -2207,8 +2390,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
             prepared_romfs = watcher.result();
         } catch (const std::exception& error) {
             LOG_ERROR(Frontend, "Loose RomFS preparation failed: {}", error.what());
-            QMessageBox::critical(this, tr("Unable to prepare game files"),
-                                  tr("Game preparation failed. See the log for details."));
+            ShowErrorWithExportLog(tr("Unable to prepare game files"),
+                                   tr("Game preparation failed. See the log for details."));
             return;
         }
         if (close_pending) {
@@ -2275,7 +2458,6 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     // Update the GUI
     UpdateStatusButtons();
     jinra_home->SetEmulating(true);
-    statusBar()->setVisible(ui->action_Show_Status_Bar->isChecked());
     if (ui->action_Single_Window_Mode->isChecked()) {
         jinra_home->hide();
         game_list->hide();
@@ -2283,11 +2465,6 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     }
     status_bar_update_timer.start(500);
     renderer_status_button->setDisabled(true);
-    frame_gen_status_button->setDisabled(true);
-    frame_gen_state = VideoCore::FrameGenState::Pending;
-    frame_gen_frames = 0;
-    dlss_evaluations = 0;
-    frame_gen_generating = false;
     refresh_button->setDisabled(true);
     SetFPSSuffix();
 
@@ -2326,6 +2503,20 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                      .arg(QString::fromStdString(title_name), instruction_set_suffix)
                      .toStdString();
     LOG_INFO(Frontend, "Booting game: {:016X} | {} | {}", title_id, title_name, title_version);
+    if (const std::string switches = Nx2SwitchSummary(); !switches.empty()) {
+        LOG_INFO(Frontend, "Test switches: {}", switches);
+    } else {
+        LOG_INFO(Frontend, "Test switches: none set");
+    }
+    if (ProfilingMode::Active()) {
+        const std::string& applied = ProfilingMode::Applied();
+        LOG_INFO(Frontend, "Profiling mode ON: {}",
+                 applied.empty() ? std::string{"no switches added (all set elsewhere)"} : applied);
+    }
+#ifdef _WIN32
+    LOG_INFO(Frontend, "Power: {}", WindowsPowerText());
+    Common::LogCpuPlacement();
+#endif
     const auto gpu_vendor = QtCommon::system->GPU().Renderer().GetDeviceVendor();
     UpdateWindowTitle(title_name, title_version, gpu_vendor);
 
@@ -2335,8 +2526,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     emulation_running = true;
     if (ui->action_Fullscreen->isChecked()) {
         ShowFullscreen();
-    } else if (!(ui->action_Single_Window_Mode->isChecked() ? isMaximized()
-                                                            : render_window->isMaximized())) {
+    } else {
         if (Settings::IsDockedMode()) {
             ResetWindowSize1080();
         } else {
@@ -2353,6 +2543,10 @@ void MainWindow::BootGameFromList(const QString& filename, StartGameType with_co
 bool MainWindow::OnShutdownBegin() {
     if (!emulation_running) {
         return false;
+    }
+
+    if (shader_warm_run_dialog) {
+        shader_warm_run_dialog->close();
     }
 
     if (ui->action_Fullscreen->isChecked()) {
@@ -2381,6 +2575,7 @@ bool MainWindow::OnShutdownBegin() {
     QtCommon::system->SetShuttingDown(true);
     status_bar_update_timer.stop();
     LOG_INFO(Frontend, "Shutdown requested; waiting for emulation thread");
+    Common::ShutdownWatch::Begin("frontend: game exit requested, waiting for the emulation thread");
     discord_rpc->Pause();
 
     RequestGameExit();
@@ -2421,6 +2616,9 @@ void MainWindow::OnShutdownBeginDialog() {
 void MainWindow::OnEmulationStopTimeExpired() {
     if (QtCommon::emu_thread) {
         QtCommon::emu_thread->ForceStop();
+        Common::ShutdownWatch::Step("frontend: emulation thread force-stopped, waiting for it");
+        emu_force_stop_clock.start();
+        shutdown_progress_seen = Common::ShutdownProgress();
         emu_terminate_timer.setSingleShot(true);
         emu_terminate_timer.start(EmuThreadStopTimeoutMs);
         connect(&emu_terminate_timer, &QTimer::timeout, this, &MainWindow::OnEmulationStopTimeout,
@@ -2428,7 +2626,25 @@ void MainWindow::OnEmulationStopTimeExpired() {
     }
 }
 
+bool MainWindow::EmulationShutdownProgressing() {
+    const u64 progress = Common::ShutdownProgress();
+    const bool moved = progress != shutdown_progress_seen;
+    shutdown_progress_seen = progress;
+    return moved && emu_force_stop_clock.isValid() &&
+           emu_force_stop_clock.elapsed() < MaxEmuThreadShutdownMs;
+}
+
 void MainWindow::OnEmulationStopTimeout() {
+    // Terminating the thread mid-teardown can leave a lock it holds (the heap's, the driver's)
+    // taken for good, which froze the whole app. While the teardown still moves (pipeline caches
+    // written, pipelines destroyed), it gets another timeout.
+    if (QtCommon::emu_thread && QtCommon::emu_thread->isRunning() &&
+        EmulationShutdownProgressing()) {
+        LOG_INFO(Frontend, "Emulation thread still shutting down after {} ms, waiting",
+                 emu_force_stop_clock.elapsed());
+        emu_terminate_timer.start(EmuThreadStopTimeoutMs);
+        return;
+    }
     TerminateEmulationThread();
     OnEmulationStopped();
 }
@@ -2436,6 +2652,7 @@ void MainWindow::OnEmulationStopTimeout() {
 void MainWindow::TerminateEmulationThread() {
     if (QtCommon::emu_thread && QtCommon::emu_thread->isRunning()) {
         LOG_ERROR(Frontend, "Emulation thread failed to stop, terminating it");
+        Common::ShutdownWatch::Step("frontend: terminating the emulation thread");
         QtCommon::emu_thread->terminate();
         QtCommon::emu_thread->wait();
     }
@@ -2450,11 +2667,13 @@ void MainWindow::OnEmulationStopped() {
     }
     shutdown_timer.stop();
     emu_terminate_timer.stop();
+    Common::ShutdownWatch::Step("frontend: emulation thread ended, joining it");
     if (QtCommon::emu_thread) {
         QtCommon::emu_thread->disconnect();
         QtCommon::emu_thread->wait();
         QtCommon::emu_thread.reset();
     }
+    Common::ShutdownWatch::Step("frontend: emulation cleanup (window, input devices)");
 
     if (shutdown_dialog) {
         shutdown_dialog->deleteLater();
@@ -2476,14 +2695,13 @@ void MainWindow::OnEmulationStopped() {
     loading_screen->hide();
     loading_screen->Clear();
     jinra_home->SetEmulating(false);
-    statusBar()->hide();
     jinra_home->show();
-    if (game_list->IsEmpty()) {
-        game_list_placeholder->show();
+    OnGameListShowList(!game_list->IsEmpty());
+    if (jinra_home->IsHomeChromeActive()) {
+        game_list->FocusLibrary();
     } else {
-        game_list->show();
+        game_list->SetFilterFocus();
     }
-    game_list->SetFilterFocus();
     tas_label->clear();
     input_subsystem->GetTas()->Stop();
     OnTasStateChanged();
@@ -2501,14 +2719,14 @@ void MainWindow::OnEmulationStopped() {
 
     // Disable status bar updates
     status_bar_update_timer.stop();
+    shader_warm_label->setVisible(false);
     shader_building_label->setVisible(false);
     res_scale_label->setVisible(false);
     emu_speed_label->setVisible(false);
     game_fps_label->setVisible(false);
-    dlss_status_label->hide();
+    dlss_status_label->setVisible(false);
     emu_frametime_label->setVisible(false);
     renderer_status_button->setEnabled(!UISettings::values.has_broken_vulkan);
-    frame_gen_status_button->setEnabled(true);
     refresh_button->setEnabled(true);
 
     if (!firmware_label->text().isEmpty()) {
@@ -2527,7 +2745,16 @@ void MainWindow::OnEmulationStopped() {
     QtCommon::system->HIDCore().ReloadInputDevices();
     UpdateStatusButtons();
     LOG_INFO(Frontend, "Emulation cleanup completed");
+#ifdef ENABLE_UPDATE_CHECKER
+    if (pending_update && !close_pending) {
+        QTimer::singleShot(0, this, &MainWindow::OfferPendingUpdate);
+    }
+#endif
+    if (!close_pending) {
+        Common::ShutdownWatch::End(); // the stop is done, the app stays open
+    }
     if (close_pending) {
+        Common::ShutdownWatch::Step("frontend: emulation cleaned up, window close queued");
         QTimer::singleShot(0, this, &QWidget::close);
     } else if (!boot_in_progress) {
         game_list->SetScanEnabled(true);
@@ -2540,7 +2767,7 @@ void MainWindow::ShutdownGame() {
         return;
     }
 
-    // TODO(crueter): make this common as well (frontend_common?)
+    // TODO: make this common as well (frontend_common?)
     play_time_manager->Stop();
     OnShutdownBegin();
     OnEmulationStopTimeExpired();
@@ -2551,8 +2778,13 @@ void MainWindow::ShutdownGame() {
         timeout.setSingleShot(true);
         connect(QtCommon::emu_thread.get(), &QThread::finished, &loop, &QEventLoop::quit);
         connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
-        timeout.start(EmuThreadStopTimeoutMs);
-        loop.exec(QEventLoop::ExcludeUserInputEvents);
+        // Waits on while the teardown still makes progress (see OnEmulationStopTimeout).
+        do {
+            timeout.start(EmuThreadStopTimeoutMs);
+            loop.exec(QEventLoop::ExcludeUserInputEvents);
+            // OnEmulationStopped (on QThread::finished) may have reset the thread meanwhile.
+        } while (QtCommon::emu_thread && QtCommon::emu_thread->isRunning() &&
+                 EmulationShutdownProgressing());
     }
     TerminateEmulationThread();
     OnEmulationStopped();
@@ -2596,7 +2828,7 @@ void MainWindow::OnGameListLoadFile(QString game_path, u64 program_id) {
     BootGame(game_path, params);
 }
 
-// TODO(crueter): Common profile selector
+// TODO: Common profile selector
 void MainWindow::OnGameListOpenFolder(u64 program_id, GameListOpenTarget target,
                                       const std::string& game_path) {
     std::filesystem::path path;
@@ -2670,8 +2902,9 @@ void MainWindow::OnGameListOpenFolder(u64 program_id, GameListOpenTarget target,
                              tr("Folder does not exist!"));
         return;
     }
-    LOG_INFO(Frontend, "Opening {} path for program_id={:016x}", open_target.toStdString(),
-             program_id);
+    // The path too (2026-11-11: Explorer said a save folder that exists "isn't available").
+    LOG_INFO(Frontend, "Opening {} path for program_id={:016x}: {}", open_target.toStdString(),
+             program_id, qpath.toStdString());
     QDesktopServices::openUrl(QUrl::fromLocalFile(qpath));
 }
 
@@ -2737,7 +2970,7 @@ static bool RomFSRawCopy(size_t total_size, size_t& read_size, QProgressDialog& 
     return true;
 }
 
-// TODO(crueter): All this can be transfered to qt_common
+// TODO: All this can be transfered to qt_common
 // Aldoe I need to decide re: message boxes for QML
 // translations_common? strings_common? qt_strings? who knows
 void MainWindow::OnGameListRemoveInstalledEntry(u64 program_id,
@@ -2760,7 +2993,7 @@ void MainWindow::OnGameListRemoveInstalledEntry(u64 program_id,
         return;
     }
 
-    // TODO(crueter): move this to QtCommon (populate async?)
+    // TODO: move this to QtCommon (populate async?)
     switch (type) {
     case QtCommon::Game::InstalledEntryType::Game:
         QtCommon::Game::RemoveBaseContent(program_id, type);
@@ -2981,7 +3214,7 @@ void MainWindow::OnGameListCreateShortcut(u64 program_id, const std::string& gam
 }
 
 void MainWindow::OnGameListOpenDirectory(const QString& directory) {
-    // TODO(crueter): QtCommon
+    // TODO: QtCommon
     std::filesystem::path fs_path;
     if (directory == QStringLiteral("SDMC")) {
         fs_path =
@@ -3375,6 +3608,7 @@ void MainWindow::OnPauseGame() {
 void MainWindow::OnPauseContinueGame() {
     if (emulation_running) {
         if (QtCommon::emu_thread->IsRunning()) {
+            LOG_INFO(Frontend, "Pausing: the Pause action (menu, hotkey or button)");
             OnPauseGame();
         } else {
             OnStartGame();
@@ -3419,10 +3653,17 @@ bool MainWindow::ConfirmShutdownGame() {
 void MainWindow::OnLoadComplete() {
     loading_screen->OnLoadComplete();
 
-    perf_overlay = new PerformanceOverlay(this);
+    if (FritchiiUi::Enabled()) {
+        perf_overlay = new FritchiiUi::PerfOverlay(
+            this, [this] { ui->action_Show_Performance_Overlay->setChecked(false); });
+        perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
+        return;
+    }
+    auto* overlay = new PerformanceOverlay(this);
+    perf_overlay = overlay;
     perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
 
-    connect(perf_overlay, &PerformanceOverlay::closed, perf_overlay,
+    connect(overlay, &PerformanceOverlay::closed, overlay,
             [this]() { ui->action_Show_Performance_Overlay->setChecked(false); });
 }
 
@@ -3536,7 +3777,7 @@ void MainWindow::OnOpenModsPage() {
 }
 
 void MainWindow::OnOpenUserHandbook() {
-    OpenURL(QUrl(QStringLiteral("https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/user/README.md")));
+    OpenURL(QUrl(QStringLiteral("https://github.com/Frizti/Fritchii#readme")));
 }
 
 void MainWindow::ToggleFullscreen() {
@@ -3574,25 +3815,16 @@ void MainWindow::ShowFullscreen() {
             window->showFullScreen();
             return;
         }
-#ifdef _WIN32
-        // Let Windows activate the borderless game window before restoring its tool window.
-        const bool restore_overlay = window == this && perf_overlay && perf_overlay->isVisible();
-        if (restore_overlay) {
-            perf_overlay->hide();
-        }
-#endif
         window->hide();
+        // A maximized window keeps the work area and ignores the new geometry, so the taskbar
+        // stays visible; the saved geometry restores the maximized state afterwards.
+        window->setWindowState(window->windowState() & ~Qt::WindowMaximized);
         window->setWindowFlags(window->windowFlags() | Qt::FramelessWindowHint);
         const auto screen_geometry = GuessCurrentScreen(window)->geometry();
         window->setGeometry(screen_geometry.x(), screen_geometry.y(), screen_geometry.width(),
                             screen_geometry.height() + 1);
         window->raise();
         window->showNormal();
-#ifdef _WIN32
-        if (restore_overlay) {
-            perf_overlay->show();
-        }
-#endif
     };
 
     if (ui->action_Single_Window_Mode->isChecked()) {
@@ -3621,8 +3853,9 @@ void MainWindow::HideFullscreen() {
             show();
         }
 
-        statusBar()->setVisible(emulation_running && ui->action_Show_Status_Bar->isChecked());
-        ui->menubar->show();
+        statusBar()->setVisible(!jinra_home->IsHomeChromeActive() &&
+                                ui->action_Show_Status_Bar->isChecked());
+        ui->menubar->setVisible(!jinra_home->IsHomeChromeActive());
     } else {
         if (UsingExclusiveFullscreen()) {
             render_window->showNormal();
@@ -3659,7 +3892,7 @@ void MainWindow::ToggleWindowMode() {
             render_window->setVisible(true);
             render_window->RestoreGeometry();
             jinra_home->show();
-            game_list->show();
+            OnGameListShowList(!game_list->IsEmpty());
         }
     }
 }
@@ -3668,17 +3901,6 @@ void MainWindow::ResetWindowSize(u32 width, u32 height) {
     const auto aspect_ratio = Layout::EmulationAspectRatio(Settings::values.aspect_ratio.GetValue(),
                                                            float(height) / width);
     const bool single_window = ui->action_Single_Window_Mode->isChecked();
-    // Resizing a maximized window leaves it marked as maximized at the new size, stuck in a corner.
-    if (single_window && isMaximized()) {
-        showNormal();
-    } else if (!single_window && render_window->isMaximized()) {
-        // A stopped game hides the render window; showNormal() would show it again.
-        if (render_window->isHidden()) {
-            render_window->setWindowState(render_window->windowState() & ~Qt::WindowMaximized);
-        } else {
-            render_window->showNormal();
-        }
-    }
     const bool show_status_bar = ui->action_Show_Status_Bar->isChecked();
     const auto status_bar_height = (single_window && show_status_bar) ? statusBar()->height() : 0;
     const auto menu_bar_height = single_window ? menuBar()->height() : 0;
@@ -3786,159 +4008,170 @@ void MainWindow::ToggleShowGameName() {
     game_list->RefreshGameDirectory();
 }
 
-struct MainWindow::ConfigurationSnapshot {
-    std::string theme = UISettings::values.theme;
-    bool discord_presence = UISettings::values.enable_discord_presence.GetValue();
-    Settings::Language language_index = Settings::values.language_index.GetValue();
-    bool gamemode = UISettings::values.enable_gamemode.GetValue();
-#ifdef __unix__
-    bool force_x11 = UISettings::values.gui_force_x11.GetValue();
-#endif
-};
-
 void MainWindow::OnConfigure() {
-    if (jinra_home->IsHomeChromeActive()) {
-        OpenHomeSettings(0);
-    } else {
-        OpenDesktopSettings(0);
-    }
+    OpenConfiguration(0);
 }
 
-void MainWindow::OpenDesktopSettings(int category) {
-    const ConfigurationSnapshot previous;
-    Settings::SetConfiguringGlobal(true);
-    ConfigureDialog configure_dialog(this, hotkey_registry, input_subsystem.get(),
-                                     vk_device_records, *QtCommon::system,
-                                     !multiplayer_state->IsHostingPublicRoom());
-    connect(&configure_dialog, &ConfigureDialog::LanguageChanged, this,
-            &MainWindow::OnLanguageChanged);
-    connect(&configure_dialog, &ConfigureDialog::ExternalContentDirsChanged, this,
-            &MainWindow::OnGameListRefresh);
-
-    configure_dialog.SelectCategory(category);
-    const auto result = configure_dialog.exec();
-    if (result != QDialog::Accepted && !UISettings::values.configuration_applied &&
-        !UISettings::values.reset_to_defaults) {
-        // Runs if the user hit Cancel or closed the window, and did not ever press the Apply button
-        // or `Reset to Defaults` button
+void MainWindow::OpenConfiguration(int category) {
+    if (jinra_home->IsShowingSettings()) {
         return;
-    } else if (result == QDialog::Accepted) {
-        // Only apply new changes if user hit Okay
-        // This is here to avoid applying changes if the user hit Apply, made some changes, then hit
-        // Cancel
-        configure_dialog.ApplyConfiguration();
     }
-    FinishConfiguration(previous);
-}
-
-void MainWindow::OpenHomeSettings(int category) {
-    const ConfigurationSnapshot previous;
-    Settings::SetConfiguringGlobal(true);
-    auto settings = std::make_unique<ConfigurationPages>(
-        jinra_home, hotkey_registry, input_subsystem.get(), vk_device_records, *QtCommon::system,
-        !multiplayer_state->IsHostingPublicRoom());
-    connect(settings.get(), &ConfigurationPages::LanguageChanged, this,
-            &MainWindow::OnLanguageChanged);
-    connect(settings.get(), &ConfigurationPages::ExternalContentDirsChanged, this,
-            &MainWindow::OnGameListRefresh);
-    jinra_home->ShowSettings(std::move(settings), category, [this, previous](bool accepted) {
-        if (accepted || UISettings::values.reset_to_defaults) {
-            FinishConfiguration(previous);
-        }
-    });
-}
-
-void MainWindow::FinishConfiguration(const ConfigurationSnapshot& previous) {
-    if (UISettings::values.reset_to_defaults) {
-        LOG_INFO(Frontend, "Resetting all settings to defaults");
-        if (!Common::FS::RemoveFile(config->GetConfigFilePath())) {
-            LOG_WARNING(Frontend, "Failed to remove configuration file");
-        }
-        if (!Common::FS::RemoveDirContentsRecursively(
-                Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "custom")) {
-            LOG_WARNING(Frontend, "Failed to remove custom configuration files");
-        }
-        if (!Common::FS::RemoveDirRecursively(
-                Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "game_list")) {
-            LOG_WARNING(Frontend, "Failed to remove game metadata cache files");
-        }
-
-        // Explicitly save the game directories, since reinitializing config does not explicitly do
-        // so.
-        QVector<UISettings::GameDir> old_game_dirs = std::move(UISettings::values.game_dirs);
-        QVector<u64> old_favorited_ids = std::move(UISettings::values.favorited_ids);
-
-        Settings::values.disabled_addons.clear();
-
-        config = std::make_unique<QtConfig>();
-        UISettings::values.reset_to_defaults = false;
-
-        UISettings::values.game_dirs = std::move(old_game_dirs);
-        UISettings::values.favorited_ids = std::move(old_favorited_ids);
-
-        InitializeRecentFileMenuActions();
-
-        SetDefaultUIGeometry();
-        RestoreUIState();
-    }
-    InitializeHotkeys();
-
-    if (UISettings::values.theme != previous.theme) {
-        UpdateUITheme();
-    }
-    if (UISettings::values.enable_discord_presence.GetValue() != previous.discord_presence) {
-        SetDiscordEnabled(UISettings::values.enable_discord_presence.GetValue());
-    }
-    if (UISettings::values.enable_gamemode.GetValue() != previous.gamemode) {
-        SetGamemodeEnabled(UISettings::values.enable_gamemode.GetValue());
-    }
+    const auto old_theme = UISettings::values.theme;
+    const bool old_discord_presence = UISettings::values.enable_discord_presence.GetValue();
+    const auto old_language_index = Settings::values.language_index.GetValue();
+    const bool old_gamemode = UISettings::values.enable_gamemode.GetValue();
 #ifdef __unix__
-    if (UISettings::values.gui_force_x11.GetValue() != previous.force_x11) {
-        GraphicsBackend::SetForceX11(UISettings::values.gui_force_x11.GetValue());
-    }
+    const bool old_force_x11 = UISettings::values.gui_force_x11.GetValue();
 #endif
 
-    if (!multiplayer_state->IsHostingPublicRoom()) {
-        multiplayer_state->UpdateCredentials();
+    const auto finish = [=, this](bool accepted) {
+        if (!accepted && !UISettings::values.configuration_applied &&
+            !UISettings::values.reset_to_defaults) {
+            return;
+        }
+        if (UISettings::values.reset_to_defaults) {
+            // Fritchii: the current settings are saved first (Settings > General > Restore Settings),
+            // a restore puts a saved set back, and a reset ends on Fritchii's own settings with the
+            // controls kept (2026-11-09).
+            const bool fritchii = FritchiiUi::Enabled();
+            const QString restore = std::exchange(FritchiiUi::PendingSettingsRestore(), QString{});
+            const auto old_players = Settings::values.players.GetValue(true);
+            if (fritchii) {
+                FritchiiUi::BackupSettings();
+            }
+            LOG_INFO(Frontend, "{}", restore.isEmpty() ? "Resetting all settings to defaults"
+                                                       : "Restoring saved settings");
+            if (!Common::FS::RemoveFile(config->GetConfigFilePath())) {
+                LOG_WARNING(Frontend, "Failed to remove configuration file");
+            }
+            if (!Common::FS::RemoveDirContentsRecursively(
+                    Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "custom")) {
+                LOG_WARNING(Frontend, "Failed to remove custom configuration files");
+            }
+            if (!Common::FS::RemoveDirRecursively(
+                    Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "game_list")) {
+                LOG_WARNING(Frontend, "Failed to remove game metadata cache files");
+            }
+
+            // Explicitly save the game directories, since reinitializing config does not explicitly do
+            // so.
+            QVector<UISettings::GameDir> old_game_dirs = std::move(UISettings::values.game_dirs);
+            QVector<u64> old_favorited_ids = std::move(UISettings::values.favorited_ids);
+
+            Settings::values.disabled_addons.clear();
+
+            if (!restore.isEmpty() && !FritchiiUi::RestoreSettingsFiles(restore)) {
+                QMessageBox::warning(this, tr("Restore Settings"),
+                                     tr("Some settings could not be restored. Jinra's defaults "
+                                        "fill the gaps."));
+            }
+            config = std::make_unique<QtConfig>();
+            UISettings::values.reset_to_defaults = false;
+
+            UISettings::values.game_dirs = std::move(old_game_dirs);
+            UISettings::values.favorited_ids = std::move(old_favorited_ids);
+            if (fritchii && restore.isEmpty()) {
+                // The tuned settings now, not at the next start (the revision went back to 0).
+                Settings::values.players.GetValue(true) = old_players;
+                MigrateFriztiSettings();
+                config->SaveAllValues();
+            }
+
+            InitializeRecentFileMenuActions();
+
+            SetDefaultUIGeometry();
+            RestoreUIState();
+        }
+        InitializeHotkeys();
+
+        if (UISettings::values.theme != old_theme) {
+            UpdateUITheme();
+        }
+        if (UISettings::values.enable_discord_presence.GetValue() != old_discord_presence) {
+            SetDiscordEnabled(UISettings::values.enable_discord_presence.GetValue());
+        }
+        if (UISettings::values.enable_gamemode.GetValue() != old_gamemode) {
+            SetGamemodeEnabled(UISettings::values.enable_gamemode.GetValue());
+        }
+#ifdef __unix__
+        if (UISettings::values.gui_force_x11.GetValue() != old_force_x11) {
+            GraphicsBackend::SetForceX11(UISettings::values.gui_force_x11.GetValue());
+        }
+#endif
+
+        if (!multiplayer_state->IsHostingPublicRoom()) {
+            multiplayer_state->UpdateCredentials();
+        }
+
+        emit UpdateThemedIcons();
+
+        const auto reload = UISettings::values.is_game_list_reload_pending.exchange(false);
+        if (reload || Settings::values.language_index.GetValue() != old_language_index) {
+            game_list->PopulateAsync(UISettings::values.game_dirs);
+        }
+
+        UISettings::values.configuration_applied = false;
+
+        config->SaveAllValues();
+
+        if ((UISettings::values.hide_mouse || Settings::values.mouse_panning) && emulation_running) {
+            render_window->installEventFilter(render_window);
+            render_window->setAttribute(Qt::WA_Hover, true);
+        } else {
+            render_window->removeEventFilter(render_window);
+            render_window->setAttribute(Qt::WA_Hover, false);
+        }
+
+        if (UISettings::values.hide_mouse) {
+            mouse_hide_timer.start();
+        }
+
+        // Restart camera config
+        if (emulation_running) {
+            render_window->FinalizeCamera();
+            render_window->InitializeCamera();
+        }
+
+        if (!UISettings::values.has_broken_vulkan) {
+            renderer_status_button->setEnabled(!emulation_running);
+        }
+
+        jinra_home->ReloadSettings();
+        UpdateStatusButtons();
+        controller_dialog->refreshConfiguration();
+        QtCommon::system->ApplySettings();
+
+        // Ocarina of Time: its high refresh rate checkbox switches the running game too.
+        if (IsOotRunning() &&
+            Settings::values.oot_high_refresh.GetValue() != Settings::OotHighRefreshPatched()) {
+            SetOotHighRefresh(Settings::values.oot_high_refresh.GetValue());
+        }
+    };
+
+    Settings::SetConfiguringGlobal(true);
+    if (jinra_home->IsHomeChromeActive()) {
+        auto settings = std::make_unique<ConfigurationPages>(
+            jinra_home, hotkey_registry, input_subsystem.get(), vk_device_records,
+            *QtCommon::system, !multiplayer_state->IsHostingPublicRoom());
+        connect(settings.get(), &ConfigurationPages::LanguageChanged, this,
+                &MainWindow::OnLanguageChanged);
+        connect(settings.get(), &ConfigurationPages::ExternalContentDirsChanged, this,
+                &MainWindow::OnGameListRefresh);
+        jinra_home->ShowSettings(std::move(settings), category, finish);
+        return;
     }
 
-    emit UpdateThemedIcons();
-
-    const auto reload = UISettings::values.is_game_list_reload_pending.exchange(false);
-    if (reload || Settings::values.language_index.GetValue() != previous.language_index) {
-        game_list->PopulateAsync(UISettings::values.game_dirs);
+    ConfigureDialog dialog(this, hotkey_registry, input_subsystem.get(), vk_device_records,
+                           *QtCommon::system, !multiplayer_state->IsHostingPublicRoom());
+    connect(&dialog, &ConfigureDialog::LanguageChanged, this, &MainWindow::OnLanguageChanged);
+    connect(&dialog, &ConfigureDialog::ExternalContentDirsChanged, this,
+            &MainWindow::OnGameListRefresh);
+    dialog.SelectCategory(category);
+    const bool accepted = dialog.exec() == QDialog::Accepted;
+    if (accepted) {
+        dialog.ApplyConfiguration();
     }
-
-    UISettings::values.configuration_applied = false;
-
-    config->SaveAllValues();
-
-    if ((UISettings::values.hide_mouse || Settings::values.mouse_panning) && emulation_running) {
-        render_window->installEventFilter(render_window);
-        render_window->setAttribute(Qt::WA_Hover, true);
-    } else {
-        render_window->removeEventFilter(render_window);
-        render_window->setAttribute(Qt::WA_Hover, false);
-    }
-
-    if (UISettings::values.hide_mouse) {
-        mouse_hide_timer.start();
-    }
-
-    // Restart camera config
-    if (emulation_running) {
-        render_window->FinalizeCamera();
-        render_window->InitializeCamera();
-    }
-
-    if (!UISettings::values.has_broken_vulkan) {
-        renderer_status_button->setEnabled(!emulation_running);
-    }
-
-    UpdateStatusButtons();
-    controller_dialog->refreshConfiguration();
-    QtCommon::system->ApplySettings();
-    jinra_home->ReloadSettings();
+    finish(accepted);
 }
 
 void MainWindow::OnConfigureTas() {
@@ -4122,9 +4355,6 @@ void MainWindow::OnConfigurePerGame() {
 void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_name) {
     Settings::SetConfiguringGlobal(false);
     ConfigurePerGame dialog(this, title_id, file_name, vk_device_records, *QtCommon::system);
-    if (jinra_home->IsHomeChromeActive()) {
-        dialog.setStyleSheet(jinra_home->styleSheet());
-    }
     dialog.LoadFromFile(Core::GetGameFileFromPath(QtCommon::vfs, file_name));
 
     const auto result = dialog.exec();
@@ -4185,7 +4415,7 @@ void MainWindow::OnLoadAmiibo() {
     LoadAmiibo(filename);
 }
 
-// TODO(crueter): does this need to be ported to QML?
+// TODO: does this need to be ported to QML?
 bool MainWindow::question(QWidget* parent, const QString& title, const QString& text,
                           QMessageBox::StandardButtons buttons,
                           QMessageBox::StandardButton defaultButton) {
@@ -4252,65 +4482,93 @@ void MainWindow::OnOpenModFolder() {
     QtCommon::Game::OpenModFolder();
 }
 
-void MainWindow::OnOpenLogFolder() {
-    QtCommon::Game::OpenLogFolder();
+void MainWindow::OnExportLog() {
+    ExportLog::Export(this, vk_device_records);
 }
 
-void MainWindow::OnExportLogs() {
-    const auto title = tr("Export Jinra Logs");
-    const QDir log_dir{
-        QString::fromStdString(Common::FS::GetEdenPathString(Common::FS::EdenPath::LogDir))};
-    QMap<QString, QString> files;
-    const auto add_log = [&](const QString& source, const QString& entry) {
-        const QFileInfo file(log_dir.filePath(source));
-        if (file.isFile() && !file.isSymLink()) {
-            files.insert(entry, file.filePath());
+void MainWindow::SetUpProfilingMode() {
+    // Help > Profiling Mode (both looks), first in the menu: turn it on, play, Export Log.
+    auto* action = new QAction(tr("Profiling Mode"), this);
+    action->setCheckable(true);
+    action->setChecked(UISettings::values.profiling_mode.GetValue());
+    QAction* first = ui->menu_Help->actions().value(0);
+    ui->menu_Help->insertAction(first, action);
+    if (!FritchiiUi::Enabled()) {
+        ui->menu_Help->insertSeparator(first);
+    }
+    connect(action, &QAction::toggled, this, [this](bool on) {
+        UISettings::values.profiling_mode = on;
+        config->SaveAllValues();
+        // Its switches are read once per process: only a new start of Fritchii changes them.
+        if (on == ProfilingMode::Active()) {
+            return;
         }
-    };
-    add_log(QStringLiteral(LOG_FILE), QStringLiteral(LOG_FILE));
-    add_log(QStringLiteral(LOG_PREVIOUS_FILE), QStringLiteral(LOG_PREVIOUS_FILE));
-    if (!files.contains(QStringLiteral(LOG_PREVIOUS_FILE))) {
-        add_log(QStringLiteral(LEGACY_LOG_FILE), QStringLiteral(LOG_PREVIOUS_FILE));
-    }
-    if (!files.contains(QStringLiteral(LOG_PREVIOUS_FILE))) {
-        add_log(QStringLiteral(LEGACY_LOG_PREVIOUS_FILE), QStringLiteral(LOG_PREVIOUS_FILE));
-    }
-    if (files.isEmpty()) {
-        QMessageBox::information(this, title, tr("There are no logs to export."));
-        return;
-    }
-
-    QFileDialog dialog(this, title,
-                       QStandardPaths::writableLocation(QStandardPaths::DownloadLocation),
-                       tr("ZIP archive (*.zip)"));
-    dialog.setAcceptMode(QFileDialog::AcceptSave);
-    dialog.setDefaultSuffix(QStringLiteral("zip"));
-    dialog.selectFile(QStringLiteral("jinra-logs.zip"));
-    if (dialog.exec() != QDialog::Accepted) {
-        return;
-    }
-    const auto destination = dialog.selectedFiles().front();
-    if (QFileInfo(destination).suffix().compare(QStringLiteral("zip"), Qt::CaseInsensitive) != 0) {
-        QMessageBox::warning(this, title, tr("Choose a filename ending in .zip."));
-        return;
-    }
-
-    Common::Log::Flush();
-    ui->action_Export_Logs->setEnabled(false);
-    auto* watcher = new QFutureWatcher<bool>(this);
-    connect(watcher, &QFutureWatcher<bool>::finished, this, [this, watcher, title, destination] {
-        const bool success = watcher->result();
-        watcher->deleteLater();
-        ui->action_Export_Logs->setEnabled(true);
-        if (success) {
-            QMessageBox::information(this, title, tr("Logs saved to %1.").arg(destination));
-        } else {
-            QMessageBox::warning(this, title, tr("Could not write the log archive."));
+        QString text = on ? tr("Restart Jinra to turn profiling mode on.")
+                          : tr("Restart Jinra to turn profiling mode off.");
+        if (emulation_running || boot_in_progress) {
+            text += QStringLiteral("\n\n") + tr("Save your game first.");
+        }
+        if (on) {
+            text += QStringLiteral("\n\n") + tr("Then play as usual and send us Help > Export Log.");
+        }
+        QMessageBox box(QMessageBox::Question, tr("Profiling Mode"), text, QMessageBox::NoButton,
+                        this);
+        QPushButton* restart = box.addButton(tr("Restart Now"), QMessageBox::AcceptRole);
+        box.addButton(tr("Later"), QMessageBox::RejectRole);
+        box.setDefaultButton(restart);
+        box.exec();
+        if (box.clickedButton() == restart) {
+            ProfilingMode::RestartFritchii(*this, [this] { return close_pending || !isVisible(); });
         }
     });
-    watcher->setFuture(QtConcurrent::run([destination, files] {
-        return QtCommon::Compress::compressFiles(destination, files);
-    }));
+
+    if (!ProfilingMode::Active()) {
+        return;
+    }
+    // On in this start: a red label in the status bar and the banner on the game.
+    auto* label = new QLabel(tr("PROFILING ON"), this);
+    label->setStyleSheet(QStringLiteral("QLabel { background: #d31f2f; color: white; "
+                                        "font-weight: bold; padding: 2px 10px; "
+                                        "border-radius: 4px; }"));
+    statusBar()->insertPermanentWidget(0, label);
+    auto* banner =
+        new ProfilingMode::Banner(this, [this] { return static_cast<QWidget*>(render_window); });
+    connect(this, &MainWindow::EmulationStarting, banner, [banner] { banner->Start(); });
+    connect(this, &MainWindow::EmulationStopping, banner, [banner] { banner->Stop(); });
+}
+
+void MainWindow::SetUpSwitchesWindow() {
+    // Both looks. The switches are read once at launch: the window saves the player's file and
+    // can restart Fritchii with its launch environment, so the restart doesn't inherit this
+    // process's file switches as environment ones (those would beat the file from then on).
+    ui->menu_Tools->addSeparator();
+    QAction* action = ui->menu_Tools->addAction(tr("S&witches..."));
+    connect(action, &QAction::triggered, this, [this] {
+        const bool restart = FritchiiUi::ShowSwitchesWindow(
+            this, [this] { return emulation_running || boot_in_progress; });
+        if (restart && !emulation_running && !boot_in_progress) {
+            ProfilingMode::RestartFritchii(*this, [this] { return close_pending || !isVisible(); });
+        }
+    });
+}
+
+void MainWindow::ShowErrorWithExportLog(const QString& title, const QString& text) {
+    if (!FritchiiUi::Enabled()) {
+        QMessageBox::critical(this, title, text);
+        return;
+    }
+    QMessageBox box(QMessageBox::Critical, title, text, QMessageBox::Ok, this);
+    box.setTextFormat(Qt::RichText);
+    QPushButton* export_button = box.addButton(tr("Export Log..."), QMessageBox::ActionRole);
+    box.setDefaultButton(QMessageBox::Ok);
+    box.exec();
+    if (box.clickedButton() == export_button) {
+        OnExportLog();
+    }
+}
+
+void MainWindow::OnOpenLogFolder() {
+    QtCommon::Game::OpenLogFolder();
 }
 
 void MainWindow::OnVerifyInstalledContents() {
@@ -4327,7 +4585,7 @@ void MainWindow::OnInstallFirmwareFromZIP() {
     OnCheckFirmwareDecryption();
 }
 
-// TODO(crueter): QtCommon this: game list populate can be a signal?
+// TODO: QtCommon this: game list populate can be a signal?
 void MainWindow::OnInstallDecryptionKeys() {
     // Don't do this while emulation is running.
     if (QtCommon::emu_thread != nullptr && QtCommon::emu_thread->IsRunning())
@@ -4366,7 +4624,7 @@ void MainWindow::OnToggleFilterBar() {
 }
 
 void MainWindow::OnToggleStatusBar() {
-    statusBar()->setVisible(emulation_running && ui->action_Show_Status_Bar->isChecked());
+    statusBar()->setVisible(ui->action_Show_Status_Bar->isChecked());
 }
 
 void MainWindow::OnTogglePerfOverlay() {
@@ -4399,7 +4657,7 @@ void MainWindow::OnGameListRefresh() {
     SetFirmwareVersion();
 }
 
-#ifdef JINRA_NX_TOOLS
+#ifdef LICHII_NX_TOOLS
 void MainWindow::OnGameListEditNxMetadata(const std::string& game_path) {
     const auto can_edit = [this] {
         if (boot_in_progress || close_pending || nx_metadata_write_in_progress) {
@@ -4561,6 +4819,172 @@ void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
             Qt::QueuedConnection);
         return result;
     }));
+}
+
+void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path) {
+    if (shader_warm_dialog) {
+        if (shader_warm_dialog->IsRunning()) {
+            shader_warm_dialog->raise();
+            shader_warm_dialog->activateWindow();
+            return;
+        }
+        shader_warm_dialog->close();
+    }
+    if (QtCommon::emu_thread != nullptr) {
+        QMessageBox::information(this, tr("Prepare Shaders"),
+                                 tr("Close the running game first."));
+        return;
+    }
+    if (nup_running && game_path == nup_source_path) {
+        QMessageBox::information(this, tr("Prepare Shaders"),
+                                 tr("This game is being converted. Try again when it is done."));
+        return;
+    }
+
+    auto path = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
+    // Loose dumps are listed by their exefs folder (FormatGameName); the loader opens its main.
+    if (std::error_code ec; std::filesystem::is_directory(path, ec)) {
+        path /= "main";
+    }
+    QString name;
+    if (const auto loader = Loader::GetLoader(
+            *QtCommon::system, QtCommon::vfs->OpenFile(game_path, FileSys::OpenMode::Read))) {
+        std::string title;
+        if (loader->ReadTitle(title) == Loader::ResultStatus::Success) {
+            name = QString::fromStdString(title);
+        }
+    }
+    if (name.isEmpty()) {
+        name = QFileInfo(QString::fromStdString(game_path)).completeBaseName();
+    }
+
+    shader_warm_dialog = new ShaderWarmDialog(*QtCommon::system, path, program_id, name, this);
+    connect(shader_warm_dialog, &QDialog::finished, shader_warm_dialog, &QObject::deleteLater);
+    shader_warm_dialog->show();
+    shader_warm_dialog->Start();
+}
+
+void MainWindow::OnGameListDeleteShaderWarm(u64 program_id) {
+    if (shader_warm_dialog && shader_warm_dialog->IsRunning() &&
+        shader_warm_dialog->TitleId() == program_id) {
+        // The builder writes this title's files: deleting them under it would lose the result or
+        // fail it. Other titles' files are in their own folders.
+        QMessageBox::information(this, tr("Delete Shader Warm-up"),
+                                 tr("Shaders are being prepared. Try again when it is done."));
+        shader_warm_dialog->raise();
+        shader_warm_dialog->activateWindow();
+        return;
+    }
+    if (QMessageBox::question(this, tr("Delete Shader Warm-up"),
+                              tr("Delete the shader warm-up files of this game? You can prepare "
+                                 "them again at any time."),
+                              QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) {
+        return;
+    }
+    std::string error;
+    if (!DeleteShaderWarmFiles(program_id, error)) {
+        QMessageBox::critical(this, tr("Delete Shader Warm-up"),
+                              tr("The files could not be deleted: %1")
+                                  .arg(QString::fromStdString(error)));
+    }
+}
+
+void MainWindow::OnPrepareShadersNow() {
+    if (!emulation_running || !QtCommon::system->IsPoweredOn()) {
+        return;
+    }
+    if (shader_warm_run_dialog) {
+        shader_warm_run_dialog->show();
+        shader_warm_run_dialog->raise();
+        shader_warm_run_dialog->activateWindow();
+        return;
+    }
+    auto& notify = QtCommon::system->GPU().ShaderNotify();
+    // EDEN_NX2_PRECOMPILE: the title's precompiled pipelines are prepared again (they count as a
+    // warm-up from here on).
+    notify.RequestPrecompile();
+    if (!notify.WarmActive()) {
+        QMessageBox::information(
+            this, tr("Prepare Shaders Now"),
+            tr("This game has no shader warm-up left to build.\n\nTo make one, close the game, "
+               "right-click it in the game list and choose Prepare shaders (warm-up). A warm-up "
+               "that ran to the end runs again only after a driver update."));
+        return;
+    }
+    // Started from the menu: it builds while the game runs, until it is done or stopped.
+    notify.SetWarmRequested(true);
+
+    auto* dialog = new QProgressDialog(this);
+    dialog->setWindowTitle(tr("Prepare Shaders Now"));
+    dialog->setCancelButtonText(tr("Stop"));
+    dialog->setRange(0, 0);
+    dialog->setMinimumDuration(0);
+    dialog->setAutoClose(false);
+    dialog->setAutoReset(false);
+    dialog->setWindowModality(Qt::NonModal);
+    dialog->setMinimumWidth(460);
+    auto* label = new QLabel(dialog);
+    label->setWordWrap(true);
+    dialog->setLabel(label);
+    shader_warm_run_dialog = dialog;
+
+    const QString note =
+        tr("The game keeps running and can stutter or slow down until this is done; pausing it "
+           "makes this faster. Stop keeps what is built: the rest builds while the game is "
+           "paused, or the next time you start this.");
+    const QString tip = TakeShaderCacheTip();
+    auto* timer = new QTimer(dialog);
+    const auto finish = [this, dialog, timer] {
+        timer->stop();
+        if (emulation_running && QtCommon::system->IsPoweredOn()) {
+            QtCommon::system->GPU().ShaderNotify().SetWarmRequested(false);
+        }
+        dialog->deleteLater();
+    };
+    const auto update = [this, dialog, timer, note, tip] {
+        if (!emulation_running || !QtCommon::system->IsPoweredOn() ||
+            QtCommon::system->IsShuttingDown()) {
+            dialog->close();
+            return;
+        }
+        auto& shader_notify = QtCommon::system->GPU().ShaderNotify();
+        QString text;
+        if (!shader_notify.WarmActive()) {
+            timer->stop();
+            shader_notify.SetWarmRequested(false);
+            dialog->setRange(0, 1);
+            dialog->setValue(1);
+            dialog->setCancelButtonText(tr("Close"));
+            text = tr("Shaders are ready.");
+        } else {
+            const auto warm = shader_notify.GetWarmProgress();
+            const auto done = static_cast<qulonglong>(warm.done);
+            const auto total = static_cast<qulonglong>(warm.total);
+            text = warm.kind == 1   ? tr("Building compute shaders")
+                   : warm.kind == 2 ? tr("Building graphics shaders")
+                   : warm.kind == 3 ? tr("Building precompiled shaders")
+                                    : tr("Starting");
+            if (warm.kind != 0 && total > 0) {
+                text += QStringLiteral(": ") + tr("%L1 / %L2").arg(done).arg(total);
+                dialog->setRange(0, 1000);
+                dialog->setValue(static_cast<int>((std::min<qulonglong>)(done * 1000 / total, 1000)));
+            } else {
+                dialog->setRange(0, 0);
+            }
+            text += QStringLiteral("\n\n") + note;
+        }
+        if (!tip.isEmpty()) {
+            text += QStringLiteral("\n\n") + tip;
+        }
+        dialog->setLabelText(text);
+    };
+    // Stop, Close, the window's close button and Escape all end it.
+    connect(dialog, &QProgressDialog::canceled, this, finish);
+    connect(dialog, &QDialog::rejected, this, finish);
+    connect(timer, &QTimer::timeout, dialog, update);
+    update();
+    timer->start(250);
+    dialog->show();
 }
 
 void MainWindow::OnGameListExtractNup(const std::string& game_path) {
@@ -4874,7 +5298,14 @@ void MainWindow::OnCaptureScreenshot() {
         return;
 
 #ifdef _WIN32
-    if (UISettings::values.enable_screenshot_save_as) {
+    // The Save as dialog pauses the game. In fullscreen it can open behind the game, which then
+    // looks frozen until the player finds it (2026-11-18): save straight to the folder there.
+    const bool fullscreen = isFullScreen() || (render_window && render_window->isFullScreen());
+    if (UISettings::values.enable_screenshot_save_as && fullscreen) {
+        LOG_INFO(Frontend, "Screenshot saved without the Save as dialog (fullscreen)");
+    }
+    if (UISettings::values.enable_screenshot_save_as && !fullscreen) {
+        LOG_INFO(Frontend, "Pausing: the screenshot Save as dialog");
         OnPauseGame();
         filename = QFileDialog::getSaveFileName(this, tr("Capture Screenshot"), filename,
                                                 tr("PNG Image (*.png)"));
@@ -4888,33 +5319,101 @@ void MainWindow::OnCaptureScreenshot() {
 }
 
 #ifdef ENABLE_UPDATE_CHECKER
-void MainWindow::OnEmulatorUpdateAvailable() {
-    const auto result = update_future.result();
-    if (result.failure == UpdateChecker::Failure::RateLimited) {
-        statusBar()->showMessage(
-            tr("Could not check for updates: GitHub rate limit reached. Jinra will try again at "
-               "the next start."),
-            15000);
+void MainWindow::StartUpdateCheck(bool manual) {
+    if (update_watcher.isRunning()) {
+        update_check_manual |= manual;
         return;
     }
-    if (result.failure == UpdateChecker::Failure::Http) {
-        statusBar()->showMessage(
-            tr("Could not check for updates: GitHub answered with HTTP %1.").arg(result.status),
-            15000);
+    update_check_manual = manual;
+    update_future = QtConcurrent::run([]() { return UpdateChecker::Check(); });
+    update_watcher.setFuture(update_future);
+}
+
+void MainWindow::OnCheckForUpdates() {
+    StartUpdateCheck(true);
+}
+
+void MainWindow::OnEmulatorUpdateAvailable() {
+    const auto result = update_future.result();
+    const bool manual = std::exchange(update_check_manual, false);
+    if (result.failure != UpdateChecker::Failure::None) {
+        QString text;
+        switch (result.failure) {
+        case UpdateChecker::Failure::RateLimited:
+            text = tr("Could not check for updates: GitHub rate limit reached. Jinra will try "
+                      "again at the next start.");
+            break;
+        case UpdateChecker::Failure::Http:
+            text =
+                tr("Could not check for updates: GitHub answered with HTTP %1.").arg(result.status);
+            break;
+        default:
+            text = tr("Could not check for updates. Check your internet connection.");
+            break;
+        }
+        // The check at startup stays quiet when offline.
+        if (manual) {
+            QMessageBox::warning(this, tr("Check for Updates"), text);
+        } else if (result.failure != UpdateChecker::Failure::Network) {
+            statusBar()->showMessage(text, 15000);
+        }
         return;
     }
     if (!result.update) {
+        if (manual) {
+            QMessageBox::information(this, tr("Check for Updates"),
+                                     tr("You have the latest version (%1 %2).")
+                                         .arg(QString::fromLatin1(Common::g_build_name),
+                                              QString::fromLatin1(Common::g_build_label)));
+        }
         return;
     }
 
     const auto& release = *result.update;
     const auto now = static_cast<unsigned long long>(QDateTime::currentSecsSinceEpoch());
-    if (UISettings::values.skipped_update_tag.GetValue() == release.tag ||
-        UISettings::values.update_remind_at.GetValue() > now) {
+    if (!manual && (UISettings::values.skipped_update_tag.GetValue() == release.tag ||
+                    UISettings::values.update_remind_at.GetValue() > now)) {
         return;
     }
+    pending_update = result;
+    if (emulation_running || boot_in_progress) {
+        statusBar()->showMessage(tr("%1 is available. It will be offered when the game closes.")
+                                     .arg(QString::fromStdString(release.title)),
+                                 15000);
+        return;
+    }
+    OfferPendingUpdate();
+}
 
-    UpdateDialog dialog(release, this);
+void MainWindow::OfferPendingUpdate() {
+    if (!pending_update || close_pending || emulation_running || boot_in_progress) {
+        // OnEmulationStopped offers it once the game is closed.
+        return;
+    }
+    // Wait for other dialogs, such as the first-launch frame rate question, to be answered.
+    const bool first_question_pending =
+        !launched_with_game && !Settings::values.oot_fps_asked.GetValue();
+    if (QApplication::activeModalWidget() != nullptr || first_question_pending) {
+        QTimer::singleShot(1000, this, &MainWindow::OfferPendingUpdate);
+        return;
+    }
+    const auto result = std::move(*pending_update);
+    pending_update.reset();
+    ShowUpdate(result);
+}
+
+void MainWindow::ShowRestartNote() {
+    if (QApplication::activeModalWidget() != nullptr) {
+        QTimer::singleShot(1000, this, &MainWindow::ShowRestartNote);
+        return;
+    }
+    QMessageBox::information(this, tr("Jinra"), restart_note);
+}
+
+void MainWindow::ShowUpdate(const UpdateChecker::CheckResult& result) {
+    const auto& release = *result.update;
+    const auto now = static_cast<unsigned long long>(QDateTime::currentSecsSinceEpoch());
+    UpdateDialog dialog(release, result.asset, this);
     switch (dialog.exec()) {
     case UpdateDialog::SkipVersion:
         UISettings::values.skipped_update_tag = release.tag;
@@ -4966,14 +5465,7 @@ void MainWindow::OnApplicationChanged(u64 program_id) {
 
 void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view title_version,
                                    std::string_view gpu_vendor) {
-    static const std::string build_id = std::string{Common::g_build_id};
-    static const std::string yuzu_title =
-        fmt::format("{} | {} | {}", std::string{Common::g_build_name},
-                    std::string{Common::g_build_version}, std::string{Common::g_compiler_id});
-
-    const auto override_title =
-        fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
-    const std::string window_title = "Jinra";
+    const std::string window_title = ProfilingMode::Active() ? "[PROFILING] Jinra" : "Jinra";
 
     if (title_name.empty()) {
         setWindowTitle(QString::fromStdString(window_title));
@@ -5057,6 +5549,40 @@ void MainWindow::UpdateStatusBar() {
     auto& shader_notify = QtCommon::system->GPU().ShaderNotify();
     const int shaders_building = shader_notify.ShadersBuilding();
 
+    const auto dlss = QtCommon::system->GPU().Renderer().GetDlssStatus();
+    dlss_status_text.clear();
+    if (dlss.evaluations > dlss_evaluations) {
+        const auto mode_text = [](Settings::NvidiaDlssQuality mode) {
+            return ConfigurationShared::nvidia_dlss_quality_texts_map.at(mode).toUpper();
+        };
+        dlss_status_text =
+            tr("DLSS %1 %2", "NVIDIA DLSS mode and model preset, e.g. DLSS DLAA M")
+                .arg(mode_text(dlss.mode),
+                     ConfigurationShared::nvidia_dlss_preset_texts_map.at(dlss.preset).toUpper());
+        if (dlss.requested != Settings::NvidiaDlssQuality::Automatic &&
+            dlss.requested != dlss.mode) {
+            dlss_status_text += tr(" (%1 DOESN'T FIT)", "The DLSS mode the user chose")
+                                    .arg(mode_text(dlss.requested));
+        }
+        // Fritchii builds: the real sizes, e.g. "1440p -> 4K" or "1080p" for DLAA.
+        if (FritchiiUi::Enabled() && dlss.render_height != 0 && dlss.output_height != 0) {
+            const auto height = [](u32 lines) {
+                return lines == 2160   ? QStringLiteral("4K")
+                       : lines == 4320 ? QStringLiteral("8K")
+                                       : QStringLiteral("%1p").arg(lines);
+            };
+            dlss_status_text += QStringLiteral("  ") + height(dlss.render_height);
+            if (dlss.output_height != dlss.render_height) {
+                dlss_status_text +=
+                    QStringLiteral(" %1 ").arg(QChar(0x2192)) + height(dlss.output_height);
+            }
+        }
+    }
+    dlss_evaluations = dlss.evaluations;
+    dlss_status_label->setText(dlss_status_text);
+    dlss_status_label->setVisible(!dlss_status_text.isEmpty());
+
+    emit statsUpdated(results, shader_notify);
 
     if (shaders_building > 0) {
         shader_building_label->setText(tr("Building: %n shader(s)", "", shaders_building));
@@ -5065,10 +5591,79 @@ void MainWindow::UpdateStatusBar() {
         shader_building_label->setVisible(false);
     }
 
+    const auto warm = shader_notify.GetWarmProgress();
+    if (warm.kind == 1 || warm.kind == 2) {
+        const auto done = static_cast<qulonglong>(warm.done);
+        const auto total = static_cast<qulonglong>(warm.total);
+        QString text;
+        if (warm.kind == 1) {
+            text = total > 0 ? tr("Shader warm-up: compute %L1 / %L2").arg(done).arg(total)
+                             : tr("Shader warm-up: compute %L1").arg(done);
+        } else if (total > 0) {
+            const int percent = static_cast<int>((std::min<qulonglong>)(done * 100 / total, 100));
+            text = tr("Shader warm-up: graphics %L1 / %L2 (%3%)")
+                       .arg(done)
+                       .arg(total)
+                       .arg(percent);
+        } else {
+            text = tr("Shader warm-up: graphics %L1").arg(done);
+        }
+        if (!shader_notify.WarmMayBuild()) {
+            text += QLatin1Char(' ') + tr("(waits while you play)");
+        }
+        shader_warm_label->setText(text);
+        shader_warm_label->setVisible(true);
+    } else {
+        shader_warm_label->setVisible(false);
+    }
+
     const auto res_info = Settings::values.resolution_info;
     const auto res_scale = res_info.up_factor;
-    res_scale_label->setText(
-        tr("Scale: %1x", "%1 is the resolution scaling factor").arg(res_scale));
+    QString res_scale_text =
+        tr("Scale: %1x", "%1 is the resolution scaling factor").arg(res_scale);
+    // Fritchii, OoT: the picture as it really is (owner 2026-11-18: "Scale: 1x" said nothing while
+    // DLSS or FSR ran): "1440p -> 4K · DLSS", "up to 1080p -> 1440p · FSR 3.1", or the
+    // resolution itself without an upscaler. Published by the rasterizer once it picked OoT's
+    // upscaler, so a DLSS that isn't available never shows as running.
+    if (FritchiiUi::Enabled() &&
+        QtCommon::system->GetApplicationProcessProgramID() == 0x0400486024DEC000ULL) {
+        const auto height = [](u32 lines) {
+            return lines == 2160   ? QStringLiteral("4K")
+                   : lines == 4320 ? QStringLiteral("8K")
+                                   : QStringLiteral("%1p").arg(lines);
+        };
+        if (const auto picture = VideoCommon::ReadOcarinaPicture()) {
+            const QString arrow = QStringLiteral(" %1 ").arg(QChar(0x2192));
+            const QString dot = QStringLiteral(" %1 ").arg(QChar(0x00B7));
+            if (picture->backend >= 2 && picture->output_height != 0) {
+                const QString name = picture->backend == 4   ? QStringLiteral("DLSS")
+                                     : picture->backend == 3 ? QStringLiteral("FSR 4")
+                                                             : QStringLiteral("FSR 3.1");
+                const QString input = picture->input_up_to
+                                          ? tr("up to %1").arg(height(picture->input_height))
+                                          : height(picture->input_height);
+                res_scale_text =
+                    picture->output_height == picture->input_height
+                        ? QString(input + dot + tr("%1 Native").arg(name))
+                        : QString(input + arrow + height(picture->output_height) + dot + name);
+            } else {
+                // No upscaler: the resolution setting's size, docked or handheld.
+                const bool docked = Settings::IsDockedMode();
+                const bool max_resolution = Settings::OcarinaMaxResolutionOn();
+                const u32 base = docked ? (max_resolution ? 1440U : 1080U) : 1080U;
+                const u32 lines =
+                    static_cast<u32>(base * res_info.up_scale) >> res_info.down_shift;
+                res_scale_text = docked && !max_resolution ? tr("up to %1").arg(height(lines))
+                                                           : height(lines);
+            }
+        }
+    }
+    // Fritchii's small card profile turned a larger scale down to 1x for this session.
+    if (const float refused = VideoCore::SmallCard::RefusedScale(); refused > 0.0f) {
+        res_scale_text += tr(" (%1x DOESN'T FIT)", "A resolution scale too big for the video memory")
+                              .arg(refused);
+    }
+    res_scale_label->setText(res_scale_text);
 
     if (Settings::SpeedLimitEnabled()) {
         emu_speed_label->setText(tr("Speed: %1% / %2%")
@@ -5086,52 +5681,6 @@ void MainWindow::UpdateStatusBar() {
 
     emu_frametime_label->setText(tr("Frame: %1 ms").arg(results.frametime * 1000.0, 0, 'f', 2));
 
-    const auto& renderer = QtCommon::system->GPU().Renderer();
-    if (perf_overlay && perf_overlay->isVisible()) {
-        perf_overlay->UpdateStats(results, shaders_building, renderer.GetVideoMemoryUsage());
-    }
-    const auto dlss = renderer.GetDlssStatus();
-    const bool dlss_active = dlss.evaluations > dlss_evaluations;
-    dlss_evaluations = dlss.evaluations;
-    if (dlss_active) {
-        const auto mode_text = [this](Settings::NvidiaDlssQuality mode) {
-            using Quality = Settings::NvidiaDlssQuality;
-            switch (mode) {
-            case Quality::Native:
-                return QStringLiteral("DLAA");
-            case Quality::Quality:
-                return tr("Quality");
-            case Quality::Balanced:
-                return tr("Balanced");
-            case Quality::Performance:
-                return tr("Performance");
-            case Quality::UltraPerformance:
-                return tr("Ultra Performance");
-            case Quality::Automatic:
-                return tr("Automatic");
-            }
-            return QString{};
-        };
-        const auto preset = dlss.preset == Settings::NvidiaDlssPreset::NvidiaDefault
-                                ? tr("NVIDIA default")
-                                : QString::fromStdString(
-                                      std::string{Settings::CanonicalizeEnum(dlss.preset)});
-        auto text = tr("DLSS %1 %2", "Active DLSS mode and model preset")
-                        .arg(mode_text(dlss.mode), preset);
-        if (dlss.requested != Settings::NvidiaDlssQuality::Automatic &&
-            dlss.requested != dlss.mode) {
-            text += tr(" (%1 unavailable)").arg(mode_text(dlss.requested));
-        }
-        dlss_status_label->setText(text);
-    }
-    dlss_status_label->setVisible(dlss_active);
-
-    const auto frame_gen = renderer.GetFrameGenStatus();
-    frame_gen_generating = frame_gen.generated_frames > frame_gen_frames;
-    frame_gen_frames = frame_gen.generated_frames;
-    frame_gen_state = frame_gen.state;
-    UpdateFrameGenButton();
-
     res_scale_label->setVisible(true);
     emu_speed_label->setVisible(!Settings::values.use_multi_core.GetValue());
     game_fps_label->setVisible(true);
@@ -5145,6 +5694,102 @@ void MainWindow::UpdateGPUAccuracyButton() {
         ConfigurationShared::gpu_accuracy_texts_map.find(gpu_accuracy)->second;
     gpu_accuracy_button->setText(gpu_accuracy_text.toUpper());
     gpu_accuracy_button->setChecked(gpu_accuracy != Settings::GpuAccuracy::Low);
+}
+
+void MainWindow::UpdateOotFpsButton() {
+    const bool fps30 = Settings::values.oot_30fps.GetValue();
+    oot_fps_button->setChecked(fps30);
+    oot_fps_button->setText(fps30 ? tr("30 FPS") : tr("60 FPS"));
+}
+
+void MainWindow::OnToggleOotFrameRate() {
+    Settings::values.oot_30fps.SetValue(!Settings::values.oot_30fps.GetValue());
+    Settings::values.oot_fps_asked.SetValue(true);
+    UpdateOotFpsButton();
+    config->SaveAllValues();
+}
+
+bool MainWindow::IsOotRunning() const {
+    constexpr u64 OcarinaOfTime = 0x0400486024DEC000ULL;
+    // Not while "Closing software...": the kernel is being torn down (fable52_answer_10 2.6).
+    return emulation_running && !QtCommon::system->IsShuttingDown() &&
+           QtCommon::system->GetApplicationProcessProgramID() == OcarinaOfTime;
+}
+
+bool MainWindow::ToggleOotHighRefresh() {
+    if (!IsOotRunning()) {
+        return false;
+    }
+    SetOotHighRefresh(!Settings::OotHighRefreshPatched());
+    return true;
+}
+
+void MainWindow::SetOotHighRefresh(bool on) {
+    QString text;
+    switch (FileSys::SwitchOotHighRefreshLive(*QtCommon::system, on)) {
+    case FileSys::OotHighRefreshSwitch::Switched: {
+        Settings::values.oot_high_refresh.SetValue(on);
+        config->SaveAllValues();
+        const bool fps30 = Settings::values.oot_30fps.GetValue();
+        if (!on) {
+            text = fps30 ? tr("High refresh: off (30 FPS)") : tr("High refresh: off (60 FPS)");
+            break;
+        }
+        if (fps30) {
+            text = tr("High refresh: on, but the 30 FPS mode wins");
+            break;
+        }
+        int hz = 0;
+        switch (Settings::values.oot_high_refresh_cap.GetValue()) {
+        case Settings::OotRefreshCap::Hz90:
+            hz = 90;
+            break;
+        case Settings::OotRefreshCap::Hz120:
+            hz = 120;
+            break;
+        case Settings::OotRefreshCap::Hz144:
+            hz = 144;
+            break;
+        case Settings::OotRefreshCap::Hz165:
+            hz = 165;
+            break;
+        case Settings::OotRefreshCap::Unlimited:
+            hz = -1;
+            break;
+        case Settings::OotRefreshCap::Display:
+        default:
+            break;
+        }
+        text = hz > 0   ? tr("High refresh: on (%1 FPS cap)").arg(hz)
+               : hz < 0 ? tr("High refresh: on (no cap)")
+                        : tr("High refresh: on (monitor refresh cap)");
+        break;
+    }
+    case FileSys::OotHighRefreshSwitch::DisabledInAddOns:
+        text = tr("High refresh: off in Add-Ons");
+        break;
+    case FileSys::OotHighRefreshSwitch::Busy:
+        text = tr("High refresh: busy, try again");
+        break;
+    case FileSys::OotHighRefreshSwitch::UnknownCode:
+        // A mod that writes over the same game code wins over the built-in: name it.
+        if (const auto mod = FileSys::OotHighRefreshBlockedBy(); !mod.empty()) {
+            text = tr("High refresh can't turn on: the mod \"%1\" changes the same game code. "
+                      "Turn the mod off in Add-Ons to use it.")
+                       .arg(QString::fromStdString(mod));
+            statusBar()->showMessage(text, 10000);
+            SetFPSSuffix();
+            return;
+        }
+        text = tr("High refresh: can't switch, a mod or Add-Ons changed that code");
+        break;
+    case FileSys::OotHighRefreshSwitch::NotRunning:
+    default:
+        text = tr("High refresh: can't switch in this game version");
+        break;
+    }
+    statusBar()->showMessage(text, 4000);
+    SetFPSSuffix();
 }
 
 void MainWindow::UpdateDockedButton() {
@@ -5195,87 +5840,6 @@ void MainWindow::UpdatePostShaderText() {
 }
 #endif
 
-void MainWindow::UpdateFrameGenButton() {
-    const bool enabled = Settings::values.frame_gen.GetValue();
-    frame_gen_status_button->setChecked(enabled);
-    if (!enabled) {
-        frame_gen_status_button->setText(tr("NO FG"));
-        frame_gen_status_button->setToolTip(tr("Frame generation is off."));
-        return;
-    }
-
-    const QString type = ConfigurationShared::frame_gen_type_texts_map
-                             .find(Settings::values.frame_gen_type.GetValue())
-                             ->second.toUpper();
-    const u32 target_rate = Settings::values.frame_gen_target_rate.GetValue();
-    const QString mode = target_rate == 0
-                             ? tr("FG %1 %2X").arg(type).arg(Settings::FrameGenMultiplier())
-                             : tr("FG %1 AUTO").arg(type);
-    const QString target = target_rate == 0
-                               ? QString()
-                               : tr(" It adds up to %1 frames per game frame to reach %2 FPS.")
-                                     .arg(Settings::MAX_FRAME_GEN_MULTIPLIER - 1)
-                                     .arg(target_rate);
-
-    if (!emulation_running) {
-        frame_gen_status_button->setText(mode);
-        frame_gen_status_button->setToolTip(
-            tr("Frame generation is on.%1 Whether it runs shows here once a game starts.")
-                .arg(target));
-        return;
-    }
-
-    QString unavailable;
-    switch (frame_gen_state) {
-    case VideoCore::FrameGenState::Pending:
-    case VideoCore::FrameGenState::Running:
-        break;
-    case VideoCore::FrameGenState::UnsupportedRenderer:
-        unavailable = tr("Frame generation needs the Vulkan renderer.");
-        break;
-    case VideoCore::FrameGenState::UnsupportedBuild:
-        unavailable = tr("This build was compiled without frame generation.");
-        break;
-    case VideoCore::FrameGenState::UnsupportedGpu:
-        unavailable = tr("This GPU lacks Vulkan features LSFG needs (Vulkan memory model, null "
-                         "descriptors and 16-bit floats). The Optical Flow type may still work.");
-        break;
-    case VideoCore::FrameGenState::UnsupportedSurface:
-        unavailable = tr("This GPU can't write to the window's swapchain format from a shader, so "
-                         "generated frames can't be presented.");
-        break;
-    case VideoCore::FrameGenState::MissingLosslessDll:
-        unavailable = tr("LSFG needs Lossless.dll from Lossless Scaling in the \"lossless\" folder "
-                         "of the user directory. It is missing or could not be loaded.");
-        break;
-    }
-
-    if (!unavailable.isEmpty()) {
-        frame_gen_status_button->setChecked(false);
-        frame_gen_status_button->setText(tr("FG UNAVAILABLE"));
-        frame_gen_status_button->setToolTip(
-            tr("Frame generation is on but not running. %1").arg(unavailable));
-        return;
-    }
-
-    if (frame_gen_generating) {
-        frame_gen_status_button->setText(mode);
-        frame_gen_status_button->setToolTip(tr("Frame generation is running.%1").arg(target));
-        return;
-    }
-
-    const QString target_met =
-        target_rate == 0
-            ? QString()
-            : tr(" It also pauses while the game already reaches %1 FPS.").arg(target_rate);
-    frame_gen_status_button->setText(tr("%1 (IDLE)").arg(mode));
-    frame_gen_status_button->setToolTip(
-        tr("Frame generation is on but generated no frames in the last half second. It pauses "
-           "while it warms up, for a second after a frame takes longer than 100 ms, and while "
-           "frames arrive in bursts.%1")
-            .arg(target_met));
-}
-
 void MainWindow::UpdateVolumeUI() {
     const auto volume_value = static_cast<int>(Settings::values.volume.GetValue());
     volume_slider->setValue(volume_value);
@@ -5294,13 +5858,13 @@ void MainWindow::UpdateStatusButtons() {
     UpdateAPIText();
     UpdateGPUAccuracyButton();
     UpdateDockedButton();
+    UpdateOotFpsButton();
     UpdateFilterText();
     UpdateAAText();
-    UpdateFrameGenButton();
     UpdateVolumeUI();
 }
 
-// TODO(crueter): Use this for game list stuff
+// TODO: Use this for game list stuff
 void MainWindow::UpdateUISettings() {
     if (!ui->action_Fullscreen->isChecked()) {
         UISettings::values.geometry = saveGeometry();
@@ -5453,10 +6017,16 @@ void MainWindow::SetFPSSuffix() {
     case Settings::SpeedMode::Turbo:
         m_fpsSuffix = tr("Turbo");
         break;
-    case Settings::SpeedMode::Standard:
+    case Settings::SpeedMode::Standard: {
         const bool limited = Settings::SpeedLimitEnabled();
-        m_fpsSuffix = limited ? QString{} : tr("Unlocked");
+        if (IsOotRunning() && Settings::OotHighRefreshPatched() &&
+            !Settings::values.oot_30fps.GetValue()) {
+            m_fpsSuffix = limited ? tr("High refresh") : tr("High refresh, unlocked");
+        } else {
+            m_fpsSuffix = limited ? QString{} : tr("Unlocked");
+        }
         break;
+    }
     }
 }
 
@@ -5534,10 +6104,6 @@ bool MainWindow::ConfirmClose() {
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
-    if (shader_sync_active) {
-        event->ignore();
-        return;
-    }
     if (!close_pending && !ConfirmClose()) {
         event->ignore();
         return;
@@ -5560,6 +6126,8 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         return;
     }
     LOG_INFO(Frontend, "Closing frontend after emulation cleanup");
+    // Watched from here on also when no game ran (Begin arms it, or names the step).
+    Common::ShutdownWatch::Begin("frontend close: saving settings");
 
     UpdateUISettings();
     game_list->SaveInterfaceLayout();
@@ -5567,6 +6135,7 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     hotkey_registry.SaveHotkeys();
 
     // Unload controllers early
+    Common::ShutdownWatch::Step("frontend close: unloading controllers");
     controller_dialog->UnloadController();
     game_list->UnloadController();
 
@@ -5574,11 +6143,16 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     if (QtCommon::emu_thread != nullptr)
         ShutdownGame();
 
+    Common::ShutdownWatch::Step("frontend close: closing the render window");
     render_window->close();
+    Common::ShutdownWatch::Step("frontend close: multiplayer");
     multiplayer_state->Close();
+    Common::ShutdownWatch::Step("frontend close: unloading input devices");
     QtCommon::system->HIDCore().UnloadInputDevices();
+    Common::ShutdownWatch::Step("frontend close: network shutdown");
     Network::Shutdown();
 
+    Common::ShutdownWatch::Exiting("frontend close done: Qt closes the window and ends its loop");
     QWidget::closeEvent(event);
 }
 
@@ -5649,7 +6223,7 @@ bool MainWindow::ConfirmForceLockedExit() {
     if (QtCommon::emu_thread == nullptr)
         return true;
 
-    const auto text = tr("The currently running application has requested Jinra to not exit.\n\n"
+    const auto text = tr("The currently running application has requested Jinra to stay open.\n\n"
                          "Would you like to bypass this and exit anyway?");
 
     return question(this, tr("Jinra"), text);
@@ -5705,7 +6279,7 @@ void MainWindow::UpdateUITheme() {
 #endif
 
     if (current_theme != default_theme) {
-        QString theme_uri{current_theme == QStringLiteral("jinra") ? QStringLiteral(":/jinra/style.qss") : QStringLiteral(":%1/style.qss").arg(current_theme)};
+        QString theme_uri{QStringLiteral(":%1/style.qss").arg(current_theme)};
         QFile f(theme_uri);
         if (!f.open(QFile::ReadOnly | QFile::Text)) {
             LOG_ERROR(Frontend, "Unable to open style \"{}\", fallback to the default theme",
@@ -5714,7 +6288,7 @@ void MainWindow::UpdateUITheme() {
         }
     }
 
-    QString theme_uri{current_theme == QStringLiteral("jinra") ? QStringLiteral(":/jinra/style.qss") : QStringLiteral(":%1/style.qss").arg(current_theme)};
+    QString theme_uri{QStringLiteral(":%1/style.qss").arg(current_theme)};
     QFile f(theme_uri);
     if (f.open(QFile::ReadOnly | QFile::Text)) {
         QTextStream ts(&f);

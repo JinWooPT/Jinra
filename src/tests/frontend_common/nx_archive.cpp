@@ -37,7 +37,7 @@ TEST_CASE("NX tools: saved archives get the .nx extension", "[frontend][nx]") {
 }
 
 TEST_CASE("NX tools: listing a folder never throws", "[frontend][nx]") {
-    TempDir dir{"jinra-nx-regular-files"};
+    TempDir dir{"lichii-nx-regular-files"};
     std::ofstream{dir.path / "update.nsp"} << "x";
     std::filesystem::create_directory(dir.path / "sub");
     const auto files = RegularFiles(dir.path);
@@ -58,7 +58,7 @@ TEST_CASE("NX tools: an untouched file-name title is not written", "[frontend][n
 }
 
 TEST_CASE("NX tools: the update folder below a picked parent is found", "[frontend][nx]") {
-    TempDir dir{"jinra-nx-update-folder"};
+    TempDir dir{"lichii-nx-update-folder"};
     const auto update = dir.path / "updates" / "65536";
     std::filesystem::create_directories(update / "exefs");
     std::ofstream{dir.path / "updates" / "readme.txt"} << "x";

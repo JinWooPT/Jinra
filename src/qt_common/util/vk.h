@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -58,15 +57,30 @@ namespace VkDeviceInfo {
 class Record {
 public:
     explicit Record(std::string_view name, const std::vector<VkPresentModeKHR>& vsync_modes,
-                    bool has_broken_compute, bool fsr4_capable = false);
+                    bool has_broken_compute, std::string_view driver_version = {},
+                    bool fsr4_capable = false, bool nvidia = true,
+                    std::string_view device_name = {},
+                    VkPhysicalDeviceType device_type = VK_PHYSICAL_DEVICE_TYPE_OTHER,
+                    u64 local_memory = 0);
     ~Record();
 
     const std::string name;
     const std::vector<VkPresentModeKHR> vsync_support;
     const bool has_broken_compute;
-    const bool fsr4_capable;
+    /// The driver's own version text (e.g. "581.57"), for support logs.
+    const std::string driver_version;
+    const bool fsr4_capable; ///< VideoCommon::IsFsr4CapableGpu
+    const bool nvidia;       ///< an NVIDIA GPU (vendor 0x10DE): the only ones DLSS runs on
+    /// The device's own name (no driver), as vulkan_device_name and the log's "Device:" keep it.
+    const std::string device_name;
+    const VkPhysicalDeviceType device_type;
+    const u64 local_memory; ///< Largest device-local heap, in bytes
 };
 
-// TODO(crueter): Port some configure_graphics.cpp stuff
+/// The card a game would run on for these saved settings (Vulkan::PickPhysicalDevice).
+size_t PickedIndex(const std::vector<Record>& records, u32 saved_index,
+                   std::string_view saved_name);
+
+// TODO: Port some configure_graphics.cpp stuff
 void PopulateRecords(std::vector<Record>& records, QWindow* window);
 } // namespace VkDeviceInfo

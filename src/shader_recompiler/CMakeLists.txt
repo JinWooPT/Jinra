@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_library(shader_recompiler STATIC
@@ -174,10 +173,15 @@ add_library(shader_recompiler STATIC
     frontend/maxwell/translate_program.cpp
     frontend/maxwell/translate_program.h
     host_translate_info.h
+    info_serialize.cpp
+    info_serialize.h
+    translate_profile.cpp
+    translate_profile.h
     ir_opt/collect_shader_info_pass.cpp
     ir_opt/conditional_barrier_pass.cpp
     ir_opt/constant_propagation_pass.cpp
     ir_opt/dead_code_elimination_pass.cpp
+    ir_opt/dominance.h
     ir_opt/dual_vertex_pass.cpp
     ir_opt/geometry_compaction_pass.cpp
     ir_opt/global_memory_to_storage_buffer_pass.cpp
@@ -199,8 +203,7 @@ add_library(shader_recompiler STATIC
     program_header.h
     runtime_info.h
     shader_info.h
-    info_serialize.cpp
-    info_serialize.h
+    storage_write_extent.h
     varying_state.h)
 
 if (ENABLE_OPENGL)

@@ -642,7 +642,7 @@ std::vector<u8> MakeRecipe(std::span<const u8> precompiled, const X::Result& ext
 }
 
 std::vector<u8> Assemble(std::span<const u8> recipe, const X::Result& extracted, u32 cache_version,
-                         Report& report, unsigned threads, std::stop_token stop) {
+                         Report& report, unsigned threads) {
     const auto body = Decompress(recipe);
     Reader r{body};
     if (r.Get<u32>() != Format) {
@@ -657,9 +657,6 @@ std::vector<u8> Assemble(std::span<const u8> recipe, const X::Result& extracted,
         by_fingerprint.try_emplace(p.fingerprint, &p);
     }
     const u32 program_count = r.Get<u32>();
-    if (program_count > 1'000'000) {
-        throw std::runtime_error("too many programs in shader recipe");
-    }
     std::vector<Program> programs(program_count);
     std::vector<Stage> stages(program_count);
     for (u32 i = 0; i < program_count; ++i) {
@@ -675,24 +672,18 @@ std::vector<u8> Assemble(std::span<const u8> recipe, const X::Result& extracted,
         }
     }
     ParallelFor(program_count, threads, [&](size_t i) {
-        if (!stop.stop_requested() && programs[i].source) {
+        if (programs[i].source) {
             programs[i].lowered =
                 Lower(stages[i], programs[i].source->control, programs[i].source->code,
                       programs[i].error);
         }
     });
-    if (stop.stop_requested()) {
-        return {};
-    }
     for (const auto& p : programs) {
         report.programs_failed += p.source && !p.lowered ? 1 : 0;
     }
 
     // Environments: the facts with the program's code and header put back.
     const u32 fact_count = r.Get<u32>();
-    if (fact_count > 1'000'000) {
-        throw std::runtime_error("too many shader environments in recipe");
-    }
     struct Env {
         s64 program = -1;
         std::vector<u8> bytes;
@@ -702,9 +693,6 @@ std::vector<u8> Assemble(std::span<const u8> recipe, const X::Result& extracted,
     };
     std::vector<Env> envs(fact_count);
     for (u32 i = 0; i < fact_count; ++i) {
-        if (stop.stop_requested()) {
-            return {};
-        }
         const u32 program = r.Get<u32>();
         const u8 flags = r.Get<u8>();
         r.Take(3);
@@ -741,9 +729,6 @@ std::vector<u8> Assemble(std::span<const u8> recipe, const X::Result& extracted,
     }
 
     const u32 state_count = r.Get<u32>();
-    if (state_count > 1'000'000) {
-        throw std::runtime_error("too many graphics states in shader recipe");
-    }
     std::vector<Bytes> states(state_count);
     for (auto& state : states) {
         state = r.Take(StateSize);
@@ -751,23 +736,14 @@ std::vector<u8> Assemble(std::span<const u8> recipe, const X::Result& extracted,
 
     // Records, and the environments they use, renumbered.
     const u32 record_count = r.Get<u32>();
-    if (record_count > 1'000'000) {
-        throw std::runtime_error("too many pipeline records in shader recipe");
-    }
     Writer records;
     std::vector<s64> env_slot(fact_count, -1);
     std::vector<u32> env_list;
     u32 written = 0;
     for (u32 i = 0; i < record_count; ++i) {
-        if (stop.stop_requested()) {
-            return {};
-        }
         const u8 kind = r.Get<u8>();
         const u8 count = r.Get<u8>();
         r.Take(2);
-        if (kind > 1 || count == 0 || count > 6 || (kind == 1 && count != 1)) {
-            throw std::runtime_error("invalid pipeline record in shader recipe");
-        }
         std::vector<u32> ids(count);
         bool ok = true;
         for (auto& id : ids) {

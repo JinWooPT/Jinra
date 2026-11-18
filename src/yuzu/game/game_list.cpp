@@ -43,6 +43,7 @@
 #include "yuzu/game/game_tree.h"
 #include "yuzu/game/search_field.h"
 #include "yuzu/main_window.h"
+#include "yuzu/shader_warm_dialog.h"
 #include "yuzu/util/controller_navigation.h"
 
 GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvider* provider_,
@@ -96,8 +97,12 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
                 if (!isVisible() || !isActiveWindow() || QApplication::activePopupWidget()) {
                     return;
                 }
-                QKeyEvent* event = new QKeyEvent(QEvent::KeyPress, key, Qt::NoModifier);
-                QCoreApplication::postEvent(m_currentView, event);
+                QWidget* target = m_currentView;
+                auto* focus = QApplication::focusWidget();
+                if (home_mode && focus && focus->property("jinraHomeControl").toBool()) {
+                    target = focus;
+                }
+                QCoreApplication::postEvent(target, new QKeyEvent(QEvent::KeyPress, key, Qt::NoModifier));
             });
 
     connect(item_model, &GameListModel::PopulatingCompleted, this,
@@ -600,7 +605,7 @@ void GameList::PopupContextMenu(const QPoint& menu_location) {
 }
 
 void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::string& path) {
-    // TODO(crueter): Refactor this and make it less bad
+    // TODO: Refactor this and make it less bad
     QAction* favorite = context_menu.addAction(tr("Favorite"));
     context_menu.addSeparator();
     QAction* start_game = context_menu.addAction(tr("Start Game"));
@@ -611,12 +616,13 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     QAction* open_mod_location = context_menu.addAction(tr("Open Mod Data Location"));
     QAction* open_transferable_shader_cache =
         context_menu.addAction(tr("Open Transferable Pipeline Cache"));
-#ifdef _WIN32
-    QAction* sync_shaders = context_menu.addAction(tr("Sync Shaders..."));
-    sync_shaders->setVisible(program_id != 0);
-    connect(sync_shaders, &QAction::triggered, this,
-            [this, program_id]() { emit SyncShadersRequested(program_id); });
-#endif
+    const bool has_shader_warm = ShaderWarmFilesExist(program_id);
+    QAction* prepare_shaders = context_menu.addAction(
+        has_shader_warm ? tr("Rebuild shader warm-up") : tr("Prepare shaders (warm-up)"));
+    QAction* delete_shader_warm = nullptr;
+    if (has_shader_warm) {
+        delete_shader_warm = context_menu.addAction(tr("Delete shader warm-up"));
+    }
     QAction* ryujinx = context_menu.addAction(tr("Link to Ryujinx"));
     context_menu.addSeparator();
     QMenu* remove_menu = context_menu.addMenu(tr("Remove"));
@@ -654,7 +660,7 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     QAction* add_to_nx = nullptr;
     QAction* remove_from_nx = nullptr;
     QAction* edit_nx_metadata = nullptr;
-#ifdef JINRA_NX_TOOLS
+#ifdef LICHII_NX_TOOLS
     if (NxTools::CanConvert(path)) {
         convert_nx = context_menu.addAction(tr("Convert to NX..."));
         convert_nx->setEnabled(!nx_tool_running);
@@ -681,12 +687,14 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         edit_nup->setEnabled(!nup_conversion_running);
     }
     QAction* properties = context_menu.addAction(tr("Configure Game"));
+
     favorite->setVisible(program_id != 0);
     favorite->setCheckable(true);
     favorite->setChecked(UISettings::values.favorited_ids.contains(program_id));
     open_save_location->setVisible(program_id != 0);
     open_mod_location->setVisible(program_id != 0);
     open_transferable_shader_cache->setVisible(program_id != 0);
+    prepare_shaders->setVisible(program_id != 0);
     remove_update->setVisible(program_id != 0);
     remove_dlc->setVisible(program_id != 0);
     remove_gl_shader_cache->setVisible(program_id != 0);
@@ -708,6 +716,12 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     });
     connect(open_transferable_shader_cache, &QAction::triggered, this,
             [this, program_id]() { emit OpenTransferableShaderCacheRequested(program_id); });
+    connect(prepare_shaders, &QAction::triggered, this,
+            [this, program_id, path]() { emit PrepareShaderWarmRequested(program_id, path); });
+    if (delete_shader_warm) {
+        connect(delete_shader_warm, &QAction::triggered, this,
+                [this, program_id]() { emit DeleteShaderWarmRequested(program_id); });
+    }
     connect(remove_all_content, &QAction::triggered, this, [this, program_id]() {
         emit RemoveInstalledEntryRequested(program_id, QtCommon::Game::InstalledEntryType::Game);
     });
@@ -905,6 +919,10 @@ bool GameList::eventFilter(QObject* obj, QEvent* event) {
         return QWidget::eventFilter(obj, event);
     if (obj == carousel_view && home_mode && event->type() == QEvent::KeyPress) {
         const auto key = static_cast<QKeyEvent*>(event)->key();
+        if (key == Qt::Key_Down) {
+            emit HomeDockRequested();
+            return true;
+        }
         if (key == Qt::Key_Escape) {
             emit DesktopModeRequested();
             return true;

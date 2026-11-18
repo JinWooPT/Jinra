@@ -25,6 +25,8 @@ public:
 
 protected:
     void resizeEvent(QResizeEvent* event) override;
+    void currentChanged(const QModelIndex& current, const QModelIndex& previous) override;
+    QModelIndex moveCursor(CursorAction action, Qt::KeyboardModifiers modifiers) override;
 
 private:
     GameCard* m_gameCard = nullptr;

@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #version 430
@@ -125,9 +124,12 @@ void main() {
     offset += (pos.x >> GOB_SIZE_X_SHIFT) << x_shift;
     offset += swizzle;
 
+    const uvec4 texel = ReadTexel(offset);
     const ivec3 coord = ivec3(gl_GlobalInvocationID) + destination;
-    if (any(lessThan(coord, ivec3(0))) || any(greaterThanEqual(coord, imageSize(output_image)))) {
+    // Workgroups round the dispatch up past the image; on AMD a store outside it lands in other
+    // memory (see astc_decoder.comp).
+    if (any(greaterThanEqual(coord, imageSize(output_image)))) {
         return;
     }
-    imageStore(output_image, coord, ReadTexel(offset));
+    imageStore(output_image, coord, texel);
 }

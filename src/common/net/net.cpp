@@ -21,6 +21,22 @@
 
 namespace Common::Net {
 
+std::optional<std::string> ParseSha256Digest(std::string_view digest) {
+    constexpr std::string_view prefix = "sha256:";
+    if (!digest.starts_with(prefix) || digest.size() != prefix.size() + 64) {
+        return std::nullopt;
+    }
+    std::string hex;
+    hex.reserve(64);
+    for (const char c : digest.substr(prefix.size())) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) {
+            return std::nullopt;
+        }
+        hex.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    return hex;
+}
+
 LinuxPackage CurrentLinuxPackage() {
 #ifdef __linux__
     const char* appimage = std::getenv("APPIMAGE");
@@ -60,7 +76,7 @@ std::vector<Asset> Release::GetPlatformAssets(std::string_view platform,
     for (const std::string_view variant : pgo ? std::vector<std::string_view>{"-pgo", ""}
                                               : std::vector<std::string_view>{""}) {
         for (const auto extension : extensions) {
-            const auto filename = fmt::format("jinra-{}{}{}", platform, variant, extension);
+            const auto filename = fmt::format("lichii-{}{}{}", platform, variant, extension);
             const auto url = host_url + path + filename;
             if (std::ranges::find(assets, url) == assets.end()) {
                 continue;
@@ -145,20 +161,8 @@ std::optional<Release> Release::FromJson(const nlohmann::json& json, const std::
         if (asset.contains("size") && asset["size"].is_number_unsigned()) {
             info.size = asset["size"].get<u64>();
         }
-        constexpr std::string_view digest_prefix = "sha256:";
         if (asset.contains("digest") && asset["digest"].is_string()) {
-            const auto digest = asset["digest"].get<std::string>();
-            const std::string_view hex =
-                digest.starts_with(digest_prefix)
-                    ? std::string_view{digest}.substr(digest_prefix.size())
-                    : std::string_view{};
-            if (hex.size() == 64 &&
-                std::ranges::all_of(hex, [](unsigned char c) { return std::isxdigit(c); })) {
-                info.sha256 = std::string{hex};
-                std::ranges::transform(info.sha256, info.sha256.begin(), [](unsigned char c) {
-                    return static_cast<char>(std::tolower(c));
-                });
-            }
+            info.sha256 = ParseSha256Digest(asset["digest"].get<std::string>()).value_or("");
         }
         rel.asset_info.emplace(url, std::move(info));
     }
@@ -223,7 +227,7 @@ RequestResult Fetch(const std::string& url, const std::string& path) {
         httplib::Request request{
             .method = "GET",
             .path = path,
-            .headers = {{"Accept", "application/vnd.github+json"}, {"User-Agent", "Jinra"}},
+            .headers = {{"Accept", "application/vnd.github+json"}, {"User-Agent", "Fritchii"}},
         };
 
         client->set_follow_location(true);
@@ -261,7 +265,7 @@ ReleaseList GetReleases() {
     const auto response = Fetch(url, Common::g_build_auto_update_api_path);
 
     if (!response.body) {
-        LOG_WARNING(Common, "Failed to get Jinra releases");
+        LOG_WARNING(Common, "Failed to get Fritchii releases");
         return {.status = response.status};
     }
 

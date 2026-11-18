@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 Torzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -138,19 +137,20 @@ ENUM(RendererBackend, OpenGL_GLSL, Vulkan, Null, OpenGL_GLASM, OpenGL_SPIRV);
 ENUM(GpuAccuracy, Low, High);
 ENUM(DmaAccuracy, Default, Unsafe, Safe);
 ENUM(GpuFenceBehavior, Default, Immediate, Balanced, Accurate);
+ENUM(NativeComputeWriteMark, Auto, Full, Cap64K);
 ENUM(CpuBackend, Dynarmic, Nce);
 ENUM(CpuAccuracy, Auto, Accurate, Unsafe, Paranoid, Debugging);
 ENUM(CpuClock, Normal, Boost, Overclock)
-ENUM(NativeAsyncDraws, Wait, Bounded, Skip);
 ENUM(MemoryLayout, Memory_4Gb, Memory_6Gb, Memory_8Gb, Memory_10Gb, Memory_12Gb);
 ENUM(ConfirmStop, Ask_Always, Ask_Based_On_Game, Ask_Never);
 ENUM(FullscreenMode, Borderless, Exclusive);
 ENUM(NvdecEmulation, Off, Cpu, Gpu);
 ENUM(ResolutionSetup, Res1_4X, Res1_2X, Res3_4X, Res1X, Res5_4X, Res3_2X, Res2X, Res3X, Res4X, Res5X, Res6X, Res7X, Res8X);
-ENUM(ScalingFilter, NearestNeighbor, Bilinear, Bicubic, Gaussian, Lanczos, ScaleForce, Fsr, Area, ZeroTangent, BSpline, Mitchell, Spline1, Mmpx, Sgsr, SgsrEdge, Fsr3);
+ENUM(ScalingFilter, NearestNeighbor, Bilinear, Bicubic, Gaussian, Lanczos, ScaleForce, Fsr, Area, ZeroTangent, BSpline, Mitchell, Spline1, Mmpx, Sgsr, SgsrEdge, Fsr3, Auto);
 ENUM(AntiAliasing, None, Fxaa, Smaa);
-ENUM(OotAntiAliasing, Game, NoSharpening, Fsr31, Fsr4);
-ENUM(OotRefreshCap, Display, Hz90, Hz120, Hz144, Hz165);
+ENUM(OotAntiAliasing, Game, NoSharpening, Fsr3, Fsr4);
+ENUM(DlssPreset, Default, J, K, L, M);
+ENUM(NvidiaDlssQuality, Automatic, Native, Quality, Balanced, Performance, UltraPerformance);
 ENUM(AspectRatio, R16_9, R4_3, R21_9, R16_10, Stretch);
 ENUM(ConsoleMode, Handheld, Docked);
 ENUM(AppletMode, HLE, LLE, Disabled);
@@ -164,9 +164,14 @@ ENUM(ExtendedDynamicState, Disabled, EDS1, EDS2, EDS3);
 ENUM(GpuLogLevel, Off, Errors, Standard, Verbose, All)
 ENUM(GameListMode, TreeView, GridView, CarouselView);
 ENUM(SpeedMode, Standard, Turbo, Slow);
-ENUM(FrameGenType, Lsfg, Fsr3);
-ENUM(NvidiaDlssQuality, Automatic, Native, Quality, Balanced, Performance, UltraPerformance);
-ENUM(NvidiaDlssPreset, M, NvidiaDefault, E, F, J, K, L);
+ENUM(MeshShaderMode, Automatic, Native, Compute);
+// Ocarina of Time's movies: the game's own upscaler, or a bilinear copy (Settings oot_movie_upscale).
+ENUM(OotMovieUpscale, Automatic, Bilinear, Game);
+// Ocarina of Time's frame rate cap with its high refresh rate mode on (Settings oot_high_refresh).
+// New values go at the end: saved configs store the index.
+ENUM(OotRefreshCap, Display, Hz90, Hz120, Hz144, Hz165, Unlimited);
+// Ocarina of Time's texture LOD bias while DLSS or FSR upscales (Settings oot_texture_sharpness).
+ENUM(OotTextureSharpness, Auto, Sharper, Custom);
 
 template <typename Type>
 inline std::string_view CanonicalizeEnum(Type id) {

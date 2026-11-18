@@ -13,7 +13,14 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#ifdef _WIN32
+#include "common/windows/crash_handler.h"
+#endif
+#ifdef __linux__
+#include "common/linux/crash_handler.h"
+#endif
 #include "common/scm_rev.h"
+#include "common/build_stamp.h"
 #include "common/cpu_features.h"
 #include "core/memory.h"
 
@@ -26,6 +33,7 @@
 
 #include <QMessageBox>
 
+#include <string_view>
 #include <thread>
 #include <JlCompress.h>
 #include <QPainter>
@@ -172,7 +180,7 @@ static void LogRuntimes() {
     LOG_INFO(Frontend, "Qt Compile: {} Runtime: {}", QT_VERSION_STR, qVersion());
 }
 
-static QString PrettyProductName() {
+QString PrettyProductName() {
 #ifdef _WIN32
     // After Windows 10 Version 2004, Microsoft decided to switch to a different notation: 20H2
     // With that notation change they changed the registry key used to denote the current version
@@ -210,6 +218,20 @@ static void RemoveCachedContents() {
     Common::FS::RemoveDirRecursively(offline_system_data);
 }
 
+std::string BuildVersionString() {
+    const auto branch_name = std::string(Common::g_scm_branch);
+    const auto description = std::string(Common::g_scm_desc);
+    const auto build_id = std::string(Common::g_build_id);
+
+    const auto yuzu_build =
+        std::string_view{Common::g_build_name} == "Jinra"
+            ? fmt::format("Jinra {} | {}-{}", Common::g_build_version, branch_name, description)
+            : fmt::format("Fritchii Development Build | {}-{}", branch_name, description);
+    const auto override_build =
+        fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
+    return override_build.empty() ? yuzu_build : override_build;
+}
+
 void Init(QWidget* root) {
     rootObject = root;
 
@@ -224,6 +246,11 @@ void Init(QWidget* root) {
 
     Common::Log::Initialize();
     Common::Log::Start();
+#ifdef _WIN32
+    Common::Windows::InstallCrashHandler(Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir));
+#elif defined(__linux__)
+    Common::Linux::InstallCrashHandler();
+#endif
 
     Network::Init();
 
@@ -232,7 +259,13 @@ void Init(QWidget* root) {
     const auto processor_count = std::thread::hardware_concurrency();
 
     // info logging
-    LOG_INFO(Frontend, "Jinra Version: {} | {}", Common::g_build_version, Common::g_compiler_id);
+    LOG_INFO(Frontend, "{} Version: {}", Common::g_build_name, BuildVersionString());
+    if (const auto stamp = Common::BuildStamp(); !stamp.empty()) {
+        LOG_INFO(Frontend, "Build hash: {}", stamp);
+    }
+    if (const auto& tag = Common::BuildTag(); !tag.empty()) {
+        LOG_INFO(Frontend, "Build tag: {}", tag);
+    }
     LogRuntimes();
 #ifdef ARCHITECTURE_x86_64
     const auto& caps = Common::g_cpu_caps;
@@ -265,6 +298,26 @@ void Init(QWidget* root) {
                  .count());
     QtCommon::system->CoreTiming().SetTimerResolutionNs(
         Common::Windows::GetCurrentTimerResolution());
+    // What a 1 ms sleep really takes in this process. Windows 11 may stop honouring the request
+    // above (players gain 10-20 fps from tools that raise the timer for every process), and the
+    // system figure can't show that: another program's request moves it too. 20 short sleeps at
+    // start and once a minute for the first 10 minutes, on a thread of its own.
+    std::thread([] {
+        using namespace std::chrono;
+        for (int round = 0; round < 11; ++round) {
+            const auto start = steady_clock::now();
+            for (int i = 0; i < 20; ++i) {
+                std::this_thread::sleep_for(milliseconds{1});
+            }
+            const double sleep_ms =
+                duration<double, std::milli>(steady_clock::now() - start).count() / 20;
+            LOG_INFO(Frontend, "Timer check: a 1 ms sleep takes {:.2f} ms (system timer {:.4f} ms)",
+                     sleep_ms,
+                     duration<double, std::milli>(Common::Windows::GetCurrentTimerResolution())
+                         .count());
+            std::this_thread::sleep_for(seconds{60});
+        }
+    }).detach();
 #endif
 
     // Remove cached contents generated during the previous session

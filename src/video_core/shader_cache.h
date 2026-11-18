@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -41,7 +40,20 @@ struct ShaderInfo {
     size_t size_bytes{};
     /// Lowered code of a native program, reused when its pipelines are built.
     std::shared_ptr<const LoweredNativeCode> lowered_native;
+    /// Generic inputs a native vertex program reads (its header's input map), two bits per
+    /// attribute as in FixedPipelineState::attribute_types. None for task and mesh programs, all
+    /// set for any other program.
+    u64 vertex_attribute_mask{~u64{0}};
+    /// Native vertex programs: the generic attributes their header says they read.
+    u32 generic_read_mask{~0U};
 };
+
+/// Generic attributes a vertex program's header says it reads (any component of each).
+u32 GenericReadMask(const Shader::ProgramHeader& sph) noexcept;
+
+/// ShaderInfo::vertex_attribute_mask of the program in `env` (a runtime or a disk environment).
+/// EDEN_NX2_KEY_ALL_ATTRIBUTES=1 keeps every attribute type in the keys, as before.
+[[nodiscard]] u64 VertexAttributeMaskOf(const Shader::Environment& env);
 
 class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
     static constexpr u64 YUZU_PAGEBITS = 14;
@@ -107,11 +119,25 @@ protected:
     /// @return Pointer to a valid shader, nullptr on error
     const ShaderInfo* ComputeShader();
 
+    /// One follower (FRITCHII_ONEF_OP_DISPATCH, E): the current compute shader when it is known
+    /// already (no translation, no hook, nothing written); nullptr otherwise. Then
+    /// ComputeShaderKnownChecks runs ComputeShader's checks and hooks for it, exactly once.
+    [[nodiscard]] const ShaderInfo* KnownComputeShader() const;
+    /// ComputeShader's work for a shader KnownComputeShader found: the trap guards and the OoT
+    /// network, DLSS contract and game DLSS hooks (they throw as ComputeShader's do).
+    void ComputeShaderKnownChecks(const ShaderInfo* shader);
+
     /// @brief Collect the current graphics environments
-    void GetGraphicsEnvironments(GraphicsEnvironments& result,
-                                 const std::array<u64, NUM_PROGRAMS>& unique_hashes);
+    /// @param snapshot Take each environment's snapshot (GraphicsEnvironment::TakeSnapshot)
+    /// @return Bytes the snapshots copied
+    size_t GetGraphicsEnvironments(GraphicsEnvironments& result,
+                                   const std::array<u64, NUM_PROGRAMS>& unique_hashes,
+                                   bool snapshot = false);
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
+    /// vertex_attribute_mask of shader_infos, copied so the lookup of every draw doesn't read a
+    /// ShaderInfo that an invalidation may have removed since.
+    std::array<u64, NUM_PROGRAMS> vertex_attribute_masks{};
     bool last_shaders_valid = false;
 
 private:
@@ -122,6 +148,10 @@ private:
     /// @param addr Start address of the shader, this doesn't cache for region
     /// @return Pointer to a valid shader, nullptr when nothing is found
     ShaderInfo* TryGet(VAddr addr) const;
+
+    /// ComputeShader's hooks once its shader is known (the OoT network bypass, the DLSS contract
+    /// trace, the game's DLSS): they may throw FireEmblemUpscale::DispatchReplaced.
+    void RunComputeHooks(const ShaderInfo* shader);
 
     /// @brief Register in the cache a given entry
     /// @param data Shader to store in the cache

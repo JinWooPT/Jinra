@@ -90,6 +90,9 @@ public:
     void UnloadController();
 
     void ResetViewMode();
+    void AddGameMenu(QMenu& context_menu, u64 program_id, const std::string& path) {
+        AddGamePopup(context_menu, program_id, path);
+    }
     void SetHomeMode(bool enabled);
     void FocusLibrary();
     void PlaySelectedGame();
@@ -107,6 +110,7 @@ public slots:
 
 signals:
     void DesktopModeRequested();
+    void HomeDockRequested();
     void GameHighlighted(const QModelIndex& index);
     void FilterCountChanged(int visible, int total);
     void BootGame(const QString& game_path, StartGameType type);
@@ -114,7 +118,8 @@ signals:
     void OpenFolderRequested(u64 program_id, GameListOpenTarget target,
                              const std::string& game_path);
     void OpenTransferableShaderCacheRequested(u64 program_id);
-    void SyncShadersRequested(u64 program_id);
+    void PrepareShaderWarmRequested(u64 program_id, const std::string& game_path);
+    void DeleteShaderWarmRequested(u64 program_id);
     void RemoveInstalledEntryRequested(u64 program_id, QtCommon::Game::InstalledEntryType type);
     void RemoveFileRequested(u64 program_id, QtCommon::Game::GameListRemoveTarget target,
                              const std::string& game_path);

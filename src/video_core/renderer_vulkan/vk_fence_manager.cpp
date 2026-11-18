@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
@@ -75,6 +74,7 @@ void FenceManager::WaitFence(Fence& fence) {
 }
 
 void FenceManager::SubmitDeferredWork() {
+    // Only the split's back defers (Scheduler::DeferFlush) and submits.
     if (VideoCommon::GpuSplit::OnBackThread()) {
         scheduler.FlushDeferred();
     }

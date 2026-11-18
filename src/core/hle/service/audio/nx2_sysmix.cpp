@@ -6,14 +6,16 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 
+#include "audio_core/sink/silent_input_stream.h"
 #include "audio_core/sink/sink.h"
 #include "audio_core/sink/sink_stream.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "core/core.h"
-#include "core/core_timing.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/audio/errors.h"
@@ -54,13 +56,28 @@ struct SysmixOutput::Impl {
         open = false;
         engaged = false;
         data_mode = 0;
-        if (host) {
-            sink.CloseStream(host);
-            host = nullptr;
-        }
+        ReleaseHost();
         if (state_event) {
             state_event->Signal(system.Kernel());
         }
+    }
+
+    void ReleaseHost() {
+        if (host == silent_input.get()) {
+            silent_input.reset();
+        } else {
+            sink.CloseStream(host);
+        }
+        host = nullptr;
+    }
+
+    /// Replace a host microphone that failed to open or start with silence the guest can capture.
+    void UseSilentInput(u32 guest_channels) {
+        LOG_WARNING(Service_Audio,
+                    "sysmix stream {}: host microphone unavailable, capturing silence", id);
+        ReleaseHost();
+        silent_input = std::make_unique<AudioCore::Sink::SilentInputStream>(system, guest_channels);
+        host = silent_input.get();
     }
 
     /// Stop admission and notify the guest after invalid memory or a fatal host-stream failure.
@@ -98,23 +115,6 @@ struct SysmixOutput::Impl {
         }
     }
 
-    // emu_us is the guest clock; the wall clock is the timestamp every log line carries.
-    // Comparing their deltas over consecutive windows shows whether emulated time runs at the
-    // host's rate (48000 frames of output per second of wall time).
-    void LogStatus(u32 filled) {
-        const u64 emu_us = static_cast<u64>(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                system.CoreTiming().GetGlobalTimeNs())
-                .count());
-        LOG_INFO(Service_Audio,
-                 "sysmix stream {} output: copied={} accepted={} nonzero={} blocks={} full={} "
-                 "queued={} retried={} padded={} deferred={} filled={} emu_us={}",
-                 id, counters.copied_frames, counters.accepted_frames, counters.nonzero_frames,
-                 counters.admitted_blocks, counters.backpressure,
-                 host ? host->GetQueueSize() : 0, counters.retried_frames, counters.padded_frames,
-                 counters.deferred, filled, emu_us);
-    }
-
     Core::System& system;
     Kernel::KScopedAutoObject<Kernel::KProcess> process;
     AudioCore::Sink::Sink& sink;
@@ -122,6 +122,7 @@ struct SysmixOutput::Impl {
     Kernel::KEvent* state_event{};
     Kernel::KEvent* data_event{};
     AudioCore::Sink::SinkStream* host{};
+    std::unique_ptr<AudioCore::Sink::SinkStream> silent_input;
     mutable std::mutex mutex;
     u32 id;
     u64 buffer;
@@ -208,14 +209,21 @@ Result SysmixOutput::Open(u32 sample_type, u32 channels, u32 rate, u32 frames, u
                  memory.Read32Acquire(p.buffer + WriteOffset, write) && read < slots &&
                  write < slots,
              ResultInvalidAddressInfo);
-    p.host = p.sink.AcquireSinkStream(p.system, channels, "sysmix-" + std::to_string(p.id),
-                                      p.input_stream ? AudioCore::Sink::StreamType::In
-                                                     : AudioCore::Sink::StreamType::Sysmix);
+    if (p.input_stream &&
+        Settings::values.audio_input_device_id.GetValue() == AudioCore::Sink::no_input_device_name) {
+        LOG_INFO(Service_Audio, "sysmix stream {}: input device is none, capturing silence", p.id);
+        p.silent_input = std::make_unique<AudioCore::Sink::SilentInputStream>(p.system, channels);
+        p.host = p.silent_input.get();
+    } else {
+        p.host = p.sink.AcquireSinkStream(p.system, channels, "sysmix-" + std::to_string(p.id),
+                                          p.input_stream ? AudioCore::Sink::StreamType::In
+                                                         : AudioCore::Sink::StreamType::Sysmix);
+    }
+    if (p.input_stream && (!p.host || !p.host->IsReady())) {
+        p.UseSilentInput(channels);
+    }
     if (!p.host || !p.host->IsReady()) {
-        if (p.host) {
-            p.sink.CloseStream(p.host);
-            p.host = nullptr;
-        }
+        p.ReleaseHost();
         R_RETURN(ResultOperationFailed);
     }
     p.slots = static_cast<u32>(slots);
@@ -250,6 +258,10 @@ Result SysmixOutput::SetEngaged(bool engaged) {
     }
     if (engaged) {
         p.host->Start();
+        if (p.input_stream && (!p.host->IsReady() || p.host->IsPaused())) {
+            p.UseSilentInput(p.channels);
+            p.host->Start();
+        }
         R_UNLESS(p.host->IsReady() && !p.host->IsPaused(), ResultOperationFailed);
     } else {
         p.host->Stop();
@@ -456,20 +468,13 @@ void SysmixOutput::Pump() {
             return;
         }
         ++p.counters.backpressure;
-        p.counters.retried_frames += taken;
         if (p.counters.backpressure <= 3) {
             LOG_INFO(Service_Audio, "sysmix stream {} host full: accepted={} blocks={}", p.id,
                      p.counters.accepted_frames, p.counters.admitted_blocks);
         }
-        if (p.counters.ticks % 400 == 0) {
-            p.LogStatus(filled);
-        }
         return;
     }
     ++p.counters.admitted_blocks;
-    if (taken < BlockFrames) {
-        p.counters.padded_frames += BlockFrames - taken;
-    }
     const u32 next = (read + taken) % p.slots;
     u32 checked{};
     if (!memory.Read32Acquire(p.buffer + ReadOffset, checked) || checked != read ||
@@ -488,7 +493,11 @@ void SysmixOutput::Pump() {
     p.Notify(filled);
     if (p.counters.admitted_blocks <= 3 || p.counters.ticks % 400 == 0 ||
         (nonzero && p.counters.nonzero_frames == nonzero)) {
-        p.LogStatus(filled);
+        LOG_INFO(Service_Audio,
+                 "sysmix stream {} output: copied={} accepted={} nonzero={} blocks={} full={} queued={}",
+                 p.id, p.counters.copied_frames, p.counters.accepted_frames,
+                 p.counters.nonzero_frames, p.counters.admitted_blocks, p.counters.backpressure,
+                 p.host->GetQueueSize());
     }
 }
 

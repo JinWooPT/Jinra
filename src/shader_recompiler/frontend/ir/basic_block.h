@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -87,6 +86,16 @@ public:
     }
     const Value& SsaRegValue(IR::Reg reg) const noexcept {
         return ssa_reg_values[RegIndex(reg)];
+    }
+
+    /// The other variables the SSA pass tracks per block (predicates, flags, the indirect branch
+    /// target), by the pass's own slot numbers (EDEN_NX2_SSA_BLOCK_VALUES=1).
+    static constexpr size_t NumSsaOtherValues = 16;
+    void SetSsaOtherValue(size_t slot, const Value& value) noexcept {
+        ssa_other_values[slot] = value;
+    }
+    const Value& SsaOtherValue(size_t slot) const noexcept {
+        return ssa_other_values[slot];
     }
 
     void SsaSeal() noexcept {
@@ -182,6 +191,8 @@ private:
 
     /// Intrusively store the value of a register in the block.
     std::array<Value, NUM_REGS> ssa_reg_values;
+    /// Intrusively store the value of the SSA pass's other variables in the block.
+    std::array<Value, NumSsaOtherValues> ssa_other_values;
     /// Intrusively store if the block is sealed in the SSA pass.
     bool is_ssa_sealed{false};
 

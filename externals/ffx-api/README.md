@@ -10,6 +10,6 @@ The FFX API headers from AMD's FidelityFX SDK 2.4.0, used by
 - Licence: MIT (the SDK's `Kits/FidelityFX/docs/license.md` lists these files under its MIT
   terms; the notice is in each header).
 
-Jinra users download AMD's signed runtime DLLs from the same SDK commit in the
-Graphics settings. See
+AMD's signed runtime DLLs are not part of this repository or of any Lichii package. Users
+download them from the same SDK commit in the Graphics settings; see
 `src/video_core/vulkan_common/ffx_files.h`.

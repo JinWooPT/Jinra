@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project SPDX-License-Identifier:
 # GPL-2.0-or-later
 
 if(DEFINED ENV{AZURECIREPO})
@@ -32,14 +31,14 @@ add_library(
     bit_field.h
     bit_util.h
     bounded_threadsafe_queue.h
+    build_stamp.cpp
+    build_stamp.h
     cityhash.cpp
     cityhash.h
     common_funcs.h
     common_types.h
     concepts.h
     container_hash.h
-    core_pinning.cpp
-    core_pinning.h
     demangle.cpp
     demangle.h
     device_power_state.cpp
@@ -47,8 +46,25 @@ add_library(
     div_ceil.h
     dkb_cpu_trace.cpp
     dkb_cpu_trace.h
+    jit_symbols.cpp
+    jit_symbols.h
+    frame_budget.cpp
+    frame_budget.h
+    nx2_hitch.cpp
+    nx2_hitch.h
     nx2_sampler.cpp
     nx2_sampler.h
+    fritchii_lock_census.cpp
+    fritchii_lock_census.h
+    nx2_gpu_write_listener.h
+    nx2_uniform_keep_pages.h
+    fritchii_switch_defaults.cpp
+    fritchii_jit_list.cpp
+    fritchii_jit_list.h
+    fritchii_write_ring.h
+    fritchii_page_flags.h
+    fritchii_bind_skip.h
+    fritchii_s4_count.h
     dynamic_library.cpp
     dynamic_library.h
     elf.h
@@ -59,6 +75,8 @@ add_library(
     fiber.h
     fixed_point.h
     free_region_manager.h
+    frizti_settings.cpp
+    frizti_settings.h
     fs/file.cpp
     fs/file.h
     fs/fs.cpp
@@ -67,8 +85,12 @@ add_library(
     fs/fs_types.h
     fs/fs_util.cpp
     fs/fs_util.h
+    fs/file_lock.cpp
+    fs/file_lock.h
     fs/path_util.cpp
     fs/path_util.h
+    fs/profile_migration.cpp
+    fs/profile_migration.h
     hash.h
     heap_tracker.cpp
     heap_tracker.h
@@ -103,6 +125,9 @@ add_library(
     ${CMAKE_CURRENT_BINARY_DIR}/scm_rev.cpp
     scm_rev.h
     scope_exit.h
+    shutdown_progress.h
+    shutdown_watch.cpp
+    shutdown_watch.h
     spin_recursive_mutex.h
     scratch_buffer.h
     settings.cpp
@@ -128,6 +153,12 @@ add_library(
     swap.h
     thread.cpp
     thread.h
+    thread_pinning.cpp
+    thread_pinning.h
+    nx2_sample_profile.cpp
+    nx2_timeline.cpp
+    nx2_timeline.h
+    nx2_sample_profile.h
     thread_cpu_clock.cpp
     thread_cpu_clock.h
     adpf.cpp
@@ -159,17 +190,25 @@ add_library(
     net/net.h net/net.cpp
     container/unordered_map.h container/unordered_set.h)
 
-# The ZBIC decoder runs once per module at load, so a profile buys it nothing, and the aarch64
-# PGO build returns errors for NSOs the plain build decodes (#95). -fno-profile-instr-use is the
-# spelling both clang and clang-cl accept; it overrides -fprofile-use from CMAKE_CXX_FLAGS.
 set_source_files_properties(zbic_compression.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${ZBIC_INCLUDE_DIR}"
-    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>;$<$<CXX_COMPILER_ID:AppleClang,Clang>:-fno-profile-instr-use>")
+    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>")
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(common PRIVATE linux/crash_handler.cpp
+        linux/crash_handler.h)
+endif()
 
 if(WIN32)
-    target_sources(common PRIVATE windows/timer_resolution.cpp
+    target_sources(common PRIVATE windows/crash_handler.cpp
+        windows/crash_handler.h
+        windows/fritchii_focus.cpp
+        windows/fritchii_focus.h
+        windows/timer_resolution.cpp
         windows/timer_resolution.h)
-    target_link_libraries(common PRIVATE ntdll)
+    # pdh: the machine pulse's clock and thermal counters (nx2_hitch.cpp) and the GPU memory
+    # counters of FRITCHII_VRAM_BUDGET_MODE=os (memory_detect.cpp)
+    target_link_libraries(common PRIVATE ntdll pdh)
 endif()
 
 if(NOT WIN32)
@@ -180,17 +219,7 @@ if(ANDROID)
     target_sources(
         common
         PUBLIC fs/fs_android.cpp
-        fs/fs_android.h
-        android/android_common.cpp
-        android/android_common.h
-        android/id_cache.cpp
-        android/id_cache.h
-        android/multiplayer/multiplayer.cpp
-        android/multiplayer/multiplayer.h
-        android/applets/software_keyboard.cpp
-        android/applets/software_keyboard.h
-        android/applets/web_browser.cpp
-        android/applets/web_browser.h)
+        fs/fs_android.h)
 endif()
 
 if(ARCHITECTURE_x86_64)
@@ -269,6 +298,12 @@ endif()
 if(ANDROID)
     # For ASharedMemory_create
     target_link_libraries(common PRIVATE android)
+endif()
+
+if (MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_FLAGS_RELEASE MATCHES "-flto")
+    # As the kernel (src/core): fibers migrate between host threads, and with a newer Ocarina PGO
+    # profile ThinLTO dropped Fiber's definitions that the kernel's plain objects call.
+    set_source_files_properties(fiber.cpp PROPERTIES COMPILE_OPTIONS -fno-lto)
 endif()
 
 create_target_directory_groups(common)

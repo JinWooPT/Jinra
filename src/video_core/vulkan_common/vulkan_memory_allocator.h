@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -10,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -95,10 +95,11 @@ namespace Vulkan {
          * Construct memory allocator
          *
          * @param device_  Device to allocate from
+         * @param buffers  Use the device's buffer allocator (Device::GetBufferAllocator)
          *
          * @throw vk::Exception on failure
          */
-        explicit MemoryAllocator(const Device &device_);
+        explicit MemoryAllocator(const Device &device_, bool buffers = false);
 
         ~MemoryAllocator();
 
@@ -141,6 +142,24 @@ namespace Vulkan {
         u32 FailedImages() const noexcept {
             return failed_images.load(std::memory_order_relaxed);
         }
+
+        /// EDEN_NX2_IMAGE_ALLOC_TIMING=1 (boot, off by default): images are made in vmaCreateImage's
+        /// three steps, each timed (ns, all images so far), so "Slow clear" lines can say where a
+        /// new image's create time went (NPC-pass dips: 0.15-1.5 ms per per-object depth target).
+        struct ImageTiming {
+            u64 images{};
+            u64 create_ns{}; ///< vkCreateImage
+            u64 alloc_ns{};  ///< vmaAllocateMemoryForImage (requirements, block search, new blocks)
+            u64 bind_ns{};   ///< vmaBindImageMemory
+            /// Of the images: those whose create added a VMA memory object (a new block or
+            /// dedicated memory; VMA's count across the create, so another thread's allocation
+            /// in between can count too), their whole create time, and the dedicated ones.
+            u64 new_block_images{};
+            u64 new_block_ns{};
+            u64 dedicated_images{};
+        };
+        static ImageTiming ReadImageTiming() noexcept;
+        static bool ImageTimingEnabled() noexcept;
 
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
 
@@ -191,5 +210,42 @@ namespace Vulkan {
 
     /// Logs VMA's blocks and allocations per memory type, and each heap's budget.
     void LogMemoryStatistics(const Device& device);
+
+    /// One line each for the process's memory, what DXGI counts for the GPU (Windows), and VMA's
+    /// heaps and memory types against what the driver reports (EDEN_NX2_MEM_TRACE).
+    void LogMemoryTrace(const Device& device);
+
+    /// VMA's heaps summed by kind, for the "Memory owners" line: host heaps (system RAM) and
+    /// device-local ones (video memory), each the driver's usage and budget and VMA's blocks.
+    struct HeapTotals {
+        u64 host_usage{};
+        u64 host_budget{};
+        u64 host_blocks{};
+        u64 local_usage{};
+        u64 local_budget{};
+        u64 local_blocks{};
+    };
+    [[nodiscard]] HeapTotals GetHeapTotals(const Device& device);
+
+    /// FRITCHII_VRAM_OWNERS: where the unused space in `owner`'s blocks on `heap` lies: the
+    /// memory types' default blocks, then each custom pool (depth, colour, sparse, buffer), each
+    /// with its blocks, holes and largest hole. Walks every block: only the allocator's user may
+    /// call it (the back for the main allocator; MemoryStageLink::IsCacheUser for the buffer one).
+    [[nodiscard]] std::string VramSlackText(const Device& device, VmaAllocator owner, u32 heap);
+
+    /// FRITCHII_VRAM_TRIM: gives back the empty block VMA keeps in each of `owner`'s block
+    /// vectors on `heap` (default blocks and custom pools). Returns the bytes given back. Only the
+    /// allocator's user may call it.
+    u64 TrimEmptyBlocks(const Device& device, VmaAllocator owner, u32 heap);
+
+    /// FRITCHII_DEPTH_POOL_FIT: what it placed and the padding its live images hold; empty while
+    /// it is off and placed nothing.
+    [[nodiscard]] std::string DepthFitText();
+
+    /// FRITCHII_VRAM_HOLES: per block vector of `owner` on `heap` (default blocks per memory type,
+    /// each named pool), the holes and the allocations by size, and what holds the blocks that
+    /// are at least half free (kind, size, age). Builds VMA's detailed map: several ms with
+    /// thousands of allocations, so only on request; only the allocator's user may call it.
+    [[nodiscard]] std::string VramHolesText(VmaAllocator owner, u32 heap);
 
 } // namespace Vulkan

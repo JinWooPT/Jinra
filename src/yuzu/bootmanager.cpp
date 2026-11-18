@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <string_view>
 
 #ifdef HAS_OPENGL
 #include <glad/glad.h>
@@ -47,6 +48,7 @@
 #include <QOpenGLContext>
 #endif
 
+#include "common/build_stamp.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/settings_input.h"
@@ -118,10 +120,15 @@ struct NullRenderWidget : public RenderWidget {
 GRenderWindow::GRenderWindow(MainWindow* parent,
                              std::shared_ptr<InputCommon::InputSubsystem> input_subsystem_)
     : QWidget(parent), input_subsystem{std::move(input_subsystem_)} {
-    setWindowTitle(QStringLiteral("Jinra %1 | %2-%3")
-                       .arg(QString::fromUtf8(Common::g_build_name),
-                            QString::fromUtf8(Common::g_scm_branch),
-                            QString::fromUtf8(Common::g_scm_desc)));
+    if (std::string_view{Common::g_build_name} == "Jinra") {
+        setWindowTitle(
+            QStringLiteral("Fritchii %1").arg(QString::fromStdString(Common::BuildLabelWithTag())));
+    } else {
+        setWindowTitle(QStringLiteral("Fritchii %1 | %2-%3")
+                           .arg(QString::fromUtf8(Common::g_build_name),
+                                QString::fromUtf8(Common::g_scm_branch),
+                                QString::fromUtf8(Common::g_scm_desc)));
+    }
     setAttribute(Qt::WA_AcceptTouchEvents);
     auto* layout = new QHBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -184,10 +191,6 @@ bool GRenderWindow::IsShown() const {
 // and hence, do not support DPI scaling ("retina" displays).
 // The result will be a viewport that is smaller than the extent of the window.
 void GRenderWindow::OnFramebufferSizeChanged() {
-    const auto* display = screen();
-    const auto refresh_rate = display != nullptr ? display->refreshRate() : 0.0;
-    Settings::SetDisplayRefreshPeriodNs(
-        refresh_rate >= 20.0 ? static_cast<s64>(1'000'000'000.0 / refresh_rate) : 0);
     // Screen changes potentially incur a change in screen DPI, hence we should update the
     // framebuffer size
     const qreal pixel_ratio = windowPixelRatio();
@@ -867,7 +870,7 @@ bool GRenderWindow::InitializeOpenGL() {
     return true;
 #else
     QMessageBox::warning(this, tr("OpenGL not available!"),
-                         tr("Jinra has not been compiled with OpenGL support."));
+                         tr("Fritchii has not been compiled with OpenGL support."));
     return false;
 #endif
 }
@@ -947,7 +950,6 @@ void GRenderWindow::showEvent(QShowEvent* event) {
     // windowHandle() is not initialized until the Window is shown, so we connect it here.
     connect(windowHandle(), &QWindow::screenChanged, this, &GRenderWindow::OnFramebufferSizeChanged,
             Qt::UniqueConnection);
-    OnFramebufferSizeChanged();
 }
 
 bool GRenderWindow::eventFilter(QObject* object, QEvent* event) {

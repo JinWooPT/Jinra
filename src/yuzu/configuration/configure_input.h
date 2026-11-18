@@ -49,9 +49,9 @@ public:
 
     /// Save all button configurations to settings file.
     void ApplyConfiguration();
+    void UseHomeLayout();
 
     QList<QWidget*> GetSubTabs() const;
-    void UseHomeLayout();
 
 private:
     void changeEvent(QEvent* event) override;

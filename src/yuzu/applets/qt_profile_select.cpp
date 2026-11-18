@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <mutex>
@@ -16,6 +15,7 @@
 #include <QVBoxLayout>
 #include "common/fs/path_util.h"
 #include "common/string_util.h"
+#include "core/constants.h"
 #include "core/core.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "yuzu/applets/qt_profile_select.h"
@@ -41,10 +41,12 @@ QPixmap GetIcon(Common::UUID uuid) {
     QPixmap icon{GetImagePath(uuid)};
 
     if (!icon) {
-        icon.load(QStringLiteral(":/jinra/icon.png"));
+        icon.fill(Qt::black);
+        icon.loadFromData(Core::Constants::ACCOUNT_BACKUP_JPEG.data(),
+                          static_cast<u32>(Core::Constants::ACCOUNT_BACKUP_JPEG.size()));
     }
 
-    return icon;
+    return icon.scaled(64, 64, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 }
 } // Anonymous namespace
 

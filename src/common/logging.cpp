@@ -11,6 +11,7 @@
 #include <deque>
 #include <mutex>
 #include <regex>
+#include <string_view>
 #include <thread>
 
 #if defined(__ANDROID__)
@@ -32,6 +33,7 @@
 #include "common/fs/path_util.h"
 #include "common/literals.h"
 #include "common/polyfill_thread.h"
+#include "common/scm_rev.h"
 #include "common/thread.h"
 
 #include "common/logging.h"
@@ -157,6 +159,9 @@ struct Backend {
     virtual void Flush() noexcept = 0;
 };
 
+/// @brief Formatting specifier (to use with printf) of the equivalent fmt::format() expression
+#define CCB_PRINTF_FMT "[%4d.%06d] %s <%s> %s:%u:%s: %s"
+
 /// @brief Instead of using fmt::format() just use the system's formatting capabilities directly
 struct DirectFormatArgs {
     const char *class_name;
@@ -198,13 +203,7 @@ struct ColorConsoleBackend final : public Backend {
             }());
             SetConsoleTextAttribute(console_handle, color);
             auto const df = GetDirectFormatArgs(entry);
-            // One write per line: MinGW's fprintf emits each character separately, and stdout is
-            // unbuffered here, so every character became a WriteFile on the thread that logs.
-            fmt::memory_buffer line;
-            fmt::format_to(fmt::appender(line), "[{:4d}.{:06d}] {} <{}> {}:{}:{}: ", df.time_seconds, df.time_fractional, df.class_name, df.level_name, entry.filename, entry.line_num, entry.function);
-            line.append(entry.message, entry.message + entry.message_len);
-            line.push_back('\n');
-            std::fwrite(line.data(), 1, line.size(), stdout);
+            std::fprintf(stdout, CCB_PRINTF_FMT "\n", df.time_seconds, df.time_fractional, df.class_name, df.level_name, entry.filename, entry.line_num, entry.function, entry.message);
         }
     }
     void Flush() noexcept override {}
@@ -247,14 +246,30 @@ struct ColorConsoleBackend final : public Backend {
 /// @brief Backend that writes to a file passed into the constructor
 struct FileBackend final : public Backend {
     explicit FileBackend(const std::filesystem::path filename) noexcept {
-        const auto old_filename = filename.parent_path() / LOG_PREVIOUS_FILE;
-        if (FS::Exists(filename)) {
-            void(FS::RemoveFile(old_filename));
-            void(FS::RenameFile(filename, old_filename));
-        }
+        auto old_filename = filename;
+        old_filename += ".old.txt";
+        // Existence checks are done within the functions themselves.
+        // We don't particularly care if these succeed or not.
+        void(FS::RemoveFile(old_filename));
+        void(FS::RenameFile(filename, old_filename));
         file.emplace(filename, FS::FileAccessMode::Write, FS::FileType::TextFile);
+        path = filename;
+        if (!file->IsOpen()) {
+            // Another Fritchii still holds the log (one that never finished closing, e.g. after
+            // an update's restart): without this the session logged nothing and Export Log sent
+            // that process's old log (a v5.3 log in a v5.5 export, 2026-11-09).
+            auto busy = filename;
+            busy.replace_extension();
+            busy += ".busy.txt";
+            file.emplace(busy, FS::FileAccessMode::Write, FS::FileType::TextFile);
+            path = busy;
+            primary_locked = true;
+        }
     }
     ~FileBackend() noexcept override = default;
+
+    std::filesystem::path path;
+    bool primary_locked = false;
 
     void Write(const Entry& entry) noexcept override {
         if (!enabled)
@@ -274,8 +289,18 @@ struct FileBackend final : public Backend {
                         return std::string{s};
                 return std::string{};
             }();
-            if (!username.empty())
+            if (!username.empty()) {
+                // The build version can contain the username ("Frizti v2" for user "Frizt").
+                const std::string_view version{Common::g_build_version};
+                const bool keep_version =
+                    !version.empty() && version.find(username) != std::string_view::npos &&
+                    message.find(version) != std::string::npos;
+                if (keep_version)
+                    boost::replace_all(message, version, "\x01");
                 boost::replace_all(message, username, "user");
+                if (keep_version)
+                    boost::replace_all(message, "\x01", version);
+            }
         }
 #endif
         bytes_written += file->WriteSpan(std::span<const char>{message.begin(), message.end()});
@@ -444,12 +469,46 @@ void Start() {
 }
 
 void Stop() {
-    Flush();
-}
-
-void Flush() {
     if (logging_instance)
         logging_instance->ForEachBackend([](Backend& backend) { backend.Flush(); });
+}
+
+std::filesystem::path FilePath(bool* primary_locked) {
+    if (primary_locked) {
+        *primary_locked = false;
+    }
+#ifndef __OPENORBIS__
+    if (logging_instance && logging_instance->file_backend) {
+        if (primary_locked) {
+            *primary_locked = logging_instance->file_backend->primary_locked;
+        }
+        return logging_instance->file_backend->path;
+    }
+#endif
+    return {};
+}
+
+void FmtCrashMessageImpl(const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) noexcept {
+#ifndef __OPENORBIS__
+    if (!logging_instance || !logging_instance->file_backend)
+        return;
+    char buffer[2048];
+    const auto result = fmt::vformat_to_n(buffer, sizeof(buffer) - 1, format, args);
+    const std::size_t length = (std::min)(result.size, sizeof(buffer) - 1);
+    buffer[length] = '\0';
+    const Entry e{
+        .message = buffer,
+        .message_len = length,
+        .timestamp = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - logging_instance->time_origin),
+        .log_class = Class::Common,
+        .log_level = Level::Critical,
+        .filename = TrimSourcePath(filename),
+        .function = function,
+        .line_num = line_num,
+    };
+    logging_instance->file_backend->Write(e);
+    logging_instance->file_backend->Flush();
+#endif
 }
 
 void SetGlobalFilter(const Filter& filter) {

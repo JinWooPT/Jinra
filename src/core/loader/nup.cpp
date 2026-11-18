@@ -12,7 +12,6 @@
 #include "core/file_sys/nup_container.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/patch_manager.h"
-#include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/vfs/vfs_vector.h"
@@ -71,8 +70,10 @@ std::unique_ptr<FileSys::NACP> BuildNacp(const NupContainer::PackageInfo& base,
             }
         }
     }
-    if (!effective_title.empty()) {
-        CopyNameToEntry(nacp->raw.language_entries.language_entries[0], effective_title);
+    // Slot 0 is en-us; an exact en-us localized title wins over the default title (SPEC 5.1).
+    auto& english = nacp->raw.language_entries.language_entries[0];
+    if (!effective_title.empty() && english.application_name[0] == '\0') {
+        CopyNameToEntry(english, effective_title);
     }
     if (!base.publisher.empty()) {
         for (auto& entry : nacp->raw.language_entries.language_entries) {
@@ -133,6 +134,9 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
     const auto& program = nup->GetPackages()[*program_index];
     base_title_id = program.title_id;
 
+    // Title metadata lives on the base package (SPEC section 5.1), which is still present when
+    // its ExeFS is empty and the program boots from the update. Take each field from the base
+    // when it has one and fall back to the program package otherwise.
     NupContainer::PackageInfo meta;
     meta.title_id = program.title_id;
     meta.title_name = program.title_name;
@@ -155,12 +159,18 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
         if (!base.publisher.empty()) {
             meta.publisher = base.publisher;
         }
+        // The default and localized icons are one set, so they come from the same package.
         if (!base.icon.empty() || !base.localized_icons.empty()) {
             meta.icon = base.icon;
             meta.localized_icons = base.localized_icons;
         }
     }
     display_title = meta.title_name;
+    for (const auto& [lang, name] : meta.localized_titles) {
+        if (lang == "en-us" && !name.empty()) {
+            display_title = name;
+        }
+    }
     has_program = true;
 
     const auto exefs = nup->GetExeFSDir(*exefs_index);
@@ -173,11 +183,9 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
 
     if (update_index) {
         const auto& update = nup->GetPackages()[*update_index];
-        content_version = update.version;
         display_version = update.display_version.empty() ? DecodeVersion(update.version)
                                                          : update.display_version;
     } else {
-        content_version = program.version;
         display_version = program.display_version.empty() ? DecodeVersion(program.version)
                                                           : program.display_version;
     }
@@ -194,6 +202,18 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
             icon_file = std::make_shared<FileSys::VectorVfsFile>(
                 meta.localized_icons.front().second, "icon.dat");
         }
+    }
+
+    const auto addon_count = std::count_if(nup->GetPackages().begin(), nup->GetPackages().end(),
+                                           [](const auto& package) {
+                                               return package.kind ==
+                                                      NupContainer::PackageKind::Addon;
+                                           });
+    if (addon_count > 0) {
+        LOG_WARNING(Loader,
+                    "NUP container has {} add-on content package(s); AoC mounting is not "
+                    "supported yet",
+                    addon_count);
     }
 }
 
@@ -219,12 +239,6 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
         return result;
     }
 
-    if (const auto* slot = system.GetContentProviderUnion().GetSlotProvider(
-            FileSys::ContentProviderUnionSlot::FrontendManual)) {
-        auto& provider = *const_cast<FileSys::ManualContentProvider*>(
-            static_cast<const FileSys::ManualContentProvider*>(slot));
-        provider.AddNupAddOns(*nup, base_title_id);
-    }
     system.GetFileSystemController().RegisterProcess(
         process.GetProcessId(), base_title_id,
         std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),

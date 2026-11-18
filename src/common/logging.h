@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <filesystem>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -89,6 +90,15 @@ enum class Class : u8 {
 /// Logs a message to the global logger, using fmt
 void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args);
 
+/// Writes a Critical message to the log file alone and flushes it, for the crash handler: the
+/// other backends take locks that a crashed thread may hold.
+void FmtCrashMessageImpl(const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) noexcept;
+
+template <typename... Args>
+void FmtCrashMessage(const char* filename, unsigned int line_num, const char* function, fmt::format_string<Args...> format, const Args&... args) {
+    FmtCrashMessageImpl(filename, line_num, function, format.get(), fmt::make_format_args(args...));
+}
+
 /// Returns true if a message of this class and level would pass the global filter.
 [[nodiscard]] bool IsLevelEnabled(Class log_class, Level log_level);
 
@@ -138,11 +148,12 @@ void Initialize();
 
 void Start();
 
-/// Flushes buffered log entries so the current file can be exported.
-void Flush();
-
 /// Explicitly stops the logger thread and flushes the buffers
 void Stop();
+
+/// The file this session logs to (empty without a file log). `primary_locked` is set when the
+/// usual log file was held by another process, so the session logs to a fallback file.
+std::filesystem::path FilePath(bool* primary_locked = nullptr);
 
 /// The global filter will prevent any messages from even being processed if they are filtered.
 void SetGlobalFilter(const Filter& filter);

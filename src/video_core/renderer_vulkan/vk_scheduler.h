@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -24,10 +24,15 @@
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
 #include "common/polyfill_thread.h"
+#include "common/nx2_timeline.h"
 #include "common/settings.h"
+#include "video_core/fritchii_price.h"
 #include "video_core/gpu_split.h"
+#include "video_core/gpu_wait_site.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/renderer_vulkan/vk_mem_stage_hook.h"
+#include "video_core/renderer_vulkan/vk_submit_times.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCommon {
@@ -68,6 +73,10 @@ public:
     bool DeferFlush();
     /// Submits deferred work (the split's back, from its idle hook).
     void FlushDeferred();
+    /// The split's back (EDEN_NX2_EXP27 & 8, the original's DISPATCH_BATCH): the work so
+    /// far goes with the next submission, when the back goes idle or when another thread waits
+    /// for it (WaitSubmitted), with no time window. False on other threads (the caller submits).
+    bool DeferFlushUntilWanted();
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.
@@ -147,6 +156,16 @@ public:
         return state.renderpass != VK_NULL_HANDLE;
     }
 
+    /// Render passes begun (delta draws: a draw in another render pass is resolved in full).
+    [[nodiscard]] u64 RenderPassSerial() const noexcept {
+        return render_pass_serial;
+    }
+
+    /// The graphics pipeline UpdateGraphicsPipeline bound last in this command buffer.
+    [[nodiscard]] const GraphicsPipeline* BoundGraphicsPipeline() const noexcept {
+        return state.graphics_pipeline;
+    }
+
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
 
@@ -178,17 +197,39 @@ public:
         on_submit = std::move(func);
     }
 
-    /// Queue consecutive in-order uploads outside a render pass.
+    /// Consecutive in-order staging uploads share barriers until their destinations overlap,
+    /// a source depends on a pending copy, or the batch is full. Call outside a render pass.
     void RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies);
 
     /// Send work to a separate thread.
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordWithUploadBuffer(T&& command) {
+        SeamHook::Watch(SeamHook::Use::Record);
+        RecordCommand(std::forward<T>(command));
+    }
+
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void Record(T&& c) {
+        SeamHook::Watch(SeamHook::Use::Record);
+        RecordCommand([command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
+            command(cmdbuf);
+        });
+    }
+
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
+    void RecordCommand(T&& command) {
+        // fable_stage_levelpoints 19.4 (GPU profile on, the back): this call's time (the lambda's
+        // capture, the chunk append, a full chunk's hand-off), sampled ("Price Vulkan worker").
+        // Off: the profile's test and a branch.
+        const VideoCommon::FritchiiPrice::RecordScope price_scope;
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
         if (uploads_pending) {
+            // Pending uploads precede every other recorded command, including upload-buffer work.
             FlushUploads();
         }
         ++record_serial;
@@ -199,19 +240,12 @@ public:
         (void)chunk->Record(command);
     }
 
-    template <typename T>
-        requires std::is_invocable_v<T, vk::CommandBuffer>
-    void Record(T&& c) {
-        this->RecordWithUploadBuffer(
-            [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
-                command(cmdbuf);
-            });
-    }
-
-    /// A deferred clear becomes a command when the next submission ends the render pass.
-    [[nodiscard]] bool HasUnsubmittedCommands() const noexcept {
-        return uploads_pending || record_serial != submitted_serial ||
-               deferred_clear.framebuffer != nullptr;
+    /// Whether a command was recorded since the last Flush or Finish (EXP61: a flush with nothing
+    /// to submit is skipped).
+    [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
+        // Pending batched uploads are recorded work too: EXP61 must not
+        // skip a flush that would send them.
+        return uploads_pending || record_serial != submitted_serial;
     }
 
     /// Whether the recording thread submitted `tick` within 20 ms.
@@ -255,6 +289,8 @@ public:
             if (tick >= master_semaphore->CurrentTick()) {
                 Flush();
             }
+            VideoCommon::BackWaitScope wait_scope{"Scheduler::Wait (host GPU execution)"};
+            Common::Nx2Timeline::ArgSpan timeline_span{"wait for host GPU", {"tick", tick}};
             master_semaphore->Wait(tick);
         }
         const auto trace_waited = trace ? std::chrono::steady_clock::now()
@@ -323,13 +359,18 @@ public:
         return *master_semaphore;
     }
 
+    /// FRITCHII_SUBMIT_TIMES: per-submission GPU timestamps (Measure is safe on any thread).
+    [[nodiscard]] const SubmitTimes& GetSubmitTimes() const noexcept {
+        return submit_times;
+    }
+
     std::mutex submit_mutex;
 
 private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
-    u64 record_serial{};
-    u64 submitted_serial{};
+    u64 record_serial{};    ///< Commands recorded (RecordWithUploadBuffer)
+    u64 submitted_serial{}; ///< record_serial at the last Flush or Finish
 
     class Command {
     public:
@@ -417,6 +458,9 @@ private:
         VkRenderPass renderpass{};
         VkFramebuffer framebuffer{};
         VkExtent2D render_area = {0, 0};
+        /// The pass is a deferred clear's variant of the framebuffer's render pass that differs
+        /// from it only in load ops, so later draws on that framebuffer can stay in it.
+        bool clear_variant = false;
         GraphicsPipeline* graphics_pipeline = nullptr;
         bool is_rescaling = false;
         bool rescaling_defined = false;
@@ -468,8 +512,10 @@ private:
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;
+
     std::unique_ptr<UploadBatch> upload_batch;
     bool uploads_pending{};
+    /// Records pending uploads before another command, worker handoff, or submission tick.
     void FlushUploads();
 
     vk::QueryPool trace_query_pool;
@@ -511,6 +557,33 @@ private:
     bool trace_gpu_pending{};
     bool trace_gpu_failed{};
 
+    /// The performance overlay's GPU time (common/frame_budget.h), while it shows its time rows:
+    /// one timestamp pair per submission in a ring, read back once the tick is done, never waited
+    /// for. Worker thread only.
+    void BudgetGpuSubmission();
+    void ReadBudgetResults();
+    /// FRITCHII_SUBMIT_TIMES: the worker's per-submission GPU timestamps (GetSubmitTimes).
+    SubmitTimes submit_times;
+    /// FRITCHII_SLOW_GPU: slow submission lines and the hang breadcrumbs (worker side).
+    SlowGpu slow_gpu;
+    /// The Flush or Finish that calls SubmitExecution (recording thread), for SlowGpu::Origin.
+    std::source_location submit_site{};
+    bool submit_is_finish{};
+    /// Common::Nx2Hitch::LogGpuBreadcrumbs's hook (any thread).
+    static void LogGpuBreadcrumbs(const void* self, const char* prefix);
+    static constexpr u32 BudgetSlots = 256;
+    vk::QueryPool budget_pool;
+    std::array<u64, BudgetSlots> budget_ticks{}; ///< each pending slot's tick
+    u32 budget_next_slot{};    ///< slot of the next submission (counts up, modulo BudgetSlots)
+    u32 budget_pending{};      ///< submitted, not read back: the slots before budget_next_slot
+    u64 budget_last_end{};     ///< end of the latest read submission, GPU clock
+    u64 budget_last_tick{};    ///< latest tick that wrote to budget_pool
+    u32 budget_timestamp_bits{};
+    float budget_timestamp_period{};
+    bool budget_recording{};   ///< the current command buffers carry a start stamp
+    bool budget_has_end{};
+    bool budget_failed{};
+
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 
     vk::CommandBuffer current_cmdbuf;
@@ -523,6 +596,7 @@ private:
 
     State state;
     u64 recording_epoch = 0;
+    u64 render_pass_serial = 0; ///< BeginRenderPassImpl calls (delta draws)
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};
@@ -535,6 +609,28 @@ private:
     std::mutex queue_mutex;
     std::condition_variable_any event_cv;
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
+    /// FRITCHII_WORKER_SPIN: the worker is spinning for work outside the lock and looks at the
+    /// queue under the lock before it sleeps (guarded by queue_mutex).
+    bool worker_spinning{};
+    /// FRITCHII_WORKER_SPIN: chunks queued since start, raised under queue_mutex with each push;
+    /// the spinning worker watches it without the lock.
+    std::atomic<u64> dispatch_serial{};
+    /// Spins the worker for up to `spin_us` microseconds (without a lock) until dispatch_serial
+    /// moves from `seen`. Returns whether it moved.
+    bool SpinForWork(u64 seen, int spin_us, const std::stop_token& stop_token);
+    /// FRITCHII_WORKER_SPIN's counts: dispatches by the recording thread, the worker's spins.
+    struct WakeStats {
+        u64 dispatches{};
+        u64 notified{};
+        u64 skipped_busy{};
+        u64 skipped_spinning{};
+        std::chrono::steady_clock::time_point since{};
+    };
+    WakeStats wake_stats;
+    std::atomic<u64> worker_spins{};
+    std::atomic<u64> worker_spin_hits{};
+    std::atomic<u64> worker_spin_ns{};
+    void NoteDispatchWake(bool notified, bool spinning);
     std::jthread worker_thread;
 
     std::chrono::steady_clock::duration frame_interval{};

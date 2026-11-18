@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <vector>
@@ -41,11 +40,6 @@ void ConfigureGraphicsAdvanced::Setup(const ConfigurationShared::Builder& builde
 
     for (auto setting :
          Settings::values.linkage.by_category[Settings::Category::RendererAdvanced]) {
-        const auto id = setting->Id();
-        if (id == Settings::values.mkw_30fps.Id() ||
-            id == Settings::values.mkw_dynamic_fps.Id()) {
-            continue;
-        }
         ConfigurationShared::Widget* widget = builder.BuildWidget(setting, apply_funcs);
 
         if (widget == nullptr) {
@@ -55,6 +49,8 @@ void ConfigureGraphicsAdvanced::Setup(const ConfigurationShared::Builder& builde
             widget->deleteLater();
             continue;
         }
+
+        const auto id = setting->Id();
 
         normal_hold.emplace(id, widget);
 

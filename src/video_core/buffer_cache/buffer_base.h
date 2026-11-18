@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -115,7 +114,11 @@ public:
 
     void setLRUID(size_t lru_id_) {
         lru_id = lru_id_;
+        lru_touched_tick = ~u64{0};
     }
+
+    /// The frame tick of the last LRU touch (BufferCache::TouchBuffer, EDEN_NX2_EXP18 & 4).
+    u64 lru_touched_tick = ~u64{0};
 
     size_t SizeBytes() const {
         return size_bytes;

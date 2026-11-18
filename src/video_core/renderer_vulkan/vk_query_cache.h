@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
 
 #include <memory>
+#include <vector>
 
 #include "video_core/query_cache/query_cache_base.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -25,6 +25,19 @@ class Scheduler;
 class StagingBufferPool;
 
 struct QueryCacheRuntimeImpl;
+
+/// One follower (fable_b 16.2): a buffer E obtained at a posted fence's place for the query
+/// values R syncs there (SyncValues copies into it, never entering the buffer cache).
+struct OneFollowerSyncTarget {
+    u64 begin;     ///< device address of the run's first byte (page aligned)
+    u64 bytes;     ///< the run's bytes (whole pages)
+    VkBuffer buffer;
+    u64 offset;    ///< the run's offset in `buffer`
+    bool payload;  ///< only payload releases' pages (a superset: not counted unused)
+    bool used;
+};
+/// R, inside a posted fence: the op's targets (null elsewhere).
+inline thread_local std::vector<OneFollowerSyncTarget>* t_onef_sync_targets = nullptr;
 
 class QueryCacheRuntime {
 public:

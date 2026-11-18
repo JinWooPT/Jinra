@@ -12,16 +12,25 @@ namespace {
 
 // Every field of Info is listed in VisitInfo below. An info that grows a field has to be listed
 // there too: this size check fails the build until it is (update the size with it).
-// The prepared pipeline file version must also change when this serialization changes.
+// Bump Magic in vk_precompiled_kept.cpp when this layout changes.
 #if defined(_MSC_VER) && defined(_WIN64)
-static_assert(sizeof(Info) == 3096,
+// 7016 = 6960 + 12 inline TextureDescriptors x 4 (is_descriptor_array) + 8 for
+// binds_unmapped_pointer_word. TextureDescriptor's is_descriptor_array and handle_is_pointer_word
+// (only set with EDEN_NX2_LIGHT_TABLE_ARRAYS) are stored in is_depth's byte (VisitTexture).
+// binds_unmapped_pointer_word is not stored: only the original's cached-record drop reads it,
+// which is not ported. 7040: + 24 for storage_write_extras (FRITCHII_EXTENT_CENSUS and
+// FRITCHII_EXTENT_CBUF), not stored either: empty for an info from the precompiled cache, so the
+// format and Magic stay.
+static_assert(sizeof(Info) == 7040,
               "Shader::Info changed: list the new fields in VisitInfo, then update this size");
 // The descriptors are held in vectors, so a field they grow does not change sizeof(Info).
-static_assert(sizeof(ConstantBufferDescriptor) == 8 && sizeof(StorageBufferDescriptor) == 20 &&
+static_assert(sizeof(ConstantBufferDescriptor) == 8 && sizeof(StorageBufferDescriptor) == 80 &&
                   sizeof(TextureBufferDescriptor) == 40 && sizeof(ImageBufferDescriptor) == 28 &&
-                  sizeof(TextureDescriptor) == 44 && sizeof(ImageDescriptor) == 36,
+                  sizeof(TextureDescriptor) == 48 && sizeof(ImageDescriptor) == 36,
               "A Shader::Info descriptor changed: list the new fields in its Visit function below, "
-              "then update these sizes and PrecompiledKeptMagic (vk_pipeline_cache.cpp)");
+              "then update these sizes and Magic (vk_precompiled_kept.cpp)");
+static_assert(sizeof(StorageWriteExtent) == 60,
+              "StorageWriteExtent changed: list the new fields in VisitWriteExtent below");
 #endif
 
 struct Writer {
@@ -167,6 +176,17 @@ void VisitConstantBuffer(Io& io, D& d) {
     io(d.index);
     io(d.count);
 }
+template <typename Io, typename E>
+void VisitWriteExtent(Io& io, E& e) {
+    io(e.bounded);
+    io(e.guarded);
+    io(e.const_end);
+    io(e.local_stride);
+    io(e.group_stride);
+    io(e.guard_const);
+    io(e.guard_local_stride);
+    io(e.guard_group_stride);
+}
 template <typename Io, typename D>
 void VisitStorageBuffer(Io& io, D& d) {
     io(d.cbuf_index);
@@ -174,6 +194,7 @@ void VisitStorageBuffer(Io& io, D& d) {
     io(d.count);
     io(d.is_written);
     io(d.indirect_offset);
+    VisitWriteExtent(io, d.write_extent);
 }
 template <typename Io, typename D>
 void VisitTextureBuffer(Io& io, D& d) {
@@ -203,7 +224,22 @@ void VisitImageBuffer(Io& io, D& d) {
 template <typename Io, typename D>
 void VisitTexture(Io& io, D& d) {
     io(d.type);
-    io(d.is_depth);
+    // is_depth in bit 0, and EDEN_NX2_LIGHT_TABLE_ARRAYS's two flags above it: bit 1
+    // handle_is_pointer_word (read at every bind: HandleIsStoragePointer binds no texture for
+    // such a word), bit 2 is_descriptor_array. Both are false with the switch off, so the byte,
+    // and every kept file written before, is what it was (no new Magic).
+    if constexpr (std::is_const_v<D>) {
+        const u8 packed = static_cast<u8>((d.is_depth ? 1U : 0U) |
+                                          (d.handle_is_pointer_word ? 2U : 0U) |
+                                          (d.is_descriptor_array ? 4U : 0U));
+        io(packed);
+    } else {
+        u8 packed{};
+        io(packed);
+        d.is_depth = (packed & 1U) != 0;
+        d.handle_is_pointer_word = (packed & 2U) != 0;
+        d.is_descriptor_array = (packed & 4U) != 0;
+    }
     io(d.is_multisample);
     io(d.is_integer);
     io(d.has_secondary);
@@ -239,6 +275,8 @@ void VisitAnyDescriptor(Io& io, D& d) {
         VisitConstantBuffer(io, d);
     } else if constexpr (std::is_same_v<T, StorageBufferDescriptor>) {
         VisitStorageBuffer(io, d);
+    } else if constexpr (std::is_same_v<T, StorageWriteExtent>) {
+        VisitWriteExtent(io, d);
     } else if constexpr (std::is_same_v<T, TextureBufferDescriptor>) {
         VisitTextureBuffer(io, d);
     } else if constexpr (std::is_same_v<T, ImageBufferDescriptor>) {
@@ -345,6 +383,7 @@ void VisitInfo(Io& io, I& info) {
     io(info.used_clip_distances);
     io(info.constant_buffer_descriptors);
     io(info.storage_buffers_descriptors);
+    io(info.storage_read_extents);
     io(info.texture_buffer_descriptors);
     io(info.image_buffer_descriptors);
     io(info.texture_descriptors);

@@ -1,16 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <condition_variable>
 #include <optional>
 #include <span>
+#include <memory>
+#include <type_traits>
+#include <utility>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include <deque>
@@ -109,9 +112,48 @@ inline CommandHeader BuildCommandHeader(BufferMethods method, u32 arg_count, Sub
     return result;
 }
 
+/// std::allocator, except that a container's value construction (resize) leaves trivial elements
+/// uninitialized: for buffers whose every element is written right after (no zero fill first).
+template <typename T>
+struct DefaultInitAllocator : std::allocator<T> {
+    template <typename U>
+    struct rebind {
+        using other = DefaultInitAllocator<U>;
+    };
+    using std::allocator<T>::allocator;
+    template <typename U>
+    void construct(U* p) noexcept(std::is_nothrow_default_constructible_v<U>) {
+        ::new (static_cast<void*>(p)) U;
+    }
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+        ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    }
+};
+
+struct CommandList;
+/// FRITCHII_STEP_LEAN=1 (live, default 0; F6 of work\FRONT_SPLIT_DESIGN.md 2d): a command list's
+/// heap storage (its entries past the inline 512, its submitted words, offsets and deferred
+/// entries) was freed on the front when the list ran out and allocated again on the submitting
+/// thread. The front gives it back through a few lock-free slots (DmaPusher::PopFrontList) and
+/// the submit's list takes it (the constructor below): vectors emptied, capacity kept. A slot
+/// is owned by whoever moved its state (empty, busy, full) with a compare-exchange; storage
+/// that finds no free slot is freed as before. Off: one relaxed load per list on each side.
+[[nodiscard]] bool CommandListRecycling() noexcept;
+void GiveCommandListStorage(CommandList& list) noexcept;
+void TakeCommandListStorage(CommandList& list) noexcept;
+
 struct CommandList final {
     CommandList() = default;
     explicit CommandList(std::size_t size) : command_lists(size) {}
+    /// The entries left uninitialized: the caller writes all of them (a submit's copy).
+    /// FRITCHII_STEP_LEAN=1: on storage a list that ran gave back (CommandListRecycling).
+    CommandList(std::size_t size, boost::container::default_init_t) {
+        if (CommandListRecycling()) [[unlikely]] {
+            TakeCommandListStorage(*this);
+        }
+        command_lists.resize(size, boost::container::default_init);
+    }
     explicit CommandList(boost::container::small_vector<CommandHeader, 512>&& prefetch_command_list_)
         : prefetch_command_list{std::move(prefetch_command_list_)} {}
 
@@ -121,7 +163,9 @@ struct CommandList final {
     std::vector<u64> submit_hashes;
     /// The entries' words when they were submitted (NX2), each entry's at submitted_offsets[i]:
     /// executed instead of the memory, which the game may already be refilling for a later frame.
-    std::vector<CommandHeader> submitted_words;
+    /// Not zero-filled when sized: the submit copies every entry's words, or zeroes them for an
+    /// entry it defers (nvhost_gpu::SubmitGPFIFOImpl).
+    std::vector<CommandHeader, DefaultInitAllocator<CommandHeader>> submitted_words;
     std::vector<u32> submitted_offsets;
     /// Entries (ascending) not copied when submitted, because a GPU map still queued covers them:
     /// DmaPusher::Push copies them after the map, and until then they read memory.
@@ -130,6 +174,8 @@ struct CommandList final {
     /// that waited behind one, reads memory instead: games write the commands it runs before they
     /// release the acquire.
     u64 snapshot_suspensions = 0;
+    /// FRITCHII_FRONT_SPLIT_COUNT: refreshes of the words so far (counted only while on).
+    u32 refreshes = 0;
 };
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
@@ -175,7 +221,9 @@ public:
     [[nodiscard]] bool HasPendingAcquire() const {
         return puller.HasPendingAcquire();
     }
-    [[nodiscard]] bool CanResumeAcquire();
+    [[nodiscard]] bool CanResumeAcquire() {
+        return puller.CanResumeAcquire(*this);
+    }
 
     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
         subchannels[subchannel_id] = engine;
@@ -185,14 +233,11 @@ public:
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
 private:
-    friend struct DmaPusherTestAccess;
-
-    static bool IsMemoryWriter(const Engines::EngineInterface& engine, Engines::EngineTypes type,
-                               u32 method);
-
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
     bool Step();
+    /// Pops the list that ran out (FRITCHII_STEP_LEAN=1: its storage goes back to the submitter).
+    void PopFrontList();
     /// Returns how many words were processed: fewer than given when a semaphore acquire
     /// suspended the channel.
     size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
@@ -214,13 +259,14 @@ public:
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
-    /// A copy engine method sent to the split's back: a launch that releases its semaphore tells
-    /// the front what it writes (GpuSplit::NoteSemaphoreWrite).
-    void NoteDmaSemaphore(u32 method, u32 argument);
-    /// Copies the list's words from memory again, as of suspension count `now`.
-    void RefreshSnapshot(CommandList& list, u64 now);
+    /// Copies the list's words from memory again, as of suspension count `now`, from entry
+    /// `first_entry` on (the entries before it ran already).
+    void RefreshSnapshot(CommandList& list, u64 now, size_t first_entry = 0);
     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
     void RefreshDeferredEntries(CommandList& list);
+    /// One entry's words copied again from memory (FRITCHII_REFRESH_LEAN: `lean_mode` and the
+    /// refresh's page cache, dma_pusher.cpp).
+    void RefreshEntryWords(CommandList& list, size_t i, int lean_mode, void* page_cache);
 
     /// EDEN_NX2_RESNAPSHOT=0 turns snapshot refreshes off.
     static bool ResnapshotEnabled() {
@@ -235,6 +281,19 @@ public:
     /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
     /// flushes and reads guest memory.
     bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
+    /// EDEN_NX2_LIST_VERIFY: reads the list ReadGpuWrittenCommands just read again as before
+    /// EXP40 (Nx2ListVerify) and leaves the words read last in command_headers.
+    void VerifyGpuWrittenCommands(GPUVAddr address, u32 count);
+    /// List draws (nx2_list_draw.h): the entry at `address` is the two GPU-written parameters of an
+    /// array draw macro call; returns whether the 3D engine took them without reading them.
+    bool TakeListDraw(GPUVAddr address, u32 count);
+    /// List dispatches (nx2_list_dispatch.h): the entry at `address` is the three GPU-written parameters of
+    /// the compute macro that stores a dispatch's grid; returns whether the compute engine took
+    /// them without reading them.
+    bool TakeListDispatch(GPUVAddr address, u32 count);
+    /// List guard (nx2_list_dispatch.h): the words at `address`, which a list left on the host GPU, read
+    /// back after everything sent so far (a wait for the back and a flush of their pages).
+    bool ReadListWords(GPUVAddr address, u64 keep_id, std::span<u32> words);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 
@@ -289,8 +348,6 @@ public:
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
-    /// The copy engine's semaphore address (high, low) and payload as sent (NoteDmaSemaphore).
-    std::array<u32, 3> dma_semaphore{};
 
     Engines::Puller puller;
     std::mutex sync_mutex;
@@ -299,7 +356,7 @@ public:
     VideoCore::RasterizerInterface* rasterizer = nullptr;
 
     // Not bitfields: the fence thread sets synced, and a bitfield write would rewrite the byte it
-    // shares with dma_increment_once and signal_sync (#479).
+    // shares with dma_increment_once and signal_sync.
     const bool ib_enable = true; ///< IB mode enabled
     bool dma_increment_once = false;
     bool signal_sync = false;

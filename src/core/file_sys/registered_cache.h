@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -23,7 +22,6 @@ namespace FileSys {
 class ExternalContentProvider;
 class CNMT;
 class NCA;
-class NupContainer;
 class NSP;
 class XCI;
 enum class NCAContentType : u8;
@@ -179,7 +177,7 @@ public:
                                const VfsCopyFunction& copy = &VfsRawCopy);
 
     // Due to the fact that we must use Meta-type NCAs to determine the existence of files, this
-    // poses quite a challenge. Instead of creating a new meta NCA for this file, yuzu will create a
+    // poses quite a challenge. Instead of creating a new meta NCA for this file, the emulator will create a
     // dir inside the NAND called 'yuzu_meta' and store the raw CNMT there.
     // TODO(DarkLordZach): Author real meta-type NCAs and install those.
     InstallResult InstallEntry(const NCA& nca, TitleType type, bool overwrite_if_exists = false,
@@ -269,7 +267,6 @@ public:
                              u32 version, const std::string& version_string, VirtualFile file);
     bool AddEntriesFromContainer(VirtualFile file, bool only_content = false,
                                  std::optional<u64> base_program_id = std::nullopt);
-    bool AddNupAddOns(NupContainer& nup, std::optional<u64> base_program_id);
     void ClearAllEntries();
 
     void Refresh() override;

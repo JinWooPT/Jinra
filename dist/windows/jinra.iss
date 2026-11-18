@@ -52,15 +52,13 @@ Name: "{app}\user"; Flags: uninsneveruninstall
 
 [Files]
 Source: "{#PayloadDir}\jinra.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#PayloadDir}\jinra-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\jinra-cli.exe"; DestDir: "{app}"; Flags: onlyifdoesntexist skipifsourcedoesntexist
 Source: "{#PayloadDir}\nx2_switches.txt"; DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
 Source: "{#PayloadDir}\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\GETTING_STARTED.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\LICENSES\*"; DestDir: "{app}\LICENSES"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PayloadDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#PayloadDir}\plugins\*"; DestDir: "{app}\plugins"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
-Source: "{#PayloadDir}\recipes\*.nx2recipe"; DestDir: "{app}\recipes"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#PayloadDir}\recipes\README.md"; DestDir: "{app}\recipes"; Flags: ignoreversion skipifsourcedoesntexist
 
 #ifndef TestMode
 [Icons]

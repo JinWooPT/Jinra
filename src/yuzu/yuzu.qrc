@@ -10,6 +10,15 @@ SPDX-License-Identifier: GPL-2.0-or-later
         <file alias="icon.png">../../dist/jinra.png</file>
         <file alias="style.qss">jinra.qss</file>
     </qresource>
+    <qresource prefix="/jinra/banners">
+        <file alias="010003F003A34000.jpg">../../dist/jinra-banners/010003F003A34000.jpg</file>
+        <file alias="01008F6008C5E000.jpg">../../dist/jinra-banners/01008F6008C5E000.jpg</file>
+        <file alias="0100F2C0115B6000.jpg">../../dist/jinra-banners/0100F2C0115B6000.jpg</file>
+        <file alias="0100F43008C44000.jpg">../../dist/jinra-banners/0100F43008C44000.jpg</file>
+        <file alias="040074A01BF12000.jpg">../../dist/jinra-banners/040074A01BF12000.jpg</file>
+        <file alias="0400A3A01EE4C000.jpg">../../dist/jinra-banners/0400A3A01EE4C000.jpg</file>
+        <file alias="0400C3F00006E000.jpg">../../dist/jinra-banners/0400C3F00006E000.jpg</file>
+    </qresource>
     <qresource prefix="/jinra/avatars">
         <file alias="kitty.png">../../dist/jinra-avatars/kitty.png</file>
         <file alias="cinna.png">../../dist/jinra-avatars/cinna.png</file>

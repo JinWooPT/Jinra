@@ -227,16 +227,6 @@ public:
         candidate_count = unconfirmed_count = 0;
     }
 
-    void Reset() {
-        std::scoped_lock lk{mutex};
-        Restart();
-        arm_count = 0;
-        arm_next = 0;
-        fault = false;
-        window = {};
-        syncpoint.store(~0U, std::memory_order_relaxed);
-    }
-
     /// The counters since the last call (TextureCache::TickRenderClock, every 600 frames).
     Window TakeWindow() {
         std::scoped_lock lk{mutex};

@@ -142,6 +142,9 @@ public:
             return false;
         }
         if (sensor_timestamp < last_motion_update) {
+            // The sensor clock went back (a reconnected controller starts it again from zero).
+            // Follow it instead of dropping every report until it passes the old value.
+            last_motion_update = sensor_timestamp;
             return false;
         }
 
@@ -306,6 +309,12 @@ public:
     }
 
     void SetSDLJoystick(SDL_Joystick* joystick, SDL_Gamepad* controller) {
+        {
+            std::scoped_lock lock{mutex};
+            last_motion_update = 0;
+            motion_error_count = 0;
+            motion_restart_threshold = InitialMotionRestartThreshold;
+        }
         sdl_joystick.reset(joystick);
         sdl_controller.reset(controller);
     }
@@ -367,28 +376,6 @@ public:
         }
     }
 
-    void MarkActive(u64 timestamp) {
-        last_input_activity.store(timestamp, std::memory_order_relaxed);
-    }
-
-    u64 GetLastActivity() const {
-        return last_input_activity.load(std::memory_order_relaxed);
-    }
-
-    void RecordAxis(int axis, s16 value, u64 timestamp) {
-        if (axis < 0 || axis >= static_cast<int>(previous_axes.size())) {
-            return;
-        }
-        std::scoped_lock lock{mutex};
-        if (!known_axes[axis]) {
-            previous_axes[axis] = value;
-            known_axes[axis] = true;
-        } else if (std::abs(static_cast<int>(value) - previous_axes[axis]) > 4000) {
-            MarkActive(timestamp);
-            previous_axes[axis] = value;
-        }
-    }
-
     std::string GetControllerName() const {
         if (sdl_controller) {
             switch (SDL_GetGamepadType(sdl_controller.get())) {
@@ -428,9 +415,6 @@ private:
     std::unique_ptr<SDL_Gamepad, decltype(&SDL_CloseGamepad)> sdl_controller;
     mutable std::mutex mutex;
 
-    std::atomic<u64> last_input_activity{};
-    std::array<s16, 32> previous_axes{};
-    std::array<bool, 32> known_axes{};
     u64 last_motion_update{};
     static constexpr std::size_t InitialMotionRestartThreshold = 200;
     static constexpr std::size_t MaxMotionRestartThreshold = 200 * 64;
@@ -630,7 +614,6 @@ void SDLDriver::HandleGameControllerEvent(const SDL_Event& event) {
     case SDL_EVENT_JOYSTICK_BUTTON_DOWN: {
         if (const auto joystick = GetSDLJoystickBySDLID(event.jbutton.which)) {
             const PadIdentifier identifier = joystick->GetPadIdentifier();
-            joystick->MarkActive(event.jbutton.timestamp);
             SetButton(identifier, event.jbutton.button, true);
         }
         break;
@@ -638,9 +621,6 @@ void SDLDriver::HandleGameControllerEvent(const SDL_Event& event) {
     case SDL_EVENT_JOYSTICK_HAT_MOTION: {
         if (const auto joystick = GetSDLJoystickBySDLID(event.jhat.which)) {
             const PadIdentifier identifier = joystick->GetPadIdentifier();
-            if (event.jhat.value != 0) {
-                joystick->MarkActive(event.jhat.timestamp);
-            }
             SetHatButton(identifier, event.jhat.hat, event.jhat.value);
         }
         break;
@@ -648,7 +628,6 @@ void SDLDriver::HandleGameControllerEvent(const SDL_Event& event) {
     case SDL_EVENT_JOYSTICK_AXIS_MOTION: {
         if (const auto joystick = GetSDLJoystickBySDLID(event.jaxis.which)) {
             const PadIdentifier identifier = joystick->GetPadIdentifier();
-            joystick->RecordAxis(event.jaxis.axis, event.jaxis.value, event.jaxis.timestamp);
             SetAxis(identifier, event.jaxis.axis, event.jaxis.value / 32767.0f);
         }
         break;
@@ -693,7 +672,7 @@ void SDLDriver::CloseJoysticks() {
 SDLDriver::SDLDriver(std::string input_engine_) : InputEngine(std::move(input_engine_)) {
     // Set our application name. Currently passed to DBus by SDL and visible to the user through
     // their desktop environment.
-    SDL_SetHint(SDL_HINT_APP_NAME, "Eden");
+    SDL_SetHint(SDL_HINT_APP_NAME, "Fritchii");
 
     // Disable raw input. When enabled this setting causes SDL to die when a web applet opens
     SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, Settings::values.enable_raw_input ? "1" : "0");
@@ -770,7 +749,6 @@ SDLDriver::~SDLDriver() {
 }
 
 std::vector<Common::ParamPackage> SDLDriver::GetInputDevices() const {
-    std::scoped_lock lock{joystick_map_mutex};
     std::vector<Common::ParamPackage> devices;
     ::Common::unordered_map<int, std::shared_ptr<SDLJoystick>> joycon_pairs;
     for (const auto& [key, value] : joystick_map) {
@@ -785,7 +763,6 @@ std::vector<Common::ParamPackage> SDLDriver::GetInputDevices() const {
                 {"display", std::move(name)},
                 {"guid", joystick->GetGUID().RawString()},
                 {"port", std::to_string(joystick->GetPort())},
-                {"last_active", std::to_string(joystick->GetLastActivity())},
             });
             if (joystick->IsJoyconLeft()) {
                 joycon_pairs.insert_or_assign(joystick->GetPort(), joystick);
@@ -1216,76 +1193,8 @@ MotionMapping SDLDriver::GetMotionMappingForDevice(const Common::ParamPackage& p
 }
 
 Common::Input::ButtonNames SDLDriver::GetUIName(const Common::ParamPackage& params) const {
-    using B = Common::Input::ButtonNames;
-    if (params.Has("guid") && params.Has("port")) {
-        std::scoped_lock lock{joystick_map_mutex};
-        const auto found = joystick_map.find(Common::UUID{params.Get("guid", "")});
-        const int port = params.Get("port", -1);
-        if (found != joystick_map.end() && port >= 0 &&
-            port < static_cast<int>(found->second.size())) {
-            auto* controller = found->second[port]->GetSDLGameController();
-            if (controller) {
-                const auto type = SDL_GetGamepadType(controller);
-                const bool sony = type == SDL_GAMEPAD_TYPE_PS3 || type == SDL_GAMEPAD_TYPE_PS4 ||
-                                  type == SDL_GAMEPAD_TYPE_PS5;
-                const bool xbox =
-                    type == SDL_GAMEPAD_TYPE_XBOX360 || type == SDL_GAMEPAD_TYPE_XBOXONE;
-                for (const auto& binding : GetBindings(controller)) {
-                    const bool button_match = params.Has("button") &&
-                                              binding.input_type == SDL_GAMEPAD_BINDTYPE_BUTTON &&
-                                              binding.input.button == params.Get("button", -1);
-                    const bool axis_match = params.Has("axis") &&
-                                            binding.input_type == SDL_GAMEPAD_BINDTYPE_AXIS &&
-                                            binding.input.axis.axis == params.Get("axis", -1);
-                    if (!button_match && !axis_match)
-                        continue;
-                    if (binding.output_type == SDL_GAMEPAD_BINDTYPE_AXIS) {
-                        if (binding.output.axis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER)
-                            return sony ? B::L2 : xbox ? B::XboxLT : B::TriggerZL;
-                        if (binding.output.axis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)
-                            return sony ? B::R2 : xbox ? B::XboxRT : B::TriggerZR;
-                    }
-                    if (binding.output_type != SDL_GAMEPAD_BINDTYPE_BUTTON)
-                        continue;
-                    switch (binding.output.button) {
-                    case SDL_GAMEPAD_BUTTON_SOUTH:
-                        return sony ? B::Cross : B::ButtonA;
-                    case SDL_GAMEPAD_BUTTON_EAST:
-                        return sony ? B::Circle : B::ButtonB;
-                    case SDL_GAMEPAD_BUTTON_WEST:
-                        return sony ? B::Square : B::ButtonX;
-                    case SDL_GAMEPAD_BUTTON_NORTH:
-                        return sony ? B::Triangle : B::ButtonY;
-                    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
-                        return sony ? B::L1 : xbox ? B::XboxLB : B::TriggerL;
-                    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
-                        return sony ? B::R1 : xbox ? B::XboxRB : B::TriggerR;
-                    case SDL_GAMEPAD_BUTTON_LEFT_STICK:
-                        return sony ? B::L3 : B::ButtonStickL;
-                    case SDL_GAMEPAD_BUTTON_RIGHT_STICK:
-                        return sony ? B::R3 : B::ButtonStickR;
-                    case SDL_GAMEPAD_BUTTON_BACK:
-                        return sony ? B::Share : B::ButtonMinus;
-                    case SDL_GAMEPAD_BUTTON_START:
-                        return sony ? B::Options : B::ButtonPlus;
-                    case SDL_GAMEPAD_BUTTON_GUIDE:
-                        return B::ButtonHome;
-                    case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
-                        return B::ButtonLeft;
-                    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
-                        return B::ButtonRight;
-                    case SDL_GAMEPAD_BUTTON_DPAD_UP:
-                        return B::ButtonUp;
-                    case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
-                        return B::ButtonDown;
-                    default:
-                        break;
-                    }
-                }
-            }
-        }
-    }
     if (params.Has("button")) {
+        // TODO(German77): Find how to substitute the values for real button names
         return Common::Input::ButtonNames::Value;
     }
     if (params.Has("hat")) {

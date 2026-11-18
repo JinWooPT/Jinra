@@ -1,13 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/input.h"
 #include "common/logging.h"
 #include "input_common/helpers/joycon_protocol/common_protocol.h"
-#include "input_common/helpers/joycon_protocol/subcommand_response.h"
 
 namespace InputCommon::Joycon {
 JoyconCommonProtocol::JoyconCommonProtocol(std::shared_ptr<JoyconHandle> hidapi_handle_)
@@ -52,7 +50,7 @@ Common::Input::DriverResult JoyconCommonProtocol::CheckDeviceAccess(
         SDL_hid_open(device_info->vendor_id, device_info->product_id, device_info->serial_number);
 
     if (!hidapi_handle->handle) {
-        LOG_ERROR(Input, "Yuzu can't gain access to this device: ID {:04X}:{:04X}.",
+        LOG_ERROR(Input, "Fritchii can't gain access to this device: ID {:04X}:{:04X}.",
                   device_info->vendor_id, device_info->product_id);
         return Common::Input::DriverResult::HandleInUse;
     }
@@ -79,14 +77,23 @@ Common::Input::DriverResult JoyconCommonProtocol::SendRawData(std::span<const u8
 Common::Input::DriverResult JoyconCommonProtocol::GetSubCommandResponse(
     SubCommand sc, SubCommandResponse& output) {
     constexpr int timeout_mili = 66;
-    return ReadSubCommandResponse(sc, output, [this](SubCommandResponse& candidate) {
-        const int result = SDL_hid_read_timeout(
-            hidapi_handle->handle, reinterpret_cast<u8*>(&candidate), sizeof(candidate), timeout_mili);
+    constexpr int MaxTries = 10;
+    int tries = 0;
+
+    do {
+        int result = SDL_hid_read_timeout(hidapi_handle->handle, reinterpret_cast<u8*>(&output),
+                                          sizeof(SubCommandResponse), timeout_mili);
+
         if (result < 1) {
             LOG_ERROR(Input, "No response from joycon");
         }
-        return result;
-    });
+        if (tries++ > MaxTries) {
+            return Common::Input::DriverResult::Timeout;
+        }
+    } while (output.input_report.report_mode != ReportMode::SUBCMD_REPLY &&
+             output.sub_command != sc);
+
+    return Common::Input::DriverResult::Success;
 }
 
 Common::Input::DriverResult JoyconCommonProtocol::SendSubCommand(SubCommand sc,

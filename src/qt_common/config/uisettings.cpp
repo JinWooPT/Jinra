@@ -78,7 +78,7 @@ const Themes themes{{
 
 bool IsDarkTheme() {
     const auto& theme = UISettings::values.theme;
-    return theme == std::string("jinra") || theme == std::string("qdarkstyle") || theme == std::string("qdarkstyle_midnight_blue") ||
+    return theme == "jinra" || theme == std::string("qdarkstyle") || theme == std::string("qdarkstyle_midnight_blue") ||
            theme == std::string("colorful_dark") || theme == std::string("colorful_midnight_blue");
 }
 

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -14,8 +13,10 @@
 #endif
 
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
@@ -48,9 +49,6 @@ static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
     Settings::VSyncMode setting = [has_imm, has_mailbox]() {
         // Choose Mailbox or Immediate if unlocked and those modes are supported
         const auto mode = Settings::values.vsync_mode.GetValue();
-        if (Settings::values.frame_gen.GetValue()) {
-            return mode == Settings::VSyncMode::FifoRelaxed ? mode : Settings::VSyncMode::Fifo;
-        }
         if (Settings::SpeedLimitEnabled() &&
             Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo) {
             return mode;
@@ -169,9 +167,13 @@ void Swapchain::Create(
 }
 
 bool Swapchain::AcquireNextImage(bool may_flush) {
-    const VkResult result = device.GetLogical().AcquireNextImageKHR(
-        *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
-        VK_NULL_HANDLE, &image_index);
+    VkResult result;
+    {
+        const Common::Nx2Hitch::StallScope stall{"present: vkAcquireNextImageKHR"};
+        result = device.GetLogical().AcquireNextImageKHR(
+            *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
+            VK_NULL_HANDLE, &image_index);
+    }
     switch (result) {
     case VK_SUCCESS:
         break;
@@ -192,6 +194,9 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
         // No image was acquired, so image_index is stale: the caller recreates and tries again.
         return true;
     }
+    // EDEN_NX2_STALL_SNAPSHOT: between acquire and present from here (Present ends it).
+    Common::Nx2Hitch::StallAcquired();
+    const Common::Nx2Hitch::StallScope image_stall{"present: wait for the image's last tick"};
 
     const auto wait_with_frame_pacing = [this, may_flush] {
     switch (Settings::values.frame_pacing_mode.GetValue()) {
@@ -230,11 +235,20 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     return false;
 }
 
-void Swapchain::Present(VkSemaphore render_semaphore) {
+u64 Swapchain::Present(VkSemaphore render_semaphore) {
     const auto present_queue{device.GetPresentQueue()};
+    // Ids for vkWaitForPresentKHR (the host frame pacer). They only have to increase per
+    // swapchain, so one counter serves every swapchain this object creates.
+    const u64 present_id = device.IsKhrPresentWaitSupported() ? ++next_present_id : 0;
+    const VkPresentIdKHR present_id_info{
+        .sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,
+        .pNext = nullptr,
+        .swapchainCount = 1,
+        .pPresentIds = &present_id,
+    };
     const VkPresentInfoKHR present_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .pNext = nullptr,
+        .pNext = present_id != 0 ? &present_id_info : nullptr,
         .waitSemaphoreCount = render_semaphore ? 1U : 0U,
         .pWaitSemaphores = &render_semaphore,
         .swapchainCount = 1,
@@ -242,12 +256,21 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
         .pImageIndices = &image_index,
         .pResults = nullptr,
     };
+    const auto lock_stall = Common::Nx2Hitch::StallEnter("present: wait for the submit lock");
     std::scoped_lock lock{scheduler.submit_mutex};
-    switch (const VkResult result = present_queue.Present(present_info)) {
+    Common::Nx2Hitch::StallLeave(lock_stall);
+    const auto present_stall = Common::Nx2Hitch::StallEnter("present: vkQueuePresentKHR");
+    const VkResult present_result = present_queue.Present(present_info);
+    Common::Nx2Hitch::StallLeave(present_stall);
+    Common::Nx2Hitch::StallPresented();
+    bool queued = false;
+    switch (const VkResult result = present_result) {
     case VK_SUCCESS:
+        queued = true;
         break;
     case VK_SUBOPTIMAL_KHR:
         LOG_DEBUG(Render_Vulkan, "Suboptimal swapchain");
+        queued = true;
         break;
     case VK_ERROR_OUT_OF_DATE_KHR:
         is_outdated = true;
@@ -263,6 +286,7 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
     if (frame_index >= image_count) {
         frame_index = 0;
     }
+    return queued ? present_id : 0;
 }
 
 void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
@@ -280,6 +304,14 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
     const VkCompositeAlphaFlagBitsKHR alpha_flags{ChooseAlphaFlags(capabilities)};
     surface_format = ChooseSwapSurfaceFormat(formats);
     present_mode = ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed);
+    // For Ocarina of Time's high refresh rate cap (nx2_gsv.h): only FIFO limits it to the display.
+    VideoCommon::Nx2Perf::g_present_mode.store(
+        static_cast<int>(present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? Settings::VSyncMode::Immediate
+                         : present_mode == VK_PRESENT_MODE_MAILBOX_KHR ? Settings::VSyncMode::Mailbox
+                         : present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR
+                             ? Settings::VSyncMode::FifoRelaxed
+                             : Settings::VSyncMode::Fifo),
+        std::memory_order_relaxed);
 
     u32 requested_image_count{capabilities.minImageCount + 1};
     // Ensure Triple buffering if possible.

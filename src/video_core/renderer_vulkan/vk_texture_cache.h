@@ -1,16 +1,25 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
+#include <unordered_map>
+#include <unordered_set>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include "video_core/texture_cache/texture_cache_base.h"
 
@@ -23,6 +32,7 @@
 #endif
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+#include "video_core/nx2_ghost_pools.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -97,8 +107,69 @@ struct ImagePoolKey {
     bool operator==(const ImagePoolKey&) const noexcept = default;
 };
 
+/// EDEN_NX2_ASYNC_IMAGE_FREE (boot, default on; see Device::IsAllocatorThreadSafe): images the
+/// texture cache deleted and the GPU is done with (TextureCache::TickFrame) are destroyed here, on
+/// a low-priority thread of its own, oldest first, instead of on the GPU back thread. With dedicated
+/// allocations each destruction is a vkFreeMemory into the driver's kernel path: ~22 ms/s of the
+/// back at the Castle Town market. The images arrive with their back-thread part already done
+/// (Image::PrepareForAsyncFree), so destroying them only touches their own Vulkan objects and VMA.
+class ImageFreeQueue {
+public:
+    /// Past this much device memory waiting here, images are destroyed on the caller's thread as
+    /// before: the thread falling behind never holds more than this much extra VRAM.
+    static constexpr u64 MaxPendingBytes = u64{256} << 20;
+
+    explicit ImageFreeQueue(bool enabled_);
+    ~ImageFreeQueue(); ///< Destroys what is left, then stops the thread
+
+    ImageFreeQueue(const ImageFreeQueue&) = delete;
+    ImageFreeQueue& operator=(const ImageFreeQueue&) = delete;
+
+    [[nodiscard]] bool Enabled() const noexcept {
+        return enabled;
+    }
+
+    /// Device memory of the images added and not destroyed yet: the driver still counts it.
+    [[nodiscard]] u64 PendingBytes() const noexcept {
+        return pending_bytes.load(std::memory_order_acquire);
+    }
+
+    /// Adds an image holding `bytes` of device memory to the batch (the GPU thread's; no lock).
+    void Add(std::unique_ptr<Image> image, u64 bytes);
+    /// Same for a bare VkImage (EXP99: evicted pool images; the GPU is done with them).
+    void AddBare(vk::Image image, u64 bytes);
+
+    /// Hands the batch to the thread: one lock and one wake-up for all of it.
+    void Submit();
+
+private:
+    using Entry = std::pair<std::unique_ptr<Image>, u64>; ///< The image, its device memory
+    using BareEntry = std::pair<vk::Image, u64>;
+
+    void Run(std::stop_token stop_token);
+
+    bool enabled;
+    std::vector<Entry> batch; ///< Added since the last Submit (GPU thread only)
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::vector<Entry> queue; ///< Submitted, not taken by the thread yet (under `mutex`)
+    std::vector<BareEntry> bare_batch; ///< AddBare since the last Submit (GPU thread only)
+    std::vector<BareEntry> bare_queue; ///< Submitted bare images (under `mutex`)
+    std::atomic<u64> pending_bytes{};
+    std::jthread thread; ///< Last: started once the members above exist
+};
+
 class TextureCacheRuntime {
 public:
+    /// EXP67: the host extent of the next Image made (TextureCache::JoinImages sets it right
+    /// before the insert; the Image constructor takes and clears it).
+    void SetNextHostPad(u32 width, u32 height) noexcept {
+        next_host_pad_width = width;
+        next_host_pad_height = height;
+    }
+    u32 next_host_pad_width{};
+    u32 next_host_pad_height{};
+
     explicit TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
                                  MemoryAllocator& memory_allocator_,
                                  StagingBufferPool& staging_buffer_pool_,
@@ -132,9 +203,34 @@ public:
 
     u64 GetDeviceMemorySlack() const;
 
+    /// FRITCHII_KEEP_BLOCKS: the kept blocks' limit from the budget check (Device::LimitKeptBlocks).
+    void LimitKeptBlocks(u64 budget, u64 critical) const;
+
+    /// FRITCHII_VRAM_BUDGET_MODE: the main heap's size and the driver's usage and budget for it
+    /// (Device::MainHeapNumbers). False without VK_EXT_memory_budget.
+    bool MainHeapNumbers(u64& size, u64& usage, u64& budget) const;
+
+    /// FRITCHII_VRAM_BUDGET_MODE=os: dedicated video memory the other processes hold on this
+    /// adapter (the OS's counters, Common::GetAdapterVideoMemory). None before the first sample,
+    /// without the counters and off Windows.
+    [[nodiscard]] std::optional<u64> OtherProcessesVideoMemory() const;
+
+    /// The texture cache's live budget cap binds (FRITCHII_VRAM_BUDGET_MODE): the image pool
+    /// follows the room under the budget as with FRITCHII_VRAM_POOL_FIT and kept blocks go back.
+    void SetBudgetPressure(bool pressure) noexcept {
+        budget_pressure = pressure;
+    }
+
+    /// FRITCHII_VRAM_OWNERS: the device side of the owners line (the driver's usage and budget,
+    /// both allocators, what lies outside them, the pool, frees in flight, kept blocks, staging),
+    /// with the texture cache's live images and its deleted ones still allocated.
+    [[nodiscard]] std::string VramOwnersText(u64 texture_image_bytes, u64 deleted_bytes);
+
     bool CanReportMemoryUsage() const;
 
-    VkFormatFeatureFlags2 SampledViewFeatures(VkFormat format);
+    /// The largest width and height a scaled image may take: the device's 2D image and
+    /// framebuffer limits (16384 on AMD).
+    u32 GetMaxScaledExtent() const noexcept;
 
     /// Images that did not fit the device memory budget so far (see MemoryAllocator).
     u32 MemoryPressureEvents() const noexcept {
@@ -159,6 +255,9 @@ public:
     }
 
     void LogMemoryStatistics() const;
+
+    /// EDEN_NX2_MEM_TRACE: staging buffers, then the process, DXGI and VMA (LogMemoryTrace).
+    void LogMemoryTrace();
 
     /// True when ASTC is re-compressed to BC3 and opaque images may use BC1 instead.
     bool UseOpaqueAstcFormat() const;
@@ -284,6 +383,8 @@ public:
     RenderPassCache& render_pass_cache;
     DescriptorPool& descriptor_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+    /// GetMaxScaledExtent, read once from the device's limits.
+    u32 max_scaled_extent{};
 
     /// FSR 3.1 in place of a DLSS evaluation (TemporalUpscale), created on first use.
     bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
@@ -353,7 +454,6 @@ public:
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;
     std::array<std::vector<VkFormat>, VideoCore::Surface::MaxPixelFormat> view_formats;
-    ::Common::unordered_map<VkFormat, VkFormatFeatureFlags2> sampled_view_features;
 
     static constexpr size_t indexing_slots = 8 * sizeof(size_t);
     std::array<vk::Buffer, indexing_slots> buffers{};
@@ -397,8 +497,76 @@ public:
         vk::Image image;
         u64 bytes;
         u64 frame;
+        bool proven; ///< Its key was taken from the pool before (EXP65)
+        u64 hash;    ///< ImagePoolKeyHash(key), for EXP110's shape lookups
     };
+    /// EXP110 (live, 0 = off; fable52_answer_stall3 3): the pool's own record of each shape it
+    /// answered a lookup for, by key hash. Bumped on a take only, never aged, kept through
+    /// evictions and the emptying on memory pressure. Filled whenever EXP42 is on, so turning
+    /// EXP110 on mid-session finds it ready; only EXP110 reads it.
+    struct PoolShape {
+        u64 takes{};
+        u64 last_take{};
+    };
+    std::unordered_map<u64, PoolShape> image_pool_shapes;
+    /// At this many shapes the least recently taken go until ImagePoolShapesKeep remain.
+    static constexpr size_t ImagePoolShapesMax = 4096;
+    static constexpr size_t ImagePoolShapesKeep = 3072;
+    void NoteImagePoolTake(u64 hash);
+    /// EXP110's cap in bytes (1 = 512 MiB, N > 1 = N MiB), 0 when EXP110 is off.
+    [[nodiscard]] static u64 ImagePoolRuleCap();
+    /// EXP110: evicts until the pool plus the idle backlog fit `max_bytes`, by its rule.
+    void TrimImagePoolByRule(u64 max_bytes);
+    /// EXP110: bytes waiting in EXP99's idle backlog.
+    [[nodiscard]] u64 IdleDestroyBytes();
+    /// EXP65 (live, 0 = off): pooled images whose exact create info was never taken back leave
+    /// after this many frames instead of ImagePoolMaxFrames. OoT sizes per-NPC depth targets by
+    /// screen bounds, so their dims rarely repeat; they filled the pool to its cap (~500 MiB held,
+    /// ~1,000 evicted a 600 frames) and device memory grew through an NPC pass, with driver paging
+    /// at bind (1-130 ms binds; fable_answer_npcdips_2).
+    [[nodiscard]] static u64 ImagePoolKeyHash(const ImagePoolKey& key) noexcept;
+    std::unordered_set<u64> image_pool_proven;
+    u64 image_pool_unproven_evicted{};
     static constexpr u64 ImagePoolMaxBytes = u64{512} << 20;
+    /// EXP42=2 pools the big dedicated render targets too (a 2560x1440 one is ~30 MiB): 512 MiB
+    /// held ~17 of them and evicted 1,150-1,400 images a 600 frames in Castle Town (2026-11-10).
+    static constexpr u64 ImagePoolMaxBytesDedicated = u64{1536} << 20;
+    [[nodiscard]] static u64 ImagePoolCap();
+    /// ImagePoolCap, lowered to the room under the device budget with FRITCHII_VRAM_POOL_FIT.
+    [[nodiscard]] u64 FittedPoolCap() const {
+        return (std::min)((std::min)(ImagePoolCap(), pool_fit_cap), small_pool_cap);
+    }
+    /// FRITCHII_SMALL_CARD (part Pool): 1/16 of the budget, at least 256 MiB; ~0 while off.
+    /// Re-read every 30 frames with the budget.
+    u64 small_pool_cap{~u64{0}};
+    u32 small_pool_frames{};
+    /// FRITCHII_VRAM_POOL_FIT: recomputes pool_fit_cap from the budget and the usage.
+    void UpdatePoolFitCap();
+    u64 pool_fit_cap{~u64{0}};  ///< ~0 while FRITCHII_VRAM_POOL_FIT is off
+    bool budget_pressure{};     ///< SetBudgetPressure
+    mutable int luid_state{};   ///< FRITCHII_VRAM_BUDGET_MODE=os: 0 not looked up, 1 found, 2 none
+    mutable u32 luid_low{};
+    mutable s32 luid_high{};
+    u64 pool_fit_lowest{~u64{0}}; ///< the lowest fitted cap since the last report
+    u64 pool_fit_budget{};
+    u64 pool_fit_others{};
+    u32 pool_fit_frames{};
+    /// FRITCHII_VRAM_REPORT: samples (every 30 frames) since the last report line.
+    void SampleVramReport();
+    u32 vram_report_frames{};
+    u32 vram_report_samples{};
+    u32 vram_report_over{};
+    u64 vram_report_peak_usage{};
+    u64 vram_report_peak_over{};
+    u64 vram_report_last_budget{};
+    u32 vram_report_seen_pressure{};
+    u32 vram_report_seen_failed{};
+    /// FRITCHII_VRAM_TRIM: every 60 frames near the budget, the allocators' empty blocks go.
+    void TickVramTrim();
+    u32 vram_trim_frames{};
+    u32 vram_trim_events{};  ///< trims that gave memory back, this session
+    u64 vram_trim_bytes{};   ///< what they gave back, this session
+    std::chrono::steady_clock::time_point vram_trim_logged{};
     static constexpr u64 ImagePoolMaxFrames = 180;
     std::deque<PooledImage> image_pool;
     u64 image_pool_bytes{};
@@ -411,6 +579,57 @@ public:
     u64 image_pool_given{};
     u64 image_pool_evicted{};
     void TrimImagePool(u64 max_bytes);
+    /// Destroys an evicted pool image here, or with EXP99 on its free thread.
+    void DropPooledImage(vk::Image image, u64 bytes);
+    u64 image_pool_dropped_async{}; ///< EXP99: evictions handed to the free thread
+    u64 image_pool_dropped_here{};
+    u64 image_pool_dropped_idle{}; ///< EXP99=1: destroyed in the back's idle hook
+    u64 image_pool_dropped_frame_end{}; ///< EXP110: backlog past 64 MiB, destroyed at frame end
+    /// EXP99=1's backlog: destroys up to `max`, returns how many went.
+    u32 DestroyPooledBacklog(u32 max, const char* span_name, bool frame_end);
+    /// EDEN_NX2_IMAGE_ALLOC_TIMING: pool image destroys timed in vmaDestroyImage's steps, per
+    /// place, summed since the last "Image pool destroys" line (fable52_answer_potroom 4).
+    struct PoolDestroyTiming {
+        u64 images{};
+        u64 destroy_ns{}; ///< vkDestroyImage
+        u64 free_ns{};    ///< vmaFreeMemory
+        u64 blocks_freed{};
+    };
+    PoolDestroyTiming pool_destroy_here_timing{};
+    PoolDestroyTiming pool_destroy_idle_timing{};
+    PoolDestroyTiming pool_destroy_frame_end_timing{};
+    Vulkan::MemoryAllocator::ImageTiming pool_create_timing_seen{};
+    /// Destroys `image` now, timed into `timing` with EDEN_NX2_IMAGE_ALLOC_TIMING.
+    static void DestroyPoolImage(vk::Image& image, PoolDestroyTiming& timing);
+    /// EDEN_NX2_GHOST_POOLS=1 (boot): the pool's calls replayed under other rules and caps.
+    std::unique_ptr<VideoCommon::Nx2GhostPools::Ghosts> ghost_pools =
+        VideoCommon::Nx2GhostPools::CreateIfEnabled();
+public:
+    /// EXP99=1: destroys up to `max` evicted pool images; the back calls it before it sleeps.
+    void DestroyIdlePooledImages(u32 max);
+private:
+    std::mutex idle_destroy_mutex;
+    std::deque<std::pair<vk::Image, u64>> idle_destroys; ///< EXP99=1: evicted, destroyed when idle
+    u64 idle_destroy_bytes{};
+
+public:
+    /// EDEN_NX2_ASYNC_IMAGE_FREE: a deleted image the GPU is done with (TextureCache::TickFrame,
+    /// after ReleaseToPool) is moved out of `image` into the free queue's batch when it can go
+    /// there; `image` is then empty. Otherwise `image` is left as it was, for the caller to destroy.
+    void FreeImageLater(Image& image);
+
+    /// Hands the batch FreeImageLater collected to the free queue's thread.
+    void SubmitImageFrees();
+
+    /// Device memory of images handed to the free queue and not destroyed yet: the driver still
+    /// counts it.
+    [[nodiscard]] u64 PendingImageFreeBytes() const noexcept {
+        return image_free_queue.PendingBytes();
+    }
+
+private:
+    /// Last: destroyed first, destroying what it still holds.
+    ImageFreeQueue image_free_queue;
 };
 
 class Framebuffer {
@@ -558,6 +777,13 @@ public:
     void UploadMemory(const StagingBufferRef& map,
                       std::span<const VideoCommon::BufferImageCopy> copies);
 
+    /// FRITCHII_ZERO_UPLOAD: what uploading all-zero guest bytes writes (zero in every level and
+    /// layer), as a GPU clear, with the barriers of an upload. Single-sample, uncompressed images
+    /// not scaled (the texture cache checks).
+    /// current: clears the image in use instead (the scaled one when rescaled;
+    /// FRITCHII_STALE_ZERO).
+    void ClearToZero(bool current = false);
+
     void DownloadMemory(VkBuffer buffer, size_t offset,
                         std::span<const VideoCommon::BufferImageCopy> copies);
 
@@ -586,9 +812,22 @@ public:
         return original_image.GetMemoryBlock();
     }
 
+    /// EXP42: whether the image took a pooled VkImage (the slow clear log counts them).
+    [[nodiscard]] bool FromPool() const noexcept {
+        return from_pool;
+    }
+
     /// EXP42: the deleted image's VkImages go to the runtime's pool instead of being destroyed,
     /// when eligible. Called once the GPU is done with them (TextureCache::TickFrame).
     void ReleaseToPool();
+
+    /// EDEN_NX2_ASYNC_IMAGE_FREE: runs the destructor's part that touches the runtime (resolve
+    /// shadows) now, on the GPU thread, and detaches the image from the runtime, so destroying it
+    /// later only touches its own Vulkan objects and VMA (ImageFreeQueue's thread). Returns the
+    /// device memory the image still holds. Nothing, with nothing done, for images whose
+    /// destruction stays on the GPU thread: sparse ones (their memory goes through the
+    /// MemoryAllocator) and ones holding no memory of their own (ReleaseToPool took it).
+    [[nodiscard]] std::optional<u64> PrepareForAsyncFree();
 
     /// Returns true when the image is already initialized and mark it as initialized
     [[nodiscard]] bool ExchangeInitialization() noexcept {
@@ -743,6 +982,7 @@ private:
     /// Declared before them: their initializers fill these in.
     ImagePoolKey original_pool_key;
     ImagePoolKey scaled_pool_key;
+    bool from_pool = false; ///< original_image came from the pool
 
     vk::Image original_image;
     vk::Image scaled_image;
@@ -796,7 +1036,9 @@ public:
 
     [[nodiscard]] bool IsRescaled() const noexcept;
 
-    [[nodiscard]] VkImageView Handle(Shader::TextureType texture_type) const;
+    [[nodiscard]] VkImageView Handle(Shader::TextureType texture_type) const noexcept {
+        return *image_views[static_cast<size_t>(texture_type)];
+    }
 
     [[nodiscard]] VkImage ImageHandle() const noexcept {
         return image_handle;
@@ -850,13 +1092,11 @@ private:
 
     [[nodiscard]] vk::ImageView MakeView(VkFormat vk_format, VkImageAspectFlags aspect_mask,
                                          std::optional<Shader::TextureType> texture_type = std::nullopt);
-    [[nodiscard]] vk::ImageView CreateTypedView(Shader::TextureType texture_type,
-                                               std::optional<u32> layers) const;
 
     const Device* device = nullptr;
     const SlotVector<Image>* slot_images = nullptr;
 
-    mutable std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> image_views;
+    std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> image_views;
     std::optional<StorageViews> storage_views;
     vk::ImageView typeless_storage_view;
     vk::ImageView depth_view;
@@ -869,15 +1109,11 @@ private:
     u32 buffer_size = 0;
 
     VkComponentMapping swizzle_mapping{};
-    VkImageSubresourceRange typed_view_range{};
-    VkFormat typed_view_format{VK_FORMAT_UNDEFINED};
-    VkImageUsageFlags typed_view_usage{};
 
     bool supports_depth_comparison = false;
     bool requires_border_color_format = false;
     bool supports_minmax_filter = false;
     bool has_identity_swizzle = true;
-    bool deferred_2d_array = false;
 };
 
 class ImageAlloc : public VideoCommon::ImageAllocBase {};
@@ -912,6 +1148,12 @@ public:
 
     [[nodiscard]] VkSampler HandleFor(const ImageView& image_view, bool is_depth);
 
+    /// HandleFor can pick another variant for the same view later: the OoT FSR LOD bias
+    /// follows the image's GPU writes and the console mode.
+    [[nodiscard]] bool HasChangingVariants() const noexcept {
+        return added_lod_bias != 0.0f;
+    }
+
     /// The guest descriptor and the host state built from it, for EDEN_NX2_FRAME_DUMP_SAMPLED.
     [[nodiscard]] const Tegra::Texture::TSCEntry& Descriptor() const noexcept {
         return descriptor;
@@ -928,7 +1170,8 @@ private:
         bool drop_reduction;
         bool drop_custom_border;
         bool srgb_border;
-        bool use_ocarina_lod_bias;
+        bool drop_compare;
+        bool drop_lod_bias; ///< the image was written by the GPU: no Ocarina FSR LOD bias
         std::array<VkComponentSwizzle, 4> swizzle;
 
         bool operator==(const VariantKey&) const noexcept = default;

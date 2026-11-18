@@ -29,8 +29,7 @@
 #endif
 
 LoadingScreen::LoadingScreen(QWidget* parent)
-    : QWidget(parent), ui(std::make_unique<Ui::LoadingScreen>()),
-      previous_stage(VideoCore::LoadCallbackStage::Complete) {
+    : QWidget(parent), ui(std::make_unique<Ui::LoadingScreen>()) {
     ui->setupUi(this);
     setMinimumSize(Layout::MinimumSize::Width, Layout::MinimumSize::Height);
     const QPixmap icon{QStringLiteral(":/jinra/icon.png")};
@@ -54,21 +53,14 @@ LoadingScreen::LoadingScreen(QWidget* parent)
     });
     connect(this, &LoadingScreen::LoadProgress, this, &LoadingScreen::OnLoadProgress,
             Qt::QueuedConnection);
-    connect(ui->playNow, &QPushButton::clicked, this, [this] {
-        play_now_requested = true;
-        ui->playNow->setEnabled(false);
-        ui->preparationNote->setText(
-            tr("Shaders will continue compiling in the background. You may notice brief stutters."));
-        emit PlayNowRequested();
-    });
+    connect(ui->playNow, &QPushButton::clicked, this, &LoadingScreen::PlayNowRequested);
     qRegisterMetaType<VideoCore::LoadCallbackStage>();
 }
 
 LoadingScreen::~LoadingScreen() = default;
 
 void LoadingScreen::Prepare(Loader::AppLoader& loader) {
-    play_now_requested = false;
-    ui->playNow->setEnabled(true);
+    previous_total = 0;
     ui->banner->clear();
     ui->logo->clear();
     std::vector<u8> buffer;
@@ -103,16 +95,7 @@ void LoadingScreen::OnLoadComplete() {
 
 void LoadingScreen::OnLoadProgress(VideoCore::LoadCallbackStage stage, std::size_t value,
                                    std::size_t total) {
-    using namespace std::chrono;
     using Stage = VideoCore::LoadCallbackStage;
-    const auto now = steady_clock::now();
-    if (stage != previous_stage || total != previous_total || value < first_value) {
-        stage_start = now;
-        first_value = value;
-        previous_stage = stage;
-        previous_total = total;
-    }
-
     switch (stage) {
     case Stage::Prepare:
         ui->stage->setText(tr("Loading game…"));
@@ -123,22 +106,43 @@ void LoadingScreen::OnLoadProgress(VideoCore::LoadCallbackStage stage, std::size
     case Stage::Complete:
         ui->stage->setText(tr("Launching game…"));
         break;
-    case Stage::PrepareShaders:
-        ui->stage->setText(tr("Preparing shaders"));
-        break;
     }
-    if (!play_now_requested) {
-        ui->preparationNote->setText(tr("This happens once, so the game runs smoothly"));
-    }
-    ui->preparationNote->setVisible(stage == Stage::PrepareShaders || play_now_requested);
-    ui->playNow->setVisible(stage == Stage::PrepareShaders && value < total);
 
-    const bool show_progress = total > 0 && (stage == Stage::Build || stage == Stage::PrepareShaders);
+    ui->preparationNote->hide();
+    ui->playNow->hide();
+    const bool show_progress = total > 0 && stage == Stage::Build;
     ui->progressDetails->setVisible(show_progress);
-    if (!show_progress) {
+    if (show_progress) {
+        UpdateProgress(value, total);
+    }
+}
+
+void LoadingScreen::ShowShaderPreparationProgress(std::size_t value, std::size_t total) {
+    ui->stage->setText(tr("Preparing shaders"));
+    ui->preparationNote->setText(tr("This happens once, so the game runs smoothly"));
+    ui->preparationNote->show();
+    ui->playNow->show();
+    ui->progressDetails->show();
+    UpdateProgress(value, total);
+}
+
+void LoadingScreen::UpdateProgress(std::size_t value, std::size_t total) {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    if (total != previous_total || value < first_value) {
+        stage_start = now;
+        first_value = value;
+        previous_total = total;
+    }
+
+    if (total == 0) {
+        ui->progress_bar->setRange(0, 0);
+        ui->progressCount->setText(tr("Getting ready…"));
+        ui->progressPercent->clear();
+        ui->value->clear();
         return;
     }
-
+    ui->progress_bar->setRange(0, 10'000);
     const auto done = std::min(value, total);
     const double fraction = static_cast<double>(done) / total;
     ui->progress_bar->setValue(static_cast<int>(fraction * ui->progress_bar->maximum()));

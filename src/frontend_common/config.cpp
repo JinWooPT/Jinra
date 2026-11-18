@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <filesystem>
+#include <map>
+#include <optional>
+#include <string_view>
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -14,6 +17,8 @@
 #include "common/settings_common.h"
 #include "common/settings_enums.h"
 #include "config.h"
+#include "core/file_sys/patch_manager.h"
+#include "frontend_common/profile_import.h"
 
 #ifdef _WIN32
 #include "common/string_util.h"
@@ -29,6 +34,7 @@ Config::Config(const ConfigType config_type)
     : type(config_type), global{config_type == ConfigType::GlobalConfig} {}
 
 void Config::Initialize(const std::string& config_name) {
+    FrontendCommon::CheckLegacyProfileBeforeConfig();
     const std::filesystem::path fs_config_loc = FS::GetEdenPath(FS::EdenPath::ConfigDir);
     const auto config_file = fmt::format("{}.ini", config_name);
 
@@ -54,6 +60,7 @@ void Config::Initialize(const std::string& config_name) {
 }
 
 void Config::Initialize(const std::optional<std::string> config_path) {
+    FrontendCommon::CheckLegacyProfileBeforeConfig();
     const std::filesystem::path default_sdl_config_path =
         FS::GetEdenPath(FS::EdenPath::ConfigDir) / "sdl2-config.ini";
     config_loc = config_path.value_or(FS::PathToUTF8String(default_sdl_config_path));
@@ -90,23 +97,18 @@ void Config::WriteToIni() const {
 
     CSimpleIniA::FileWriter writer(fp);
     const SI_Error rc = config->Save(writer, false);
+    fclose(fp);
     if (rc < 0) {
         LOG_ERROR(Frontend, "Config file could not be saved!");
+    } else if (on_written) {
+        on_written(*this);
     }
-    fclose(fp);
 }
 
 void Config::SetUpIni() {
     config = std::make_unique<CSimpleIniA>();
     config->SetUnicode(true);
     config->SetSpaces(false);
-
-#ifndef __ANDROID__
-    std::error_code error;
-    const auto status = std::filesystem::symlink_status(FS::ToU8String(config_loc), error);
-    const bool new_global_config = global && status.type() == std::filesystem::file_type::not_found &&
-                                   (!error || error == std::errc::no_such_file_or_directory);
-#endif
 
     FILE* fp = nullptr;
 #ifdef _WIN32
@@ -126,49 +128,10 @@ void Config::SetUpIni() {
         return;
     }
 
-    const SI_Error rc = config->LoadFile(fp);
-    fclose(fp);
-    if (rc < 0) {
+    if (SI_Error rc = config->LoadFile(fp); rc < 0) {
         LOG_ERROR(Frontend, "Config file could not be loaded!");
-        return;
     }
-
-#ifndef __ANDROID__
-    if (new_global_config) {
-        const auto seed = [this](const Settings::BasicSetting& setting, const std::string& value) {
-            WriteStringSetting(setting.GetLabel(), value);
-            WriteBooleanSetting(setting.GetLabel() + "\\default", false);
-        };
-
-#ifdef _WIN32
-        BeginGroup(Settings::TranslateCategory(Settings::Category::Core));
-        seed(Settings::values.memory_layout_mode, ToString(u32(Settings::MemoryLayout::Memory_8Gb)));
-        seed(Settings::values.sync_core_speed, ToString(true));
-        EndGroup();
-
-        BeginGroup(Settings::TranslateCategory(Settings::Category::System));
-        seed(Settings::values.use_docked_mode, ToString(u32(Settings::ConsoleMode::Docked)));
-        EndGroup();
-#endif
-
-        BeginGroup(Settings::TranslateCategory(Settings::Category::Renderer));
-#ifdef _WIN32
-        seed(Settings::values.vram_usage_mode, ToString(u32(Settings::VramUsageMode::Aggressive)));
-        seed(Settings::values.max_anisotropy, ToString(u32(Settings::AnisotropyMode::X16)));
-        seed(Settings::values.astc_recompression,
-             ToString(u32(Settings::AstcRecompression::Uncompressed)));
-        seed(Settings::values.game_dlss_network, ToString(true));
-        seed(Settings::values.nvidia_dlss, ToString(true));
-#else
-        seed(Settings::values.scaling_filter, ToString(u32(Settings::ScalingFilter::Fsr3)));
-#endif
-        seed(Settings::values.gpu_accuracy, ToString(u32(Settings::GpuAccuracy::Low)));
-        seed(Settings::values.nvdec_emulation, ToString(u32(Settings::NvdecEmulation::Gpu)));
-        seed(Settings::values.async_presentation, ToString(true));
-        seed(Settings::values.use_asynchronous_shaders, ToString(true));
-        EndGroup();
-    }
-#endif
+    fclose(fp);
 }
 
 bool Config::IsCustomConfig() const {
@@ -391,6 +354,144 @@ void Config::ReadDisabledAddOnValues() {
     EndGroup();
 }
 
+namespace {
+constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
+constexpr std::string_view MaxResolutionName = "Max Resolution (built-in)";
+
+// The mods on disk now, per title: load/<title>/ folders and cheat_ files, and "SDMC" for the SD
+// card's atmosphere/contents/<title>/ (the names FileSys::PatchManager lists them by).
+std::map<u64, std::vector<std::string>> ModsOnDisk() {
+    std::map<u64, std::vector<std::string>> out;
+    const auto parse_title = [](const std::filesystem::path& path) -> std::optional<u64> {
+        const std::string name = FS::PathToUTF8String(path.filename());
+        if (name.size() != 16 ||
+            !std::ranges::all_of(name, [](char c) { return std::isxdigit(u8(c)) != 0; })) {
+            return std::nullopt;
+        }
+        return std::stoull(name, nullptr, 16);
+    };
+    std::error_code error;
+    for (const auto& title : std::filesystem::directory_iterator(
+             FS::GetEdenPath(FS::EdenPath::LoadDir), error)) {
+        const auto title_id = parse_title(title.path());
+        if (!title_id || !title.is_directory(error)) {
+            continue;
+        }
+        std::error_code inner;
+        for (const auto& mod : std::filesystem::directory_iterator(title.path(), inner)) {
+            std::string name = FS::PathToUTF8String(mod.path().filename());
+            if (mod.is_directory(inner) || name.starts_with("cheat_")) {
+                out[*title_id].push_back(std::move(name));
+            }
+        }
+    }
+    for (const auto& title : std::filesystem::directory_iterator(
+             FS::GetEdenPath(FS::EdenPath::SDMCDir) / "atmosphere" / "contents", error)) {
+        if (const auto title_id = parse_title(title.path());
+            title_id && title.is_directory(error) &&
+            !std::filesystem::is_empty(title.path(), error)) {
+            out[*title_id].emplace_back("SDMC");
+        }
+    }
+    return out;
+}
+} // Anonymous namespace
+
+// New mods start disabled (FileSys::PatchManager): the add-on names Fritchii has seen per title.
+// The first time a config is read by such a build, tracking starts:
+// - a config used before (Frizti's config/frizti.ini, a disabled list or a tuned settings
+//   revision): every mod on disk now is seen and keeps its state, as the player chose them;
+// - a new config: nothing is seen, so every mod there starts disabled when first listed.
+// Max Resolution (built-in) is off by default (owner 2026-11-18): a new config starts with it
+// disabled; a config used before keeps its state (Fritchii's one-time v6 prompt covers those).
+// Once seen, the player's choice for any add-on sticks. The other built-ins, game updates and
+// DLC are never on this list.
+void Config::ReadSeenAddOnValues() {
+    const auto lock = FileSys::PatchManager::LockAddOns();
+    BeginGroup(std::string("SeenAddOns"));
+    const bool tracking = ReadBooleanSetting(std::string("tracking"));
+    Settings::values.seen_addons.clear();
+    const int size = BeginArray(std::string(""));
+    for (int i = 0; i < size; ++i) {
+        SetArrayIndex(i);
+        const auto title_id = ReadUnsignedIntegerSetting(std::string("title_id"), 0);
+        std::vector<std::string> out;
+        const int s_size = BeginArray("seen");
+        for (int j = 0; j < s_size; ++j) {
+            SetArrayIndex(j);
+            out.push_back(ReadStringSetting(std::string("s"), std::string("")));
+        }
+        EndArray(); // seen
+        Settings::values.seen_addons.insert_or_assign(title_id, std::move(out));
+    }
+    EndArray();
+    EndGroup();
+
+    if (!tracking) {
+        const bool used_before =
+            FS::Exists(FS::GetEdenPath(FS::EdenPath::ConfigDir) / "frizti.ini") ||
+            !Settings::values.disabled_addons.empty() ||
+            Settings::values.frizti_settings_revision.GetValue() > 0;
+        auto& oot_seen = Settings::values.seen_addons[OcarinaOfTimeId];
+        if (used_before) {
+            std::size_t mods = 0;
+            for (auto& [title_id, names] : ModsOnDisk()) {
+                auto& seen = Settings::values.seen_addons[title_id];
+                for (auto& name : names) {
+                    if (std::ranges::find(seen, name) == seen.end()) {
+                        seen.push_back(std::move(name));
+                        ++mods;
+                    }
+                }
+            }
+            LOG_INFO(Config, "Mods: new mods start disabled from now on; the {} already there "
+                             "keep their state", mods);
+        } else {
+            auto& disabled = Settings::values.disabled_addons[OcarinaOfTimeId];
+            if (std::ranges::find(disabled, MaxResolutionName) == disabled.end()) {
+                disabled.emplace_back(MaxResolutionName);
+            }
+            LOG_INFO(Config, "Mods: new config, every mod starts disabled (Max Resolution too)");
+        }
+        if (std::ranges::find(oot_seen, MaxResolutionName) == oot_seen.end()) {
+            oot_seen.emplace_back(MaxResolutionName);
+        }
+    }
+    Settings::values.seen_addons_tracking = true;
+}
+
+void Config::SaveSeenAddOnValues() {
+    BeginGroup(std::string("SeenAddOns"));
+    WriteBooleanSetting(std::string("tracking"), Settings::values.seen_addons_tracking);
+    int i = 0;
+    BeginArray(std::string(""));
+    for (const auto& [title_id, names] : Settings::values.seen_addons) {
+        SetArrayIndex(i);
+        WriteIntegerSetting(std::string("title_id"), title_id, std::make_optional(u64(0)));
+        BeginArray(std::string("seen"));
+        for (std::size_t j = 0; j < names.size(); ++j) {
+            SetArrayIndex(int(j));
+            WriteStringSetting(std::string("s"), names[j], std::make_optional(std::string("")));
+        }
+        EndArray(); // seen
+        ++i;
+    }
+    EndArray();
+    EndGroup();
+}
+
+void Config::SaveAddOnValues() {
+    if (!global) {
+        return;
+    }
+    {
+        const auto lock = FileSys::PatchManager::LockAddOns();
+        SaveDisabledAddOnValues();
+        SaveSeenAddOnValues();
+    }
+    WriteToIni();
+}
+
 void Config::ReadMiscellaneousValues() {
     BeginGroup(Settings::TranslateCategory(Settings::Category::Miscellaneous));
 
@@ -483,6 +584,10 @@ void Config::ReadValues() {
     ReadRendererValues();
     ReadAudioValues();
     ReadSystemValues();
+    if (global) {
+        // After the data paths, the disabled list and the tuned settings revision it looks at.
+        ReadSeenAddOnValues();
+    }
 }
 
 void Config::SavePlayerValues(const std::size_t player_index) {
@@ -565,7 +670,11 @@ void Config::SaveValues() {
     if (global) {
         LOG_DEBUG(Config, "Saving global generic configuration values");
         SaveDataStorageValues();
-        SaveDisabledAddOnValues();
+        {
+            const auto lock = FileSys::PatchManager::LockAddOns();
+            SaveDisabledAddOnValues();
+            SaveSeenAddOnValues();
+        }
         SaveWebServiceValues();
         SaveMiscellaneousValues();
     } else {
@@ -970,14 +1079,6 @@ void Config::ReadSettingGeneric(Settings::BasicSetting* const setting) {
     }
 
     if (global || !use_global) {
-#ifdef _WIN32
-        // Older builds marked a per-game OFF override as default. Keep it when the game
-        // explicitly overrides the global value.
-        if (!global && setting == &Settings::values.frame_gen) {
-            setting->LoadString(ReadStringSetting(key));
-            return;
-        }
-#endif
         const bool is_default = ReadBooleanSetting(std::string(key).append("\\default"), std::make_optional(true));
         if (!is_default) {
             setting->LoadString(ReadStringSetting(key, default_value));

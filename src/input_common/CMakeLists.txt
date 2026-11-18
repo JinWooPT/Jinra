@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_library(input_common STATIC
@@ -65,7 +64,6 @@ else()
         helpers/joycon_protocol/calibration.h
         helpers/joycon_protocol/common_protocol.cpp
         helpers/joycon_protocol/common_protocol.h
-        helpers/joycon_protocol/subcommand_response.h
         helpers/joycon_protocol/generic_functions.cpp
         helpers/joycon_protocol/generic_functions.h
         helpers/joycon_protocol/joycon_types.h

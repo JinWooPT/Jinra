@@ -212,12 +212,6 @@ QList<QWidget*> ConfigureInput::GetSubTabs() const {
     };
 }
 
-void ConfigureInput::UseHomeLayout() {
-    for (auto* player : player_controllers) {
-        player->UseHomeLayout();
-    }
-}
-
 /// Apply all Controls pages, including the saved microphone device and gain.
 void ConfigureInput::ApplyConfiguration() {
     const bool was_global = Settings::values.players.UsingGlobal();
@@ -323,5 +317,11 @@ void ConfigureInput::UpdateAllInputProfiles(std::size_t player_index) {
         }
 
         player_controllers[i]->UpdateInputProfiles();
+    }
+}
+
+void ConfigureInput::UseHomeLayout() {
+    for (auto* player : player_controllers) {
+        player->UseHomeLayout();
     }
 }

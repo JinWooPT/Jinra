@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -26,6 +25,10 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_fastdraw_count.h"
+#include "video_core/nx2_list_dispatch.h"
+#include "video_core/nx2_list_reader.h"
+#include "video_core/one_follower_hooks.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -39,6 +42,11 @@ class MemoryManager;
 
 namespace VideoCommon {
 class GpuSplit;
+struct MemStageShadowAccess;
+}
+
+namespace VideoCommon::ESplit {
+struct CbTarget;
 }
 
 namespace VideoCore {
@@ -3073,6 +3081,11 @@ public:
             /// Deferred instances already drawn by flushes in the middle of the current loop.
             u32 drawn_instances{};
             std::vector<u8> inline_index_draw_indexes;
+            /// List draws (nx2_list_draw.h): the next draw.end draws the array whose vertex count and
+            /// first vertex are the two words at this address (Maxwell3D::FrontTakeListDraw).
+            GPUVAddr list_draw_address{};
+            /// Its keep id: the rasterizer keeps a copy of the words for the front.
+            u64 list_keep_id{};
         };
         struct DrawTextureState {
             f32 dst_x0;
@@ -3095,31 +3108,69 @@ public:
             size_t buffer_size;
             size_t max_draw_counts;
             size_t stride;
+            /// List draws (nx2_list_draw.h): indirect_start_address holds a vertex count and a first
+            /// vertex, not a draw command; list_keep_id is the id their copy is kept as.
+            bool list_words{};
+            u64 list_keep_id{};
         };
-        void ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument);
-        void Clear(Maxwell3D& maxwell3d, u32 layer_count);
+        // `Engine` is Maxwell3D, or the memory stage's copy of the registers (MemStageShadowEngine,
+        // memstage_shadow_engine.h): the same code runs on both (draw_manager.cpp instantiates both).
+        template <typename Engine>
+        void ProcessMethodCall(Engine& maxwell3d, u32 method, u32 argument);
+        template <typename Engine>
+        void Clear(Engine& maxwell3d, u32 layer_count);
         /// Draws the waiting instances. loop_continues is set when the loop goes on afterwards.
-        void DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues = false);
+        template <typename Engine>
+        void DrawDeferred(Engine& maxwell3d, bool loop_continues = false);
         /// Instances after the first wait to be drawn together (DrawDeferred).
         [[nodiscard]] bool HasDeferredDraw() const noexcept {
-            return draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0;
+            return (draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0) ||
+                   first_folded;
         }
+        /// EDEN_NX2_FOLD_INSTANCE (split front, instanced draw macros; ported):
+        /// the next draw.end ends the first instance of an instance loop. The
+        /// loop's deferred draw covers that instance too (DrawDeferred draws instance_count + 1),
+        /// so it isn't drawn on its own (it was drawn twice).
+        void FoldFirstInstance() noexcept {
+            fold_first_instance = true;
+        }
+        bool fold_first_instance{};
+        /// A folded first instance whose loop's deferred draw hasn't come yet.
+        bool first_folded{};
         /// Methods an instance loop writes between its draws; any other write ends the loop.
         [[nodiscard]] static bool IsInstanceLoopMethod(u32 method) noexcept;
-        void DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances);
-        void DrawArrayInstanced(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, bool subsequent);
-        void DrawIndex(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count, u32 base_index, u32 base_instance, u32 num_instances);
-        void DrawArrayIndirect(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology);
-        void DrawIndexedIndirect(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count);
-        void SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 index);
-        void SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 method, const u32* base_start, u32 amount);
-        void DrawBegin(Maxwell3D& maxwell3d);
-        void DrawEnd(Maxwell3D& maxwell3d, u32 instance_count = 1, bool force_draw = false);
-        void DrawIndexSmall(Maxwell3D& maxwell3d, u32 argument);
-        void DrawTexture(Maxwell3D& maxwell3d);
-        void UpdateTopology(Maxwell3D& maxwell3d);
-        void ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed, u32 instance_count);
-        void ProcessDrawIndirect(Maxwell3D& maxwell3d);
+        template <typename Engine>
+        void DrawArray(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances);
+        template <typename Engine>
+        void DrawArrayInstanced(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, bool subsequent);
+        template <typename Engine>
+        void DrawIndex(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count, u32 base_index, u32 base_instance, u32 num_instances);
+        template <typename Engine>
+        void DrawArrayIndirect(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology);
+        template <typename Engine>
+        void DrawIndexedIndirect(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count);
+        template <typename Engine>
+        void SetInlineIndexBuffer(Engine& maxwell3d, u32 index);
+        template <typename Engine>
+        void SetInlineIndexBuffer(Engine& maxwell3d, u32 method, const u32* base_start, u32 amount);
+        template <typename Engine>
+        void DrawBegin(Engine& maxwell3d);
+        /// Instance folding (EDEN_NX2_FOLD_INSTANCES): as `count` draw.begin writes of the
+        /// register's value, which is a later instance of an instance loop.
+        template <typename Engine>
+        void AddLoopInstances(Engine& maxwell3d, u32 count);
+        template <typename Engine>
+        void DrawEnd(Engine& maxwell3d, u32 instance_count = 1, bool force_draw = false);
+        template <typename Engine>
+        void DrawIndexSmall(Engine& maxwell3d, u32 argument);
+        template <typename Engine>
+        void DrawTexture(Engine& maxwell3d);
+        template <typename Engine>
+        void UpdateTopology(Engine& maxwell3d);
+        template <typename Engine>
+        void ProcessDraw(Engine& maxwell3d, bool draw_indexed, u32 instance_count);
+        template <typename Engine>
+        void ProcessDrawIndirect(Engine& maxwell3d);
         State draw_state{};
         DrawTextureState draw_texture_state{};
         IndirectParams indirect_state{};
@@ -3207,6 +3258,13 @@ public:
     void CallConstBufferWords(Core::System& system, const u32* methods, const u32* arguments,
                               u32 count);
 
+    /// GpuSplit's back (Kind::StateDelta, EXP22 bit 1): `count` macro state register writes
+    /// (method | argument << 32), each as CallMethod would apply it.
+    void ApplyFrontDelta(Core::System& system, const u64* writes, u32 count);
+    /// GpuSplit's back (Kind::DrawBatch, EXP22 bit 2): an instance-loop group's `count` writes,
+    /// then `repeats - 1` more identical groups, which only count an instance each.
+    void RunDrawBatch(Core::System& system, const u64* writes, u32 count, u32 repeats);
+
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
     /// registers and sends the register writes to the back thread.
@@ -3214,6 +3272,41 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// FRITCHII_FRONT_LIST_LANE (fable_b 27.3): FrontWrite's same-value exit taken where a write
+    /// starts (a command-list word in DmaPusher::ProcessCommands, a handler's write in the lean
+    /// macro body). `block` is 0 only while nothing FrontWrite does before that exit can act on a
+    /// lane method: the front exists, its shadow RAM tracks, same-value skipping is on, EXP2 is
+    /// off, no list draw left stale registers, no FRITCHII_MACRO_SEQ_DRY run is open
+    /// (FrontLaneSync keeps it, at each place one of them changes).
+    struct FrontLane {
+        u32 block{1};
+        const u32* regs{};
+        const u32* shadow{};
+    };
+    FrontLane front_lane;
+    /// Per method: 1 = a state register the lane may drop (not executable, writes no memory, not
+    /// render_enable.mode, 0x157 or 0x158, not a puller method).
+    std::array<u8, Regs::NUM_REGS> front_lane_methods{};
+    /// Whether FrontWrite would drop `method` = `value` at its first test, unchanged.
+    [[nodiscard]] bool FrontLaneDrops(u32 method, u32 value) const {
+        return front_lane.block == 0 && method < Regs::NUM_REGS &&
+               front_lane_methods[method] != 0 && front_lane.shadow[method] == value &&
+               front_lane.regs[method] == value;
+    }
+    /// Once per command-list chunk: whether the lane can run for it (the switch generation is
+    /// the one the front read its experiments at; `block` recomputed).
+    [[nodiscard]] bool FrontLaneReady();
+    /// After a chunk: its lane counts (drops; verify: writes checked, drops the old path sent,
+    /// which must be 0, and sends the lane would have missed), the profile counters and the line.
+    void FrontLaneListDone(u32 dropped, u32 checked, u32 differ, u32 missed);
+    /// List draws (nx2_list_draw.h): the call of macro `method` whose two
+    /// parameters are the GPU-written words at `address`. Returns whether the call was sent to
+    /// the back without reading them.
+    bool FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                           GPUVAddr address, const Nx2ListDispatch::ListReader& reader);
+    /// List guard (nx2_list_dispatch.h): the list of the grid the data RAM's marker stands for, set by the
+    /// compute engine that shares the data RAM (KeplerCompute::FrontTakeListDispatch).
+    Nx2ListDispatch::GridMarker grid_marker;
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3273,22 +3366,144 @@ public:
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
     void ProcessCBMultiData(const u32* start_base, u32 amount);
+    /// EXP88 & 2: writes constant buffer data at `offset`
+    /// (`bytes` within the buffer) through the buffer CB_ADDRESS and CB_SIZE select, translated
+    /// once per selection and memory map (MemoryManager::WriteConstantBufferData). False, having
+    /// done nothing, where the general path has to: the switch is off, the buffer isn't one
+    /// mapped device range, or the write lands on Switch 2 sparse memory.
+    bool WriteBoundConstantBuffer(const VideoCommon::ESplit::CbTarget& target, const void* data,
+                                  u32 bytes);
+    /// Where constant buffer words written now land (CB_ADDRESS, CB_SIZE, the offset before
+    /// them, the texture header and sampler pools, the switches that keep the write here): the
+    /// memory half below reads only this, no register.
+    void FillConstantWordsTarget(VideoCommon::ESplit::CbTarget& target, u32 offset) const;
+    /// The memory half of constant buffer words: `block` = CallConstBufferWords' write (one
+    /// device page, CB_DIRECT), else ProcessCBMultiData's (`bytes` already clipped to the
+    /// buffer). The register half (the offset advance) stays with the caller. FRITCHII_ESPLIT=1
+    /// runs it on E2 from a record (fritchii_e_split_thread.h, S4), later than the register half.
+    void WriteConstantWords(const VideoCommon::ESplit::CbTarget& target, const u32* values,
+                            u32 bytes, bool block);
 
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
 
+    /// EDEN_NX2_FASTDRAW_COUNT (nx2_fastdraw_count.h), the original lists: registers
+    /// that only parameterize the next draw, the next constant buffer bind or the buffers a delta
+    /// draw binds again, or that ProcessMethodCall handles, so writing them doesn't end reuse.
+    static bool IsFastDrawParameter(u32 method);
+    /// Methods recorded as light changes (constant buffer data and binds).
+    static bool IsFastDrawDeltaMethod(u32 method);
+    /// A vertex stream's address, size or limit; its stride and enable word when dynamic.
+    static bool IsFastDrawVertexBuffer(u32 method);
+    /// Executable methods whose work leaves what a draw resolves to alone.
+    static bool IsFastDrawNeutralMethod(u32 method);
+    /// Registers only a report or a macro memory read takes as operands.
+    static bool IsFastDrawReportOperand(u32 method);
+    /// A vertex attribute format, when vertex input is dynamic state.
+    static bool IsFastDrawVertexFormat(u32 method);
+    /// The break group (Nx2FastDrawCount::Group) of a register or method that ends reuse.
+    static u32 FastDrawCountGroup(u32 method);
+    /// Counting on: a state write of `argument` to `method`, before the register takes it.
+    void NoteFastDrawCountWrite(u32 method, u32 argument);
+    /// Counting on: inline data written to GPU addresses [begin, end) (constant buffer words, a
+    /// report): texture or sampler headers end reuse, also through another GPU address mapping
+    /// their device memory (the original alias check); the rest is noted as light, unless `unchanged`
+    /// (memory held the words already: EXP107).
+    void NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end, bool unchanged = false);
+
+    /// EXP107: how inline constant buffer data about to be
+    /// written to [begin, begin + bytes) compares with what memory holds there.
+    enum class ConstantWrite : u8 {
+        Changed,   ///< Other words, or not compared (switch off, crosses a page, sparse, unmapped)
+        Unchanged, ///< The same words, but the write must still land (see CompareConstantData)
+        Skip,      ///< The same words, and writing them again changes nothing anywhere
+    };
+    /// Unchanged where the GPU caches or a guest read download may hold other words there, the
+    /// texture header or sampler pools are written (directly or through an alias), or run-ahead
+    /// was used this session. Switch off: Changed, without reading memory.
+    ConstantWrite CompareConstantData(GPUVAddr begin, const void* data, u64 bytes,
+                                      const VideoCommon::ESplit::CbTarget& target);
+    /// Counting on: translates the texture header and sampler pools to device memory again if
+    /// they or the mappings changed, and publishes them for the writes applied to the caches
+    /// (Nx2FastDrawCount::NotePoolWrite). On the thread that runs this engine.
+    void UpdateFastDrawCountPools();
+
 private:
+    /// The texture header (TIC) and sampler (TSC) pools as NoteFastDrawCountData sizes them.
+    struct FastDrawCountPools {
+        GPUVAddr tic;
+        u64 tic_size;
+        GPUVAddr tsc;
+        u64 tsc_size;
+    };
+    FastDrawCountPools FastDrawCountPoolRanges() const;
+    VideoCommon::Nx2FastDrawCount::DeviceSpans fast_draw_count_tic_spans;
+    VideoCommon::Nx2FastDrawCount::DeviceSpans fast_draw_count_tsc_spans;
+    /// EXP107: the pools' device memory, for CompareConstantData's alias check.
+    VideoCommon::Nx2FastDrawCount::DeviceSpans unchanged_write_tic_spans;
+    VideoCommon::Nx2FastDrawCount::DeviceSpans unchanged_write_tsc_spans;
+
     void InitializeRegisterDefaults();
 
     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);
 
-    u32 ProcessShadowRam(u32 method, u32 argument);
+    /// The value a write leaves in the register, as the shadow RAM mode has it: the argument
+    /// (tracked in shadow_state when tracking), or the shadow copy when replaying. Defined here,
+    /// as the hot method paths call it for nearly every write.
+    u32 ProcessShadowRam(u32 method, u32 argument) {
+        const auto control = shadow_state.shadow_ram_control;
+        if (control == Regs::ShadowRamControl::Track ||
+            control == Regs::ShadowRamControl::TrackWithFilter) {
+            return shadow_state.reg_array[method] = argument;
+        }
+        if (control == Regs::ShadowRamControl::Replay) {
+            return shadow_state.reg_array[method];
+        }
+        return argument;
+    }
 
-    void ProcessDirtyRegisters(u32 method, u32 argument);
+    /// Stores a register's value and sets its dirty flags. Defined here for the same reason.
+    void ProcessDirtyRegisters(u32 method, u32 argument) {
+        // The instances after the first are drawn together once their loop ends, and they must see
+        // the state they were begun with: NVN's draw macros reset the base instance (and its copy
+        // in c[0][0x644]) right after the loop, before the macro returns.
+        if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method))
+            [[unlikely]] {
+            draw_manager.DrawDeferred(*this, true);
+        }
+        if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+            NoteFastDrawCountWrite(method, argument);
+        }
+        regs.reg_array[method] = argument;
+        for (const auto& table : dirty.tables) {
+            dirty.flags[table[method]] = true;
+        }
+        // One follower, step 2+: the word goes in the next packet's delta (R's view).
+        if (VideoCommon::OneFollower::g_track_writes_always ||
+            VideoCommon::OneFollower::g_track_writes.load(std::memory_order_relaxed)) [[unlikely]] {
+            VideoCommon::OneFollower::NoteRegWrite(method);
+        }
+    }
+
+    /// CallMethodFast for a state register (not in execution_mask): a write of the value the
+    /// register holds changes nothing (EDEN_NX2_SKIP_SAME=0 keeps it).
+    void WriteStateRegister(u32 method, u32 method_argument) {
+        const u32 argument = ProcessShadowRam(method, method_argument);
+        if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
+            ProcessDirtyRegisters(method, argument);
+        }
+    }
 
     void ConsumeSinkImpl(Core::System& system) override;
 
+    void ApplyPairs(Core::System& system, const u64* pairs, u32 count) override;
+
     void ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call);
 
+    /// CallMethod after the profile: CallMethodFast, or CallMethodSlow where it can't.
+    void DispatchMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call);
+    /// CallMethod with EDEN_NX2_GPU_PROFILE: DispatchMethod, counted and timed.
+    void ProfiledCallMethod(Core::System& system, u32 method, u32 method_argument,
+                            bool is_last_call);
     /// CallMethod with every check, for the cases and tools CallMethodFast leaves out.
     void CallMethodSlow(Core::System& system, u32 method, u32 method_argument, bool is_last_call);
     void CallMethodFast(u32 method, u32 method_argument, bool is_last_call);
@@ -3310,12 +3525,8 @@ private:
     void CallMacroMethod(Core::System& system, u32 method, std::span<const u32> parameters);
 
     /// Whether state register writes that keep the register's value are dropped (CallMethod).
-    static bool SkipSameValueWrites() {
-        static const bool skip = [] {
-            const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
-            return value == nullptr || value[0] != '0';
-        }();
-        return skip;
+    bool SkipSameValueWrites() const {
+        return skip_same_value_writes;
     }
 
     /// Handles writes to the macro uploading register.
@@ -3347,6 +3558,15 @@ private:
     bool IsMethodExecutable(u32 method);
 
     MemoryManager& memory_manager;
+
+    /// EXP88 & 2: the constant buffer WriteBoundConstantBuffer last translated (the original's TIC and
+    /// TSC parts left out: they serve its fast draw, which we don't have).
+    struct BoundConstantBuffer {
+        GPUVAddr address{};
+        u32 size{};
+        u64 map_serial{};
+        DAddr device{}; ///< 0: the general path writes its data
+    } bound_constant_buffer;
 
     VideoCore::RasterizerInterface* rasterizer = nullptr;
 
@@ -3397,25 +3617,181 @@ private:
     // the front owns the macro code and bindings (the back thread then leaves them alone).
     struct FrontState;
     FrontState& Front(Core::System& system, VideoCommon::GpuSplit& split);
-    void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    /// FrontWrite in halves, so the front ops path (FRITCHII_ONEF_FRONT_OPS) shares them:
+    /// FrontWriteDecide applies the write to the front's state and returns whether it is still
+    /// to be sent (false: dropped, or sent already by a path that holds its own block);
+    /// FrontWriteSend sends it, then FrontWriteNotes makes the notes its entry needs.
+    struct FrontWriteDecision {
+        u32 value;           ///< after the shadow RAM
+        u8 effect;           ///< VideoCommon::GpuSplit::Effect of the entry
+        bool has_cb_write;   ///< a constant buffer data word: cb_write is its address
+        GPUVAddr cb_write;
+        GPUVAddr write_begin; ///< FrontWriteRange before the write
+        GPUVAddr write_end;
+    };
+    bool FrontWriteDecide(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                          u32 argument, bool is_last_call, bool from_macro,
+                          FrontWriteDecision& decision);
+    void FrontWriteSend(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                        bool is_last_call, bool from_macro, const FrontWriteDecision& decision);
+    void FrontWriteNotes(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                         const FrontWriteDecision& decision);
+    /// FRITCHII_ONEF_FRONT_OPS (macro_ops_oot.h): a handler write decided for the call's op; the
+    /// recorded writes sent the old way; the call's op sent (`handled`: the handler ran it whole);
+    /// the coverage line; whether a check mismatch stopped ops for the session.
+    void FrontOpRecord(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument);
+    /// FRITCHII_FRONT_OP_LEAN (fable_b2 1.4): an op write's decide with only what the op path's
+    /// per-call conditions leave (FrontOpDecideLean; mode 2 compares it with FrontWriteDecide);
+    /// the per-method kinds it uses, filled when the front starts.
+    bool FrontOpDecide(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                       FrontWriteDecision& decision);
+    bool FrontOpDecideLean(FrontState& state, u32 method, u32 argument,
+                           FrontWriteDecision& decision, bool& same);
+    void FrontOpKinds(FrontState& state);
+    void FrontOpFallback(VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontOpFinish(VideoCommon::GpuSplit& split, FrontState& state, bool handled);
+    static void FrontOpReport(FrontState& state, int mode);
+    static bool FrontOpsStopped();
+    static void StopFrontOps(const char* why);
+    /// E's half: the op's writes rebuilt and applied as Execute applies the entries they replace
+    /// (S2), or directly (S3), then the check words compared.
+    static void ApplyFrontOp(const u64* payload);
+    void ApplyFrontOpWrites(Core::System& system, u8 op, const u32* args, u64 sent, u64 pairs,
+                            const u64* cb_addresses, u32 cb_address_count, u32 checks);
+    void ApplyFrontOpDirect(Core::System& system, u8 op, const u32* args, u64 sent, u64 pairs,
+                            const u64* cb_addresses, u32 cb_address_count, u32 checks);
+    void CheckFrontOp(u8 op, const u32* args, const u64* checks, u32 writes, u32 finals);
+    /// FRITCHII_ONEF_DEAD_STORES (fable_b 27.7, count only): an 0xea0 call begins (`end`
+    /// false: are the last call's trailing stores dead?) or ended (its stores noted).
+    void FrontDeadStores(VideoCommon::GpuSplit& split, FrontState& state, bool end);
+    /// FRITCHII_ONEF_FILL_COUNT (fable_b 28.5, S4's count): a sampled bind's bytes as the front
+    /// reads them after the bind op, sent for E to compare with the bytes at its bind.
+    void FrontFillCount(VideoCommon::GpuSplit& split, FrontState& state);
+    static void BackFillCount(const u64* payload);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
-    bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
-                        const MacroEngine& engine, u32 start);
-    u32 FrontRegister(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
-    bool FrontTakeOver(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
+    /// FrontRunMacro's two bodies: v5.7's (no macro switch on) and the one with EXP53,
+    /// EDEN_NX2_OOT_MACROS, EDEN_NX2_FOLD_INSTANCE and EDEN_NX2_DRAW_PACKET. FrontState's
+    /// macro_features picks one; FrontRefreshSwitches sets it from the live switches.
+    void FrontRunMacroPlain(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    /// The features body; Lean (FRITCHII_FRONT_CALL_LEAN) takes the per-call switches kept in the
+    /// front state and the call's words where they are (fable_b 27.2 B).
+    template <bool Lean>
+    void FrontRunMacroFeaturesT(Core::System& system, VideoCommon::GpuSplit& split,
+                                FrontState& state);
+    static void FrontRefreshSwitches(FrontState& state);
+    /// FRITCHII_FRONT_CALL_LEAN: FrontRunMacro's choice of body for a lean call; the call's words
+    /// copied into the FIFO vector for a path that needs it there; the 10 s counter line.
+    void FrontRunMacroLean(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    static void FrontCallMaterialize(FrontState& state);
+    static void FrontCallLeanReport(FrontState& state);
+    /// FRITCHII_FRONT_LIST_LANE: front_lane from the front state; the counter line.
+    void FrontLaneSync(FrontState& state);
+    void FrontLaneReport(FrontState& state);
+    static void FrontLaneMacroDone(FrontState& state, u32 dropped, u32 checked, u32 differ,
+                                   u32 missed);
+public:
+    /// Split front: whether the 3D macro `method`, called with `count` parameters that GPU work
+    /// wrote, only copies the first into the draw's vertex count (dry runs on copies of its
+    /// state, nx2_indirect_grid.h). Then the parameters can stay placeholders.
+    bool FrontMacroCountsDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                              u32 count);
+private:
+    /// EXP53: whether the macro at `method` is NVN's
+    /// conditional render, which DMA-reads six Compare words and only sets render_enable.mode
+    /// from them as IfNotEqual does (dry runs on copies, cached per macro and code generation).
+    bool IsPredicateMacro(FrontState& fs, u32 method);
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
-    void FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& state, u32 method,
-                         u32 amount);
+    /// List draws (nx2_list_draw.h): whether the macro at `start` is the array draw
+    /// FrontTakeListDraw sends as an address.
+    bool FrontIsListDrawMacro(FrontState& state, const MacroEngine& engine, u32 start);
+    /// List guard (nx2_list_dispatch.h): a write of `method` while the two registers a list draw left
+    /// unwritten are stale (FrontState::list_draw_stale).
+    void FrontNoteListDrawWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
+    /// List guard (nx2_list_dispatch.h): reads the list draw's two words back and writes the registers.
+    void FrontResolveListDraw(VideoCommon::GpuSplit& split, FrontState& state);
+    /// List guard (nx2_list_dispatch.h): whether the macro at `start` uses the data RAM.
+    bool FrontMacroUsesDataRam(FrontState& state, const MacroEngine& engine, u32 start);
+    /// List guard: AnalyzeEffects of the macro at `start`, cached (bit 0 data RAM, bit 1 can read
+    /// vertex_buffer.first or count).
+    u8 FrontListGuardEffects(FrontState& state, const MacroEngine& engine, u32 start);
+    /// List guard, before FrontRunMacro picks a body: the data RAM's marker gets its real words
+    /// if the macro uses the data RAM; returns whether the call's register reads must be checked.
+    bool FrontListGuard(VideoCommon::GpuSplit& split, FrontState& state);
+    /// GpuSplit::FoldInstance's flush, `engine` a Maxwell3D.
+    static void FlushFoldedInstances(void* engine, u32 count);
+    /// EDEN_NX2_FOLD_INSTANCES: whether the front counts an instance loop's later instances
+    /// (FrontWrite).
+    static bool FoldInstancesEnabled();
+    void FrontTrackIndexDraws(FrontState& state, u32 method);
+    bool FrontSkipsIndexFirst(FrontState& state, u32 method, u32 value, bool shadow_kept);
+    void FrontReportSameWrites(FrontState& state);
+    void FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                              const u32* words, u32 count);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
-    void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state, u32 control);
+    /// FRITCHII_E2C_ON_E (fable_b 19.5 step 4, fable_front_drains_b 1.4): the 0xe2c macro's
+    /// render_enable.mode write, sent as a call E runs at its stream place: it reads the six
+    /// words there (the drained read's flushes first) and writes the mode the macro's formula
+    /// makes of them (`p0` its first parameter); with `verify` it compares with `front_value`
+    /// (what the front's drained read made) and writes that.
+    void FrontSendE2cCondition(VideoCommon::GpuSplit& split, FrontState& state, u32 p0,
+                               u32 front_value, bool verify);
+    /// E's half of it (StageCall::E2cCondition).
+    void BackE2cCondition(Core::System& system, GPUVAddr source, u32 p0, u32 front_value,
+                          bool verify);
+    /// The front's copy of render_enable.mode (and its shadow RAM word) is unknown after a
+    /// deferred 0xe2c until written again: fetched from E when something reads it.
+    void FrontResolveE2cMode(VideoCommon::GpuSplit& split, FrontState& state);
+    /// FRITCHII_MACRO_SAME_DRY (fable_b 21.2 cut 3, counters only): a macro call of slot `slot`
+    /// begins (compared with the slot's last call) and ends (stored, counted, logged).
+    void FrontMacroSameDryBegin(FrontState& state, size_t slot);
+    void FrontMacroSameDryEnd(FrontState& state, size_t slot);
+    /// FRITCHII_MACRO_SEQ_DRY (fable_b 26.4 lever 1, counters only): a macro call of `method`
+    /// joins the run since the last draw (sets FrontState::seq_dry); a command-list write of
+    /// `method` joins it (a draw.end closes it); the run ends at a draw (compared, counted).
+    void FrontMacroSeqCall(FrontState& state, u32 method);
+    void FrontMacroSeqDirect(FrontState& state, u32 method);
+    void FrontMacroSeqClose(FrontState& state);
+    /// Before the front writes render_enable.mode while it is unknown: what stays unknown.
+    void FrontNoteE2cModeWrite(VideoCommon::GpuSplit& split, FrontState& state);
+    /// Tells the split a report just sent releases a known payload (GpuSplit::NoteRelease).
+    void FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState& fs, u32 query) const;
+    /// The memory `amount` words of `method` write, if known (constant buffer uploads, reports).
+    std::pair<GPUVAddr, GPUVAddr> FrontWriteRange(const FrontState& state, u32 method,
+                                                  u32 amount) const;
+    bool FrontDmaReadEarly(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
+                           GPUVAddr source, u32 ram, u32 words);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
+    /// The closures the memory stage reads (StageTag, memstage_shadow.h), with fixed payloads.
+    struct StageCall;
+    friend struct VideoCommon::MemStageShadowAccess;
+    // EXP22 bit 2: instance-loop groups held back and sent as DrawBatch entries.
+    bool FrontBatchWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                         u32 argument, u32 value, bool is_last_call, bool from_macro);
+    static bool FrontCaptureRepeats(const FrontState& state);
+    void FrontEndCapture(VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontEmitBatch(VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontEmitCapture(VideoCommon::GpuSplit& split, FrontState& state);
+    /// GpuSplit::PendingFlush: sends what FrontBatchWrite holds.
+    static void FrontFlushPending(void* maxwell3d);
+    /// EDEN_NX2_DRAW_PACKET: a draw macro write FrontWrite holds in the packet instead of
+    /// sending it; GpuSplit::PendingFlush sending the packet; the back's apply of it.
+    void FrontCapturePacket(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                            u32 argument, u32 value, u8 effect);
+    static void FrontFlushPacket(void* maxwell3d);
+    static void ApplyDrawPacket(const u64* payload);
+    /// EXP22 bit 8: the fast StateDelta loop against the single writes (the latter are kept).
+    void CheckFrontDelta(const u64* writes, u32 count);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
+    // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY, read in the constructor (after the switch
+    // files are loaded): every method checks them, so no static guard on the hot path.
+    bool skip_same_value_writes{true};
+    bool perf_verify{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,
     // mode before, path), printed when the sides disagree.
     struct ControlWrite {

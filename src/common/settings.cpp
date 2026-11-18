@@ -1,11 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <atomic>
 #include <version>
+#include <atomic>
 #if __cpp_lib_chrono >= 201907L
 #include <chrono>
 #include <exception>
@@ -21,6 +20,7 @@
 #include <type_traits>
 #include <fmt/core.h>
 
+#include "common/scm_rev.h"
 #include "common/settings_enums.h"
 #include "common/assert.h"
 #include "common/fs/fs_util.h"
@@ -49,9 +49,12 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
-SWITCHABLE(OotRefreshCap, false);
+SWITCHABLE(OotTextureSharpness, false);
+SWITCHABLE(float, true);
+SWITCHABLE(DlssPreset, false);
 SWITCHABLE(NvidiaDlssQuality, false);
-SWITCHABLE(NvidiaDlssPreset, false);
+SWITCHABLE(OotRefreshCap, false);
+SWITCHABLE(OotMovieUpscale, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -66,7 +69,6 @@ SWITCHABLE(NvdecEmulation, false);
 SWITCHABLE(Region, true);
 SWITCHABLE(RendererBackend, true);
 SWITCHABLE(ScalingFilter, false);
-SWITCHABLE(FrameGenType, false);
 SWITCHABLE(SpirvOptimizeMode, true);
 SWITCHABLE(TimeZone, true);
 SETTING(VSyncMode, true);
@@ -90,17 +92,93 @@ SWITCHABLE(ConfirmStop, true);
 Values values;
 
 namespace {
-std::atomic<NvidiaDlssRuntimeSettings> nvidia_dlss_runtime_options{};
+std::atomic<u32> nvidia_dlss_runtime_options{};
 }
 
 void RefreshNvidiaDlssRuntimeSettings() {
     nvidia_dlss_runtime_options.store(
-        {values.nvidia_dlss_quality.GetValue(), values.nvidia_dlss_preset.GetValue()},
+        static_cast<u32>(values.nvidia_dlss_quality.GetValue()) |
+            (static_cast<u32>(values.nvidia_dlss_preset.GetValue()) << 8),
         std::memory_order_relaxed);
 }
 
 NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings() {
-    return nvidia_dlss_runtime_options.load(std::memory_order_relaxed);
+    const u32 options = nvidia_dlss_runtime_options.load(std::memory_order_relaxed);
+    return {static_cast<NvidiaDlssQuality>(options & 0xff),
+            static_cast<DlssPreset>((options >> 8) & 0xff)};
+}
+
+namespace {
+std::atomic<u32> applied_ocarina_render_scale{};
+}
+
+bool OcarinaDlssRenderScaleSwitch() {
+    static const bool on = [] {
+        const char* const value = std::getenv("FRITCHII_DLSS_RENDER_SCALE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return on;
+}
+
+std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale() {
+    const auto quality = values.nvidia_dlss_quality.GetValue();
+    const auto aa = values.oot_anti_aliasing.GetValue();
+    // Balanced (0.871) pads its 2276x1280 scene into 2288x1280 targets, which the upscaler does
+    // not take yet: it keeps 2560x1440.
+    // The patch changes Max Resolution's fixed-scale path: without Max Resolution it does nothing.
+    if (!OcarinaDlssRenderScaleSwitch() || !values.nvidia_dlss.GetValue() || !IsDockedMode() ||
+        !OcarinaMaxResolutionOn() ||
+        aa == OotAntiAliasing::Fsr3 || aa == OotAntiAliasing::Fsr4 ||
+        (quality != NvidiaDlssQuality::Performance &&
+         quality != NvidiaDlssQuality::UltraPerformance)) {
+        return std::nullopt;
+    }
+    return quality;
+}
+
+void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality) {
+    applied_ocarina_render_scale.store(quality ? static_cast<u32>(*quality) + 1 : 0,
+                                       std::memory_order_relaxed);
+}
+
+std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale() {
+    const u32 value = applied_ocarina_render_scale.load(std::memory_order_relaxed);
+    if (value == 0) {
+        return std::nullopt;
+    }
+    return static_cast<NvidiaDlssQuality>(value - 1);
+}
+
+bool OcarinaMaxResolutionOn() {
+    if (const char* const value = std::getenv("EDEN_NX2_NO_MAX_RES"); value != nullptr) {
+        const std::string_view ab{value};
+        if (ab == "1") {
+            return false;
+        }
+        if (ab == "0") {
+            return true;
+        }
+    }
+    const auto it = values.disabled_addons.find(0x0400486024DEC000ULL);
+    if (it == values.disabled_addons.end()) {
+        return true;
+    }
+    for (const auto& name : it->second) {
+        if (name == "Max Resolution (built-in)") {
+            return false;
+        }
+    }
+    return true;
+}
+
+u32 OcarinaRenderHeightFor(std::optional<NvidiaDlssQuality> scale) {
+    if (scale == NvidiaDlssQuality::Performance) {
+        return 1080;
+    }
+    if (scale == NvidiaDlssQuality::UltraPerformance) {
+        return 720;
+    }
+    return 1440;
 }
 
 std::string GetTimeZoneString(TimeZone time_zone) {
@@ -153,7 +231,7 @@ void LogSettings() {
             }
         }
     }
-    LOG_INFO(Config, "Eden Configuration:");
+    LOG_INFO(Config, "Fritchii Configuration:");
     for (auto const& e : settings_list)
         LOG_INFO(Config, "{}", e);
 #define LOG_PATH(NAME) \
@@ -199,10 +277,31 @@ bool IsGPUFenceBehaviorAccurate() {
     return values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Accurate;
 }
 
+CpuAccuracy EffectiveCpuAccuracy() {
+    static const std::optional<CpuAccuracy> forced = []() -> std::optional<CpuAccuracy> {
+        const char* value = std::getenv("FRITCHII_CPU_ACCURACY");
+        if (value == nullptr || value[0] == 0) {
+            return std::nullopt;
+        }
+        const std::string_view name{value};
+        std::optional<CpuAccuracy> result;
+        if (name == "auto") result = CpuAccuracy::Auto;
+        else if (name == "accurate") result = CpuAccuracy::Accurate;
+        else if (name == "unsafe") result = CpuAccuracy::Unsafe;
+        else if (name == "paranoid") result = CpuAccuracy::Paranoid;
+        else if (name == "debugging") result = CpuAccuracy::Debugging;
+        LOG_WARNING(Common, "FRITCHII_CPU_ACCURACY={}: {}", name,
+                    result ? "the JIT uses it this session (the setting is unchanged)"
+                           : "unknown, ignored");
+        return result;
+    }();
+    return forced ? *forced : values.cpu_accuracy.GetValue();
+}
+
 bool IsFastmemEnabled() {
-    if (values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Debugging)
+    if (EffectiveCpuAccuracy() == Settings::CpuAccuracy::Debugging)
         return bool(values.cpuopt_fastmem);
-    else if (values.cpu_accuracy.GetValue() == CpuAccuracy::Unsafe)
+    else if (EffectiveCpuAccuracy() == CpuAccuracy::Unsafe)
         return bool(values.cpuopt_unsafe_host_mmu);
 #if defined(__linux__) && defined(ARCHITECTURE_arm64)
     // Only 4kb systems support host MMU right now
@@ -235,32 +334,14 @@ bool IsNceEnabled() {
     return is_nce_enabled;
 }
 
-static std::atomic<u64> current_program_id{};
-static std::atomic_bool pin_ocarina_speed{};
-static std::atomic<s64> display_refresh_period_ns{};
+static u64 current_program_id = 0;
 
-void SetCurrentProgramID(u64 program_id, bool high_refresh_patched) {
-    pin_ocarina_speed.store(program_id == OcarinaOfTimeProgramId && !high_refresh_patched,
-                            std::memory_order_relaxed);
-    current_program_id.store(program_id, std::memory_order_relaxed);
+void SetCurrentProgramID(u64 program_id) {
+    current_program_id = program_id;
 }
 
 u64 GetCurrentProgramID() {
-    return current_program_id.load(std::memory_order_relaxed);
-}
-
-void SetDisplayRefreshPeriodNs(s64 period) {
-    display_refresh_period_ns.store(period, std::memory_order_relaxed);
-}
-
-s64 OotHighRefreshPeriodNs() {
-    constexpr s64 Periods[] = {0, 1'000'000'000LL / 90, 1'000'000'000LL / 120,
-                              1'000'000'000LL / 144, 1'000'000'000LL / 165};
-    const auto cap = static_cast<size_t>(values.oot_high_refresh_cap.GetValue());
-    const s64 cap_period = cap < std::size(Periods) ? Periods[cap] : 0;
-    const s64 display_period = display_refresh_period_ns.load(std::memory_order_relaxed);
-    const s64 period = std::max(cap_period, display_period);
-    return period > 0 ? period : 1'000'000'000LL / 60;
+    return current_program_id;
 }
 
 static bool current_program_is_switch2 = false;
@@ -433,26 +514,34 @@ void UpdateRescalingInfo() {
     TranslateResolutionInfo(setup, info);
 }
 
-u32 FrameGenMultiplier() {
-    return std::clamp(values.frame_gen_multiplier.GetValue(), MIN_FRAME_GEN_MULTIPLIER,
-                      MAX_FRAME_GEN_MULTIPLIER);
+namespace {
+std::atomic<bool> oot_high_refresh_patched{false};
+} // Anonymous namespace
+
+void SetOotHighRefreshPatched(bool patched) {
+    oot_high_refresh_patched.store(patched, std::memory_order_relaxed);
 }
 
-size_t FrameGenGenerations() {
-    if (!values.frame_gen.GetValue()) {
-        return 0;
-    }
-    return FrameGenMultiplier() - 1;
+bool OotHighRefreshPatched() {
+    return oot_high_refresh_patched.load(std::memory_order_relaxed);
 }
 
-size_t FrameGenMaxGenerations() {
-    if (!values.frame_gen.GetValue()) {
-        return 0;
+bool SpeedLimitEnabled() {
+    if (values.use_speed_limit.GetValue()) {
+        return true;
     }
-    if (values.frame_gen_target_rate.GetValue() != 0) {
-        return MAX_FRAME_GEN_MULTIPLIER - 1;
+    // Fritchii: Ocarina of Time's logic takes one fixed step per frame (1/60 s, or 1/30 with the
+    // 30 FPS mode), so "Unlocked" above 60 FPS ran the whole game fast, not just smoother
+    // (2026-11-09). It stays at its speed; Turbo and Slow remain the deliberate speed changes.
+    static const bool fritchii = std::string_view{Common::g_build_name} == "Jinra";
+    constexpr u64 OcarinaOfTime = 0x0400486024DEC000ULL;
+    if (!fritchii || GetCurrentProgramID() != OcarinaOfTime) {
+        return false;
     }
-    return FrameGenMultiplier() - 1;
+    // With the high refresh rate patch the step follows real time at any frame rate, so
+    // "Unlocked" presents as fast as the PC can without speeding the game up. The 30 FPS mode
+    // keeps its cap.
+    return !OotHighRefreshPatched() || values.oot_30fps.GetValue();
 }
 
 void RestoreGlobalState(bool is_powered_on) {
@@ -479,30 +568,19 @@ void SetConfiguringGlobal(bool is_global) {
     configuring_global = is_global;
 }
 
-bool SpeedLimitEnabled() {
-    // The stock game takes a fixed step at high FPS. Keep the console speed limited
-    // unless the game's variable step was installed successfully.
-    return values.use_speed_limit.GetValue() ||
-           pin_ocarina_speed.load(std::memory_order_relaxed);
-}
-
 u16 SpeedLimit() {
-    u16 limit = 100;
     switch (SpeedMode(values.current_speed_mode)) {
     case SpeedMode::Standard:
-        limit = values.speed_limit.GetValue();
-        break;
+        return values.speed_limit.GetValue();
     case SpeedMode::Turbo:
-        limit = values.turbo_speed_limit.GetValue();
-        break;
+        return values.turbo_speed_limit.GetValue();
     case SpeedMode::Slow:
-        limit = values.slow_speed_limit.GetValue();
-        break;
+        return values.slow_speed_limit.GetValue();
     default:
         UNIMPLEMENTED();
     }
 
-    return limit == 0 && pin_ocarina_speed.load(std::memory_order_relaxed) ? 100 : limit;
+    return 100;
 }
 
 void SetSpeedMode(const SpeedMode& mode) {

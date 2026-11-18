@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -60,6 +59,21 @@ enum class ImageFlagBits : u32 {
     /// device memory when the guest memory under it can hold data (Image::BindTiles), and only
     /// the parts written are uploaded.
     SparseTiles = 1 << 23,
+    /// EXP67: the host image is larger than the guest size (rounded up to a bucket) so the image
+    /// pool can reuse it for the next frame's target of nearby dims; the guest size is the top
+    /// left rectangle. Never sampled with normalized coordinates (a texture lookup that finds one
+    /// stops the padding at its address).
+    HostPadded = 1 << 24,
+    /// EXP68 bit 4: made at an address whose target keeps changing size: freed when the GPU is
+    /// done instead of going to the EXP42 pool (those dims never come back).
+    NoPool = 1 << 25,
+    /// EXP121: the collector recorded its download; deleted once the GPU has written it out.
+    CollectPending = 1 << 26,
+    /// FRITCHII_SCALED_EXTENT_CAP: its scaled size would pass the device's limits, so it stays
+    /// native; logged once.
+    ScaleLimited = 1 << 27,
+    /// FRITCHII_SCALE_DEPTH_MAX: a depth image kept native for its scaled size; counted once.
+    DepthNative = 1 << 28,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -105,6 +119,17 @@ struct ImageBase {
     ImageInfo info;
 
     u32 guest_size_bytes = 0;
+    /// EXP76 & 2: CityHash128 of the guest bytes as they were when the image was last uploaded
+    /// whole (0/0: none). An upload whose guest bytes still hash the same is skipped.
+    u64 nx2_content_hash_lo = 0;
+    u64 nx2_content_hash_hi = 0;
+    /// EXP84: the range RegisterImage counted in image_count_filter (UnregisterImage removes
+    /// exactly this one, whatever cpu_addr or the size say by then).
+    u64 nx2_counted_addr = 0;
+    u64 nx2_counted_size = 0;
+    /// EXP100: this image's nx2_counted range is in TextureCache::gpu_image_filter (it was
+    /// GPU-modified while registered); UnregisterImage removes it.
+    bool nx2_gpu_counted = false;
     u32 unswizzled_size_bytes = 0;
     u32 converted_size_bytes = 0;
     u32 scale_rating = 0;
@@ -118,9 +143,7 @@ struct ImageBase {
     u64 scale_tick = 0;
     bool has_scaled = false;
 
-    /// The channel and GPU address space whose page table RegisterImage put the image in.
     size_t channel = 0;
-    size_t address_space = 0;
 
     ImageFlagBits flags = ImageFlagBits::CpuModified;
 
@@ -129,11 +152,49 @@ struct ImageBase {
     VAddr cpu_addr_end = 0;
 
     u64 modification_tick = 0;
-    u64 render_write_frame{};
+    /// FRITCHII_EARLY_COMPUTE (dry): the scheduler tick of its last GPU write (MarkModification).
+    u64 early_write_tick = 0;
     size_t lru_index = SIZE_MAX;
-    u64 last_full_clear = ~u64{0};
-    u64 previous_full_clear = ~u64{0};
-    bool written_since_clear = false;
+    /// The frame tick of the last LRU touch (TextureCache::TouchImageLru, EDEN_NX2_EXP90); reset
+    /// when the image gets a new LRU node.
+    u64 lru_touched_tick = ~u64{0};
+
+    /// Render target relocation guard (EXP43): the frame the GPU last wrote the image (~0 =
+    /// never, or contents discarded), and the guard reasons this image already reported.
+    u64 last_write_frame = ~u64{0};
+    /// Consecutive render frames with a write, up to last_write_frame (NextWriteStreak).
+    u32 write_streak = 0;
+    u8 relocation_guard_noted = 0;
+    /// FRITCHII_COVERED_RETIRE: the frame a newer image last came to overlap this one (a bad
+    /// overlap in JoinImages), and the frame its coverage was last checked.
+    u64 covered_overlap_frame = 0;
+    u64 covered_check_frame = 0;
+    /// Made where a GPU-written image was dropped without a write-back (TextureCache's lost
+    /// contents counter): bits of TextureCache::LostBits, 0 once counted or overwritten whole.
+    u8 lost_contents = 0;
+    /// Why a drop path deleted it without a write-back (TextureCache::LostWhy), for the lost
+    /// contents counter's attribution; 0 = no write-back was tried.
+    u8 lost_drop_why = 0;
+
+    /// Unmapped images (TextureCache::UnmapGPUMemory): the frame + 1 at which an unmap of its GPU
+    /// memory flagged it Remapped (0 = none did, or it was found again since) and its device
+    /// memory then.
+    u64 unmapped_tick = 0;
+    u64 unmapped_bytes = 0;
+    /// Its place in the cache's list of such images (~0 = not in it), and with
+    /// EDEN_NX2_SWEEP_UNMAPPED=2: 1 once the sweep would have deleted it, 2 once a use after that
+    /// was counted.
+    u32 unmapped_index = ~0U;
+    u8 unmapped_verify = 0;
+
+    /// Asynchronous shaders' skip rule (EDEN_NX2_ASYNC_DISCARD=2, ClassifyClearedTarget): the
+    /// render frames of the image's last two full clears that had a write between them (~0 =
+    /// none), and whether anything but a clear wrote it since the last one. Two clears with no
+    /// draw between count as one, so a tick that falls between them cannot make a layer the game
+    /// renders once look like a per-frame target.
+    u64 last_clear_frame = ~u64{0};
+    u64 previous_clear_frame = ~u64{0};
+    bool drawn_since_clear = false;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
 

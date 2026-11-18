@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
+#include <limits>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -96,47 +97,75 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         return 0;
     }();
 
-    auto const last_segment_it = &nso_header.segments[nso_header.segments.size() - 1];
+    // The image ends where the furthest segment ends. The header gives the segments in order, but
+    // it comes from the file: sizing the image by the last one let an earlier segment be copied
+    // past its end.
+    u64 segments_end = 0;
+    for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
+        const auto& segment = nso_header.segments[i];
+        segments_end = std::max<u64>(segments_end, u64{segment.location} + segment.size);
+        // A stored segment is copied from the bytes read for it.
+        if (!nso_header.IsSegmentCompressed(i) &&
+            segment.size > nso_header.segments_compressed_size[i]) {
+            LOG_ERROR(Loader, "{}: stored segment {} is larger than its data", nso_file.GetName(),
+                      i);
+            return std::nullopt;
+        }
+    }
+    // The whole image, the argument block and .bss included, is sized and aligned in u32 below:
+    // check its extent in 64 bits before allocating, so a segment near the top of the address
+    // space can neither wrap that arithmetic nor ask for gigabytes.
+    const bool pass_arguments =
+        should_pass_arguments && !Settings::values.program_args.GetValue().empty();
+    const u64 image_extent =
+        (u64{module_start} + segments_end + (pass_arguments ? NSO_ARGUMENT_DATA_ALLOCATION_SIZE : 0) +
+         nso_header.segments[2].bss_size + Core::Memory::YUZU_PAGEMASK) &
+        ~u64{Core::Memory::YUZU_PAGEMASK};
+    if (image_extent > std::numeric_limits<u32>::max()) {
+        LOG_ERROR(Loader, "{}: segments end at {:#x}, past a 32-bit image", nso_file.GetName(),
+                  image_extent);
+        return std::nullopt;
+    }
     // Build program image directly in codeset memory :)
     Kernel::CodeSet codeset;
-    codeset.memory.resize(module_start + last_segment_it->location + last_segment_it->size);
+    codeset.memory.resize(module_start + segments_end);
     {
         std::vector<u8> compressed_data(*std::ranges::max_element(nso_header.segments_compressed_size));
         std::vector<u8> decompressed_size(std::ranges::max_element(nso_header.segments, [](auto const& a, auto const& b) {
             return a.size < b.size;
         })->size);
         for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
-            nso_file.Read(compressed_data.data(), nso_header.segments_compressed_size[i], nso_header.segments[i].offset);
+            // A short read would leave the previous segment's bytes in the buffer, as below.
+            if (nso_file.Read(compressed_data.data(), nso_header.segments_compressed_size[i],
+                              nso_header.segments[i].offset) !=
+                nso_header.segments_compressed_size[i]) {
+                LOG_ERROR(Loader, "{}: segment {} is past the end of the file", nso_file.GetName(),
+                          i);
+                return std::nullopt;
+            }
             if (nso_header.IsSegmentCompressed(i)) {
-                const u32 segment_size = nso_header.segments[i].size;
                 if (nso_header.IsZBICCompressed()) {
                     // ZBIC compression
                     const int r = Common::Compression::DecompressDataZBIC(
-                        std::span<u8>{decompressed_size}.first(segment_size),
+                        std::span<u8>{decompressed_size}.first(nso_header.segments[i].size),
                         std::span<const u8>{compressed_data}.first(nso_header.segments_compressed_size[i])
                     );
-                    // A failed segment would leave the previous segment's bytes in the buffer and
-                    // boot a corrupt image that hangs without presenting; refuse to load instead.
-                    if (r <= 0) {
-                        LOG_ERROR(Loader, "{}: segment {} failed ZBIC decompression",
-                                  nso_file.GetName(), i);
-                        return std::nullopt;
-                    }
-                    if (static_cast<u32>(r) != segment_size) {
-                        LOG_WARNING(Loader, "{}: segment {} decompressed to {:#x} of {:#x} bytes",
-                                    nso_file.GetName(), i, r, segment_size);
-                        std::fill(decompressed_size.begin() + r,
-                                  decompressed_size.begin() + segment_size, u8{0});
-                    }
+                    ASSERT(r > 0);
                 } else {
                     // LZ4 compression
                     int r = Common::Compression::DecompressDataLZ4(
                         decompressed_size.data(),
-                        segment_size,
+                        nso_header.segments[i].size,
                         compressed_data.data(),
                         nso_header.segments_compressed_size[i]
                     );
-                    ASSERT(r == int(segment_size));
+                    // A segment that does not decompress to its size would boot with the previous
+                    // segment's bytes in its place, and hang without presenting.
+                    if (r != int(nso_header.segments[i].size)) {
+                        LOG_ERROR(Loader, "{}: segment {} decompressed to {} of {:#x} bytes",
+                                  nso_file.GetName(), i, r, nso_header.segments[i].size);
+                        return std::nullopt;
+                    }
                 }
 
                 std::memcpy(
@@ -158,7 +187,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
 
-    if (should_pass_arguments && !Settings::values.program_args.GetValue().empty()) {
+    if (pass_arguments) {
         const auto arg_data{Settings::values.program_args.GetValue()};
 
         codeset.DataSegment().size += NSO_ARGUMENT_DATA_ALLOCATION_SIZE;
@@ -179,7 +208,6 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     // Apply patches if necessary
     const auto name = nso_file.GetName();
-    size_t oot_speed_scale_offset{};
     if (pm && (pm->HasNSOPatch(nso_header.build_id, name) || Settings::values.dump_nso)) {
         std::span<u8> patchable_section(codeset.memory.data() + module_start, codeset.memory.size() - module_start);
         std::vector<u8> pi_header(sizeof(NSOHeader) + patchable_section.size());
@@ -187,9 +215,19 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         std::memcpy(pi_header.data() + sizeof(NSOHeader), patchable_section.data(),
                     patchable_section.size());
 
-        pi_header = pm->PatchNSO(pi_header, name, &oot_speed_scale_offset);
+        pi_header = pm->PatchNSO(pi_header, name);
 
         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
+    }
+
+    // Ocarina of Time's high refresh rate patch (Settings oot_high_refresh): where its speed scale
+    // word ended up, for the present pacing (nx2_gsv.h), and whether it applied at all.
+    constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+    const bool oot_main = name == "main" && process.GetProgramId() == OcarinaOfTimeProgramId;
+    std::optional<size_t> oot_high_refresh_scale;
+    if (oot_main) {
+        oot_high_refresh_scale = FileSys::OotHighRefreshScaleOffset(
+            std::span<const u8>{codeset.memory}.subspan(module_start));
     }
 
     // Mario Kart World selects a 1- or 2-vblank frame mode in its main loop. Force its native
@@ -317,7 +355,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     // Apply cheats if they exist and the program has a valid title ID
     if (pm) {
-        // TODO(Maufeat): Check if there is a better way to check
+        // TODO: Check if there is a better way to check
         if (name == "main")
             system.SetApplicationProcessBuildID(nso_header.build_id);
 
@@ -342,13 +380,25 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     }
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
-    if (oot_speed_scale_offset != 0) {
-        const u64 address = load_base + module_start + oot_speed_scale_offset;
-        process.SetOotSpeedScaleAddress(address);
-        LOG_INFO(Loader, "Ocarina of Time high refresh rate enabled, speed scale at {:#x}", address);
-    }
     if (name == "main" && process.GetProgramId() == Settings::MarioKartWorldProgramId) {
         process.SetMkwDynamicFpsPatchApplied(mkw_dynamic_fps_patch_applied);
+    }
+    if (oot_main) {
+        const u64 scale_address =
+            oot_high_refresh_scale ? load_base + module_start + *oot_high_refresh_scale : 0;
+        process.SetOotHighRefreshScaleAddress(scale_address);
+        Settings::SetOotHighRefreshPatched(scale_address != 0);
+        // Ctrl+U switches the mode live (FileSys::SwitchOotHighRefreshLive), where its state fits.
+        const auto& data = nso_header.segments[2];
+        const u64 bss_start = u64{data.location} + data.size;
+        process.SetOotMainCodeAddress(
+            FileSys::OotHighRefreshStateInBss(bss_start, bss_start + data.bss_size)
+                ? load_base + module_start
+                : 0);
+        if (scale_address != 0) {
+            LOG_INFO(Loader, "Ocarina of Time: high refresh rate patch on, speed scale at {:#x}",
+                     scale_address);
+        }
     }
     return load_base + image_size;
 }

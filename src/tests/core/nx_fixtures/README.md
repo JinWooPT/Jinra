@@ -2,7 +2,7 @@
 
 Synthetic archives only; none contains game data.
 
-## `synthetic_game.nx`
+## `lichii_synthetic.nx`
 
 SHA-256 `05c238808353d7b47d55adc45337868d61bccc7ae61d8fe741990e5e0ce19607`. One Switch 2 application
 (`0100123456780000`): base snapshot 0, update snapshot 1 (version 1, a complete tree that replaces
@@ -15,8 +15,8 @@ Built with the packer's synthetic NUP writer and nxconvert from nxformat `V1.0.0
 
 ```sh
 cargo build --release   # in a crate depending on nxformat/packer, with src/main.rs below
-./target/release/nupgen2 synthetic.nup
-nxconvert pack-nup synthetic.nup synthetic_game.nx --platform switch2 --no-trail --compressed-chunk-kib 0
+./target/release/nupgen2 lichii.nup
+nxconvert pack-nup lichii.nup lichii_synthetic.nx --platform switch2 --no-trail --compressed-chunk-kib 0
 ```
 
 ```rust
@@ -51,7 +51,7 @@ fn main() {
 
 ## `standalone_update.nx`
 
-SHA-256 `3093e8789a3e208f1725e033fc5b4d42784d2de0acd15ccfbd4b8f68e86741ba`. `synthetic_game.nx` with a
+SHA-256 `3093e8789a3e208f1725e033fc5b4d42784d2de0acd15ccfbd4b8f68e86741ba`. `lichii_synthetic.nx` with a
 standalone update (snapshot type 3, version 131072, no display version) added from a bare update
 folder. The folder is the synthetic packer's `update(0x0100123456780000, 2, 0)` ExeFS and RomFS,
 written out as `exefs/` and `romfs/` by a small Rust program, and added with nxconvert from the

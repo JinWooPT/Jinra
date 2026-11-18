@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -37,16 +36,49 @@ public:
     /// Write multiple values to the register identified by method.
     virtual void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) = 0;
 
+    /// EXP124 (GpuSplit::MacroWords): a macro's writes of one method in a row, each of which
+    /// went as its own MacroWrite before: each is called as that one was (a last call). An
+    /// engine overrides it where taking them at once ends the same (KeplerCompute's inline
+    /// upload words).
+    virtual void CallMacroWords(Core::System& system, u32 method, const u32* words, u32 amount) {
+        for (u32 i = 0; i < amount; ++i) {
+            CallMethod(system, method, words[i], true);
+        }
+    }
+
     void ConsumeSink(Core::System& system) {
         if (!method_sink.empty()) {
             ConsumeSinkImpl(system);
         }
     }
 
+    /// GpuSplit::PairWrite blocks (EDEN_NX2_RING_PAIRS): writes that only store a register's
+    /// value, word i = method (bits 0-15) and value (bits 32-63), applied in order after the
+    /// method sink. Engines the split sends pairs to apply them as their sink would.
+    virtual void ApplyPairs(Core::System& system, const u64* pairs, u32 count) {
+        for (u32 i = 0; i < count; ++i) {
+            CallMethod(system, static_cast<u32>(pairs[i] & 0xffff),
+                       static_cast<u32>(pairs[i] >> 32), true);
+        }
+    }
+
+    /// In a method_sink entry: a write the GPU thread split's front found only stores the
+    /// register's value although execution_mask has the register (GpuSplit::SinkMethod).
+    /// Methods are 16-bit.
+    static constexpr u32 SplitPlainTag = 1U << 16;
+
     std::bitset<(std::numeric_limits<u16>::max)()> execution_mask{};
+    /// Methods that can write memory in command order (uploads, reports, copies, dispatches):
+    /// the split's front waits for the last one sent before its macros read memory. Draws and
+    /// clears are left out: their writes are visible only after a host-level wait.
+    std::bitset<(std::numeric_limits<u16>::max)()> memory_write_mask =
+        std::bitset<(std::numeric_limits<u16>::max)()>{}.set();
     /// A Maxwell3D whose CallMethod takes its fast path (Nx2Perf): GpuSplit's back calls it
     /// without the virtual call.
     bool fast_maxwell3d{};
+    /// Maxwell3D: its writes report their own delta draw count breaks (nx2_fastdraw_count.h);
+    /// any other engine's method ends reuse as a whole (the original reports_fast_draw_breaks).
+    bool counts_fast_draw_breaks{};
     std::vector<std::pair<u32, u32>> method_sink{};
     GPUVAddr current_dma_segment;
     bool current_dirty{};

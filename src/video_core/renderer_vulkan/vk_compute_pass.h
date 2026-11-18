@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
+#include <array>
 #include <functional>
 #include <optional>
 #include <span>
@@ -34,6 +34,18 @@ class Scheduler;
 class Image;
 struct StagingBufferRef;
 
+/// One run of a buffer conversion pass: what its Prepare took from the staging pool and worked
+/// out, and what its Record needs (the memory stage's Convert entry).
+struct ComputePassRun {
+    VkBuffer src{};
+    VkDeviceSize src_offset{};
+    VkDeviceSize src_size{};
+    VkBuffer dst{};
+    VkDeviceSize dst_offset{};
+    VkDeviceSize dst_size{};
+    std::array<u32, 4> args{};
+};
+
 class ComputePass {
 public:
     explicit ComputePass(const Device& device, Scheduler& scheduler, DescriptorPool& descriptor_pool,
@@ -61,9 +73,10 @@ public:
     VertexRepackPass(const Device& device, Scheduler& scheduler, DescriptorPool& descriptor_pool,
                      StagingBufferPool& staging_pool, ComputePassDescriptorQueue& descriptor_queue);
     /// Returns nothing when the range exceeds the device limits or the source buffer; the binding
-    /// is then left as is.
-    std::optional<std::pair<VkBuffer, VkDeviceSize>> Assemble(VkBuffer source, u32 offset, u32 size,
-                                                              u64 buffer_size);
+    /// is then left as is. The result's dst and dst_offset hold the repacked vertices once
+    /// Record ran.
+    std::optional<ComputePassRun> Prepare(VkBuffer source, u32 offset, u32 size, u64 buffer_size);
+    void Record(const ComputePassRun& run);
 
 private:
     Scheduler& scheduler;
@@ -78,10 +91,10 @@ public:
                        ComputePassDescriptorQueue& compute_pass_descriptor_queue_);
     ~Uint8Pass();
 
-    /// Assemble uint8 indices into an uint16 index buffer
-    /// Returns a pair with the staging buffer, and the offset where the assembled data is
-    std::pair<VkBuffer, VkDeviceSize> Assemble(u32 num_vertices, VkBuffer src_buffer,
-                                               u32 src_offset);
+    /// Assemble uint8 indices into an uint16 index buffer: dst and dst_offset of the result
+    /// hold them once Record ran.
+    ComputePassRun Prepare(u32 num_vertices, VkBuffer src_buffer, u32 src_offset);
+    void Record(const ComputePassRun& run);
 
 private:
     Scheduler& scheduler;
@@ -97,9 +110,10 @@ public:
                              ComputePassDescriptorQueue& compute_pass_descriptor_queue_);
     ~QuadIndexedPass();
 
-    std::pair<VkBuffer, VkDeviceSize> Assemble(
-        Tegra::Engines::Maxwell3D::Regs::IndexFormat index_format, u32 num_vertices,
-        u32 base_vertex, VkBuffer src_buffer, u32 src_offset, bool is_strip);
+    ComputePassRun Prepare(Tegra::Engines::Maxwell3D::Regs::IndexFormat index_format,
+                           u32 num_vertices, u32 base_vertex, VkBuffer src_buffer, u32 src_offset,
+                           bool is_strip);
+    void Record(const ComputePassRun& run);
 
 private:
     Scheduler& scheduler;

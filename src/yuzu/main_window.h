@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <QElapsedTimer>
 #include <QMainWindow>
+#include <QPointer>
 #include <QMessageBox>
 #include <QFutureWatcher>
 #include <QPushButton>
@@ -57,6 +58,7 @@ class MultiplayerState;
 class QPushButton;
 class QProgressDialog;
 class NupProgressDialog;
+class ShaderWarmDialog;
 class NxTools;
 class QSlider;
 class QHBoxLayout;
@@ -68,6 +70,9 @@ class ConfigurePostProcessing;
 enum class GameListOpenTarget;
 enum class DumpRomFSTarget;
 class GameListPlaceholder;
+namespace FritchiiUi {
+class Home;
+}
 
 class QtAmiiboSettingsDialog;
 class QtControllerSelectorDialog;
@@ -76,7 +81,6 @@ class QtSoftwareKeyboardDialog;
 class QtNXWebEngineView;
 
 namespace VideoCore {
-enum class FrameGenState : u8;
 class ShaderNotify;
 }
 namespace Core {
@@ -183,6 +187,11 @@ public:
 
     std::filesystem::path GetShortcutPath(QtCommon::Game::ShortcutTarget target);
 
+    /// What NVIDIA DLSS ran as since the last status bar update, empty when it didn't run
+    [[nodiscard]] const QString& DlssStatusText() const {
+        return dlss_status_text;
+    }
+
 signals:
 
     /**
@@ -222,6 +231,8 @@ signals:
     void SigInterrupt();
     void sizeChanged(const QSize& size);
     void positionChanged(const QPoint& pos);
+    void statsUpdated(const Core::PerfStatsResults& results,
+                      const VideoCore::ShaderNotify& shaders);
 
 public slots:
     void OnLoadComplete();
@@ -359,6 +370,9 @@ private slots:
     void OnGameListDumpRomFS(u64 program_id, const std::string& game_path, DumpRomFSTarget target);
     void OnGameListVerifyIntegrity(const std::string& game_path);
     void OnGameListConvertToNup(const std::string& game_path);
+    void OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path);
+    void OnGameListDeleteShaderWarm(u64 program_id);
+    void OnPrepareShadersNow();
     void OnGameListExtractNup(const std::string& game_path);
     void OnGameListEditNupMetadata(const std::string& game_path);
     void OnGameListCopyTID(u64 program_id);
@@ -375,8 +389,12 @@ private slots:
     void OnMenuInstallToNAND();
     void OnMenuRecentFile();
     void OnConfigure();
-    void OpenDesktopSettings(int category);
-    void OpenHomeSettings(int category);
+    void OpenConfiguration(int category);
+    /// Asks whether Ocarina of Time runs at 60 or 30 FPS (Settings::values.oot_30fps).
+    void AskOotFrameRate();
+    /// Applies the Frizti tuned settings once per revision and undoes other builds' changes to
+    /// them (common/frizti_settings.h).
+    void MigrateFriztiSettings();
     void OnConfigureTas();
     void OnDecreaseVolume();
     void OnIncreaseVolume();
@@ -386,6 +404,7 @@ private slots:
     void OnTasReset();
     void OnToggleGraphicsAPI();
     void OnToggleDockedMode();
+    void OnToggleOotFrameRate();
     void OnToggleGpuAccuracy();
     void OnToggleAdaptingFilter();
     void OnConfigurePerGame();
@@ -395,7 +414,16 @@ private slots:
     void OnOpenSDMCFolder();
     void OnOpenModFolder();
     void OnOpenLogFolder();
-    void OnExportLogs();
+    void OnExportLog();
+    /// A critical error box; Fritchii builds add an "Export Log..." button next to OK.
+    void ShowErrorWithExportLog(const QString& title, const QString& text);
+    /// The Fritchii look (fritchii/main_window_fritchii.cpp); nothing in other builds.
+    void SetUpShaderPreparation();
+    /// Help > Profiling Mode and, while it is on, its banner and status bar label
+    /// (util/profiling_mode).
+    void SetUpProfilingMode();
+    /// Tools > Switches (fritchii/switches_window): the player's nx2_switches.txt.
+    void SetUpSwitchesWindow();
     void OnVerifyInstalledContents();
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();
@@ -445,9 +473,13 @@ private slots:
     void OnEmulationStopped();
     void OnEmulationStopTimeExpired();
     void OnEmulationStopTimeout();
+    /// True while the emulation thread's teardown still makes progress (Common::ShutdownProgress
+    /// moved since the last call), for at most MaxEmuThreadShutdownMs after it was asked to stop.
+    bool EmulationShutdownProgressing();
 
 #ifdef ENABLE_UPDATE_CHECKER
     void OnEmulatorUpdateAvailable();
+    void OnCheckForUpdates();
 #endif
 
 private:
@@ -461,11 +493,18 @@ private:
                            std::string_view gpu_vendor = {});
     void OnApplicationChanged(u64 program_id);
     void UpdateDockedButton();
+    void UpdateOotFpsButton();
+    bool IsOotRunning() const;
+    /// Ocarina of Time running: switches its high refresh rate mode live (Ctrl+U) and returns
+    /// true; otherwise false.
+    bool ToggleOotHighRefresh();
+    /// Switches Ocarina of Time's high refresh rate mode while it runs, saves the setting when it
+    /// worked, and says how it went in the status bar.
+    void SetOotHighRefresh(bool on);
     void UpdateAPIText();
     void UpdateFilterText();
     void UpdateAAText();
     void UpdatePostShaderText();
-    void UpdateFrameGenButton();
     void UpdateVolumeUI();
     void UpdateStatusBar();
     void UpdateGPUAccuracyButton();
@@ -507,8 +546,18 @@ private:
     std::shared_ptr<InputCommon::InputSubsystem> input_subsystem;
 
 #ifdef ENABLE_UPDATE_CHECKER
+    void StartUpdateCheck(bool manual);
+    void OfferPendingUpdate();
+    void ShowUpdate(const UpdateChecker::CheckResult& result);
+    void ShowRestartNote();
+
     QFuture<UpdateChecker::CheckResult> update_future;
     QFutureWatcher<UpdateChecker::CheckResult> update_watcher;
+    bool update_check_manual = false;
+    // An update waiting for the game to stop or for other dialogs to close.
+    std::optional<UpdateChecker::CheckResult> pending_update;
+    // What the process this one replaced reported, such as "Fritchii v5 is installed".
+    QString restart_note;
 #endif
 
     MultiplayerState* multiplayer_state = nullptr;
@@ -520,21 +569,22 @@ private:
     LoadingScreen* loading_screen = nullptr;
     QTimer shutdown_timer;
     QTimer emu_terminate_timer;
+    QElapsedTimer emu_force_stop_clock;
+    u64 shutdown_progress_seen{};
     OverlayDialog* shutdown_dialog{};
-    PerformanceOverlay* perf_overlay = nullptr;
+    QWidget* perf_overlay = nullptr; ///< PerformanceOverlay, or Fritchii's (fritchii/perf_overlay)
 #ifdef HAS_RESHADE
     ConfigurePostProcessing* post_processing_dialog = nullptr;
 #endif
 
     GameListPlaceholder* game_list_placeholder = nullptr;
     JinraHome* jinra_home = nullptr;
-    struct ConfigurationSnapshot;
-    void FinishConfiguration(const ConfigurationSnapshot& previous);
 
     std::vector<VkDeviceInfo::Record> vk_device_records;
 
     // Status bar elements
     QLabel* message_label = nullptr;
+    QLabel* shader_warm_label = nullptr;
     QLabel* shader_building_label = nullptr;
     QLabel* res_scale_label = nullptr;
     QLabel* emu_speed_label = nullptr;
@@ -547,14 +597,12 @@ private:
     QPushButton* renderer_status_button = nullptr;
     QPushButton* refresh_button = nullptr;
     QPushButton* dock_status_button = nullptr;
+    QPushButton* oot_fps_button = nullptr;
     QPushButton* filter_status_button = nullptr;
     QPushButton* aa_status_button = nullptr;
     QPushButton* post_shader_status_button = nullptr;
-    QPushButton* frame_gen_status_button = nullptr;
-    VideoCore::FrameGenState frame_gen_state{};
-    u64 frame_gen_frames = 0;
     u64 dlss_evaluations = 0;
-    bool frame_gen_generating = false;
+    QString dlss_status_text;
     VolumeButton* volume_button = nullptr;
     QWidget* volume_popup = nullptr;
     QSlider* volume_slider = nullptr;
@@ -565,11 +613,11 @@ private:
 
     UserDataMigrator user_data_migrator;
     std::unique_ptr<QtConfig> config;
+    bool launched_with_game = false; ///< Started with a game path (skips the first-launch question)
 
-    // Whether emulation is currently running in yuzu.
+    // Whether emulation is currently running.
     bool emulation_running = false;
     bool boot_in_progress = false;
-    bool shader_sync_active = false;
     bool close_pending = false;
     // The path to the game currently running
     QString current_game_path;
@@ -606,6 +654,9 @@ private:
     QFutureWatcher<FileSys::Nup::PackResult> nup_watcher;
     std::shared_ptr<std::atomic_bool> nup_cancel;
     bool nup_running{};
+    QPointer<ShaderWarmDialog> shader_warm_dialog;
+    QAction* action_prepare_shaders_now = nullptr;
+    QPointer<QProgressDialog> shader_warm_run_dialog;
     NxTools* nx_tools = nullptr;
     bool nx_metadata_write_in_progress = false;
     std::string nup_source_path;

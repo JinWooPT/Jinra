@@ -1,18 +1,22 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <optional>
+#include <vector>
 #include <boost/container/deque.hpp>
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
+#include "video_core/renderer_vulkan/vk_host_pacer.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -32,12 +36,12 @@ struct Frame {
     u32 index;
     vk::Image image;
     vk::ImageView image_view;
-    vk::ImageView storage_view;
     vk::Framebuffer framebuffer;
     vk::CommandBuffer cmdbuf;
     vk::Semaphore render_ready;
     vk::Fence present_done;
-    bool storage_capable{};
+    u64 render_tick{};                               ///< Scheduler tick that renders the frame
+    std::chrono::steady_clock::time_point queued_at; ///< When it reached the present queue
 };
 
 class PresentManager {
@@ -59,21 +63,31 @@ public:
 
     /// Recreates the present frame to match the provided parameters
     void RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat image_view_format,
-                       VkRenderPass rd, bool storage);
-
-    [[nodiscard]] bool NeedsStorage(const Frame* frame, bool required) const;
+                       VkRenderPass rd);
 
     /// Waits for the present thread to finish presenting all queued frames.
     void WaitPresent();
 
-    /// How many additional frames can be queued without stalling the render thread
-    [[nodiscard]] size_t MaxExtraFrames() const;
-
     [[nodiscard]] std::size_t SwapchainImageCount() const { return swapchain_image_count; }
-    [[nodiscard]] VkFormat SwapchainImageFormat() const { return swapchain_image_format; }
 
 private:
     void PresentThread(std::stop_token token);
+
+    /// Host frame pacer (vk_host_pacer.h): collects when earlier frames were shown and holds
+    /// `frame` until its target (FRITCHII_PACE_FIX 2: leaves the hold to CopyToSwapchainImpl).
+    /// Returns whether it was held.
+    bool PaceFrame(Frame* frame, std::stop_token token);
+
+    /// Without present wait (no pacing): still reads the display's refresh rate now and then,
+    /// for Ocarina of Time's "Monitor refresh rate" cap (it fell back to 60 Hz).
+    void NoteDisplayRefresh();
+
+    /// Waits for each present id until it is shown (VK_KHR_present_wait).
+    void PresentWaitThread(std::stop_token token);
+
+    void ReportShown(u64 id, std::chrono::steady_clock::time_point shown, bool lost);
+
+    void DrainShown();
 
     void CopyToSwapchain(Frame* frame);
 
@@ -104,11 +118,38 @@ private:
     std::mutex free_mutex;
     std::jthread present_thread;
     bool blit_supported;
-    bool storage_supported;
     bool use_present_thread;
     std::atomic<std::size_t> image_count{};
     std::atomic<std::size_t> swapchain_image_count{};
-    std::atomic<VkFormat> swapchain_image_format{};
+
+    // Host frame pacer, used when the device supports VK_KHR_present_wait (present thread only).
+    struct PendingWait {
+        u64 id;
+        VkSwapchainKHR swapchain;
+        std::chrono::steady_clock::time_point submitted;
+    };
+    struct ShownReport {
+        u64 id;
+        std::chrono::steady_clock::time_point shown;
+        bool lost;
+    };
+    bool present_wait_enabled{};
+    HostPacer pacer;
+    /// FRITCHII_PACE_FIX 2: PaceFrame's hold, taken in CopyToSwapchainImpl before the present.
+    struct DeferredHold {
+        std::chrono::steady_clock::time_point start;
+        std::chrono::steady_clock::time_point target;
+    };
+    std::optional<DeferredHold> deferred_hold;
+    u64 last_present_id{};
+    std::mutex present_wait_mutex; ///< Held while waiting on a swapchain; recreation takes it
+    std::mutex wait_queue_mutex;
+    std::condition_variable_any wait_queue_cv;
+    std::deque<PendingWait> wait_queue;
+    std::mutex shown_mutex;
+    std::condition_variable shown_cv;
+    std::vector<ShownReport> shown_reports;
+    std::jthread present_wait_thread;
 };
 
 } // namespace Vulkan

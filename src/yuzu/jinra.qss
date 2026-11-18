@@ -57,7 +57,7 @@ QToolButton#JinraHomeTool, QToolButton#JinraHomeRound, QToolButton#JinraHomeRoun
     background: #141e30; border: 1px solid #283a54; margin: 0; padding: 0;
 }
 QToolButton#JinraHomeTool { border-radius: 17px; }
-QToolButton#JinraHomeRound, QToolButton#JinraHomeRoundPrimary { border-radius: 39px; }
+QToolButton#JinraHomeRound, QToolButton#JinraHomeRoundPrimary { border-radius: 23px; }
 QToolButton#JinraHomeRoundPrimary { background: #087fe5; border-color: #278dff; }
 QToolButton#JinraHomeTool:hover, QToolButton#JinraHomeRound:hover { background: #192f49; }
 QToolButton#JinraHomeRoundPrimary:hover, QToolButton#JinraHomeTool:checked { background: #124b7d; }
@@ -65,8 +65,9 @@ QToolButton#JinraHomeTool:focus, QToolButton#JinraHomeRound:focus,
 QToolButton#JinraHomeRoundPrimary:focus, QPushButton#JinraHomePill:focus { border-color: #35d9ed; }
 QToolButton#JinraHomeRound:disabled { background: #10182a; border-color: #1b2a41; }
 QPushButton#JinraHomePill { background: #141e30; border: 1px solid #354863; border-image: none; border-radius: 20px; padding: 7px 15px; min-height: 24px; font-size: 11pt; }
-QPushButton#JinraHomePill[primary="true"] { background: #087fe5; border-color: #278dff; color: white; font-weight: 600; }
+QPushButton#JinraHomePill[primary="true"] { background: #35d9ed; border-color: #35d9ed; color: #091721; font-weight: 700; }
 QPushButton#JinraHomePill:hover { background: #124b7d; }
+QPushButton#JinraHomePill[primary="true"]:hover { background: #79ecf7; }
 QPushButton#JinraHomePill:disabled, QPushButton#JinraHomePill[primary="true"]:disabled { background: #121c2c; color: #61748e; border-color: #273449; }
 QStatusBar::item { border: none; background: transparent; }
 QStatusBar QPushButton { min-height: 16px; max-height: 18px; padding: 2px 9px; font-size: 8pt; border: none; border-radius: 3px; background: transparent; }
@@ -147,5 +148,9 @@ QLabel#JinraAvatarPreview { background: #141e30; border: 1px solid #283a54; bord
 QListWidget#JinraAvatarCards { background: #0e1728; border: 1px solid #283a54; border-radius: 14px; padding: 8px; }
 QListWidget#JinraAvatarCards::item { background: #17243a; border: 1px solid #283a54; border-radius: 12px; color: #e6edf7; padding: 3px; }
 QListWidget#JinraAvatarCards::item:selected { background: #183953; border: 2px solid #35d9ed; }
-QListView#JinraHomeCarousel, QListView#JinraHomeCarousel::item { background: #0b1020; border: none; outline: none; }
-QLabel#JinraHomeDockLabel { color: #a9bbd3; font-size: 10pt; }
+QWidget#JinraHomeHeader, QWidget#JinraHomeFooter, QWidget#JinraHomeFeature,
+QWidget#JinraHomeGames, QWidget#JinraHomeCarouselViewport,
+QListView#JinraHomeCarousel, QListView#JinraHomeCarousel::item {
+    background: transparent; border: none; outline: none;
+}
+QLabel#JinraHomeDockLabel { color: #a9bbd3; font-size: 9pt; }

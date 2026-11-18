@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2019 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 # generate git/build information
@@ -14,11 +13,11 @@ endfunction()
 
 get_timestamp(BUILD_DATE)
 
-get_filename_component(jinra_version_file "${CMAKE_CURRENT_LIST_DIR}/../VERSION" ABSOLUTE)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${jinra_version_file}")
+set(jinra_version_file "${CMAKE_SOURCE_DIR}/VERSION")
 file(STRINGS "${jinra_version_file}" BUILD_VERSION LIMIT_COUNT 1)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${jinra_version_file}")
 
-if (JINRA_BUILD_TAG MATCHES "^build-[0-9]+$")
+if (LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")
     set(IS_DEV_BUILD false)
 elseif (DEFINED GIT_RELEASE)
     set(GIT_REFSPEC "${GIT_RELEASE}")
@@ -33,21 +32,22 @@ else()
     set(IS_NIGHTLY_BUILD false)
 endif()
 
-set(GIT_DESC ${BUILD_VERSION})
+string(SUBSTRING "${GIT_COMMIT}" 0 10 GIT_DESC)
 
 # Generate cpp with Git revision from template
 
-set(BUILD_AUTO_UPDATE_STABLE_REPO "")
-set(BUILD_AUTO_UPDATE_STABLE_API "")
-set(BUILD_AUTO_UPDATE_API_PATH "")
-set(BUILD_AUTO_UPDATE_WEBSITE "")
-set(BUILD_AUTO_UPDATE_REPO "")
+set(BUILD_AUTO_UPDATE_STABLE_REPO "JinWooPT/Jinra")
+set(BUILD_AUTO_UPDATE_STABLE_API "api.github.com")
+set(BUILD_AUTO_UPDATE_API_PATH "/repos/JinWooPT/Jinra/releases?per_page=100")
+set(BUILD_AUTO_UPDATE_WEBSITE "https://github.com")
+set(BUILD_AUTO_UPDATE_REPO "JinWooPT/Jinra")
 if (NIGHTLY_BUILD)
     set(REPO_NAME "Jinra Nightly")
 else()
     set(REPO_NAME "Jinra")
 endif()
 
+set(BUILD_LABEL "${BUILD_VERSION}")
 set(BUILD_ID ${GIT_REFSPEC})
 set(BUILD_FULLNAME "${REPO_NAME} ${BUILD_VERSION} ")
 set(CXX_COMPILER "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")

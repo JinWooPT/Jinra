@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -187,9 +186,6 @@ public:
      * @return FileType corresponding to the loaded file
      */
     virtual FileType GetFileType() const = 0;
-    virtual std::optional<u32> GetContentVersion() const {
-        return std::nullopt;
-    }
 
     /**
      * Load the application and return the created Process instance

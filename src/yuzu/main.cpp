@@ -1,17 +1,28 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+#include <fmt/format.h>
+
+#include "common/scm_rev.h"
+
 #include <QApplication>
+#include <QMessageBox>
+#include <cstdlib>
+#include <exception>
 
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
-#include "nx2_switches.h"
+#include "common/shutdown_watch.h"
 #include "startup_checks.h"
 
-#if YUZU_ROOM
-#include <cstring>
-#include "dedicated_room/yuzu_room.h"
-#endif
 #ifdef __unix__
 #include "qt_common/gui_settings.h"
 #endif
@@ -27,6 +38,11 @@
 #endif
 
 #include "main_window.h"
+#include "fritchii/switches_window.h"
+#include "util/profiling_mode.h"
+#ifdef ENABLE_UPDATE_CHECKER
+#include "updater/update_dialog.h"
+#endif
 
 #ifdef _WIN32
 #include <QScreen>
@@ -81,22 +97,316 @@ static Qt::HighDpiScaleFactorRoundingPolicy GetHighDpiRoundingPolicy() {
 #endif
 }
 
-int main(int argc, char* argv[]) {
-    LoadNx2Switches(argv[0]);
-#if YUZU_ROOM
-    bool launch_room = false;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--room") == 0) {
-            launch_room = true;
+// The NX2 switches are read from the environment (EDEN_NX2_*), which a GUI launch has no way to
+// set. nx2_switches.txt holds "NAME=VALUE" lines, one per line, '#' comments. A variable already
+// in the real environment always wins, so a launcher script can still override one run; between
+// files the later one wins, so the copy next to the executable (shipped with the build) can be
+// overridden by %APPDATA%\fritchii\nx2_switches.txt without editing the one that gets replaced.
+static void ParseSwitchFile(const std::filesystem::path& path,
+                            std::map<std::string, std::string>& entries) {
+    std::ifstream file{path};
+    if (!file) {
+        return;
+    }
+    constexpr const char* blank = " \t\r";
+    std::string line;
+    while (std::getline(file, line)) {
+        line.erase(0, line.find_first_not_of(blank));
+        line.erase(line.find_last_not_of(blank) + 1);
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        std::string name = line.substr(0, eq);
+        std::string value = line.substr(eq + 1);
+        name.erase(name.find_last_not_of(blank) + 1);
+        value.erase(0, value.find_first_not_of(blank));
+        if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+            value = value.substr(1, value.size() - 2);
+        }
+        if (!name.empty()) {
+            entries.insert_or_assign(std::move(name), std::move(value));
+        }
+    }
+}
+
+static std::filesystem::path GetSwitchExeDirectory(const char* argv0) {
+#ifdef _WIN32
+    return Common::FS::GetExeDirectory();
+#else
+    std::error_code ec;
+#ifdef __linux__
+    if (auto exe = std::filesystem::read_symlink("/proc/self/exe", ec); !ec) {
+        return exe.parent_path();
+    }
+#endif
+    const auto exe = std::filesystem::absolute(argv0, ec);
+    return ec ? std::filesystem::path{} : exe.parent_path();
+#endif
+}
+
+// Built into the Frizti builds so players don't have to set anything: the switches tuned for
+// Ocarina of Time. Either nx2_switches.txt overrides any of them (=0 turns one off).
+// Not EDEN_NX2_WRITTEN_SSBO_MARK_KIB=64 (built in from v4 to v5.5): writes past its cap were not
+// tracked, one of the gaps behind the huge glowing triangles (the other: native compute write
+// extents, see BufferCache::ExtentTrust). Castle Town: 43.4/45.0 fps with it, 44.6/43.0 without;
+// the triangles still showed without it alone (2026-11-09).
+constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
+    {"EDEN_NX2_GRAPHICS_SSBO_BARE", "0"},
+    {"EDEN_NX2_ACQUIRE_PRECHECK", "2"},   {"EDEN_NX2_MACRO_SINK", "1"},
+    {"EDEN_NX2_COMPUTE_SINK", "1"},       {"EDEN_NX2_RING_PAIRS", "1"},
+    {"EDEN_NX2_UBO_INPLACE", "1"},        {"EDEN_NX2_PIPELINE_CLEAN", "1"},
+    {"EDEN_NX2_LIST_WAIT_SKIP", "1"},     {"EDEN_NX2_PREFLUSH", "1"},
+    {"EDEN_NX2_SEM_FAST", "2"},
+    // No 40 MB/s pacing of game file reads (the original code's fix for video freezes in other games):
+    // OoT's videos play fine without it and it slept the game at loads and kills (2026-11-10).
+    {"EDEN_NX2_READ_THROTTLE", "0"},
+    // The texture cache collects from 7.5 GiB at most (a ceiling: smaller cards keep their own
+    // thresholds). Owner's call for v5.7 after the 2026-11-10 playtests (VRAM 10 -> ~6 GB, more
+    // RAM free, no new stutter).
+    {"EDEN_NX2_TC_CEILING_MIB", "7680"},
+    // Idle CPU cores compile ahead the game code another core compiled (each of OoT's 6 cores
+    // has its own recompiler). Owner's call for v5.7 after the 2026-11-10 playtests: Kakariko
+    // felt much better; repeat compiles after reloads 294 -> 8 ms in the night tests.
+    {"EDEN_NX2_JIT_WARM", "1"},
+    // The GPU thread waits for suspended channels in a wait a latch or a new command ends,
+    // instead of 1 ms sleeps. Built in with EXP12 = 4 (2026-11-14, owner's call): without it a
+    // latched resume could sit out a sleep and mode 4 lost 0.5 fps at the market.
+    {"EDEN_NX2_GPU_WAKE", "1"},
+    // 2026-11-14 (autopilot; owner: v6 gets every exact win): the keepers, each exact by its
+    // verify mode, toggled together at the market in one session: 62.7 -> 64.1 fps, 1% low 44.4 ->
+    // 45.5, 0.1% low 37.7 -> 40.4, the back 7.27 -> 6.99 us a draw (V6_PLAN.md, V6_GOALS.md).
+    // Each stays live: =0 in nx2_switches.txt turns it off.
+    {"FRITCHII_GATHER_ONE_LOCK", "1"},    {"FRITCHII_GATHER_EMPTY_TEST", "1"},
+    {"FRITCHII_FENCE_COMMIT_FAST", "1"},  {"FRITCHII_FRONT_RAN_READS", "1"},
+    {"FRITCHII_VERTEX_INPUT_COMPACT", "1"}, {"FRITCHII_BIND_ADDR_MEMO", "1"},
+    {"FRITCHII_WORKER_SPIN", "20"},       {"FRITCHII_CB_WORDS_BLOCK", "1"},
+    // 2026-11-14: uniform bank pages nobody flagged as written are not compared again. Market
+    // toggle 61.3 -> 62.5 fps, 1% low 43.5 -> 45.5, 0.1% low 32.8 -> 37.4; FLAGGED=2 verify: never
+    // flagged, recheck and CPU-modified 0 in all 29 windows (the other counts are timed races).
+    {"FRITCHII_BANK_FLAGGED", "1"},
+    // v6.0 (owner's release order 2026-11-18: bake the switch set into the defaults): the set
+    // every v6 test, PGO training and tester build 1-9 ran with, so a player with no
+    // nx2_switches.txt gets exactly the tested build. Values as tested; each stays live or
+    // overridable in nx2_switches.txt (=0 turns one off). Linux gets the set its test builds ran.
+    {"EDEN_NX2_SPLIT", "2"},              {"EDEN_NX2_FENCE_BATCH", "1"},
+    // Recompiler
+    {"FRITCHII_JIT_INDIRECT_CACHE", "2"}, {"FRITCHII_JIT_RSQRT_ZERO", "2"},
+    {"FRITCHII_JIT_NO_FRAME_POINTER", "1"}, {"FRITCHII_JIT_FLAG_BRANCH", "2"},
+    {"FRITCHII_JIT_FAR_CODE", "1"},       {"FRITCHII_JIT_CHAIN", "6"},
+    {"FRITCHII_JIT_BLOCK_LIST", "1"},     {"FRITCHII_JIT_INLINE_CNTPCT", "1"},
+    {"FRITCHII_JIT_STATE_REFS", "1"},     {"FRITCHII_JIT_SHARED", "1"},
+    {"FRITCHII_STORE_MEMO", "2"},
+    // GPU front and back
+    {"EDEN_NX2_EXP37", "1"},              {"EDEN_NX2_EXP103", "64"},
+    {"EDEN_NX2_EXP123", "3"},             {"EDEN_NX2_LIGHT_TABLE_ARRAYS", "1"},
+    {"FRITCHII_MEMSTAGE_TICKS", "1"},     {"FRITCHII_STAMP_READ_PAGES", "2"},
+    {"FRITCHII_LIST_COPY_SKIP", "1"},     {"FRITCHII_DISPATCH_WALK_SUMMARY", "1"},
+    {"FRITCHII_FRONT_CALL_LEAN", "1"},    {"FRITCHII_FRONT_LIST_LANE", "3"},
+    {"FRITCHII_NOTED_FAST", "1"},         {"FRITCHII_FRONT_TRIM_RANGE", "1"},
+    {"FRITCHII_FRONT_TRIM_QMD", "1"},     {"FRITCHII_FRONT_ASYNC_TABLE", "1"},
+    {"FRITCHII_DEPTH_POOL_BIG", "1"},     {"FRITCHII_RAM_GPU_ENTRIES", "1"},
+    {"FRITCHII_SMALL_CARD", "2"},         {"FRITCHII_READ_SIDE_COPY", "3"},
+    {"FRITCHII_GPU_SIBLINGS_FREE", "1"},  {"FRITCHII_PACE_FIX", "3"},
+    // One follower (E/R GPU threads)
+    {"FRITCHII_ONEF_LEAN", "1"},          {"FRITCHII_ONEF_AHEAD", "0"},
+    {"FRITCHII_ONEF_POSTED", "1"},        {"FRITCHII_ONEF_COPY_E", "1"},
+    {"FRITCHII_ONEF_UNLEND", "55"},       {"FRITCHII_ONEF_GATHER_E", "1"},
+    {"FRITCHII_ONEF_OP_CLEAR", "1"},      {"FRITCHII_ONEF_OP_INVAL", "1"},
+    {"FRITCHII_ONEF_POST_FENCE", "1"},    {"FRITCHII_ONEF_FLUSH_E", "1"},
+    {"FRITCHII_ONEF_OP_DMA", "1"},        {"FRITCHII_ONEF_OP_LISTKEEP", "1"},
+    {"FRITCHII_ONEF_SEM_E", "1"},         {"FRITCHII_ONEF_UNLENT_RESET", "1"},
+    {"FRITCHII_ONEF_UNLENT_VALUES", "1"}, {"FRITCHII_ONEF_BIND_SEED", "1"},
+    {"FRITCHII_ONEF_OP_DISPATCH", "7"},   {"FRITCHII_ONEF_UNION_FILTER", "1"},
+    {"FRITCHII_ONEF_SOFT_RELEASE_E", "1"}, {"FRITCHII_ONEF_POST_FENCE_REPORT", "1"},
+    {"FRITCHII_ONEF_CARRY_OPS", "1"},     {"FRITCHII_ONEF_KEY_KEEP", "2"},
+    {"FRITCHII_ONEF_CB_LEAN", "3"},       {"FRITCHII_ONEF_DISPATCH_RANGES", "1"},
+    {"FRITCHII_ONEF_POST_IDLE", "2"},     {"FRITCHII_ONEF_RAISE_AFTER_LEND", "1"},
+    // zortos293/Lichii #2104 (owner 2026-11-18: keep zortos's proven stutter fixes even where
+    // our tests show no difference): a native dispatch whose compute pipeline isn't built yet is
+    // skipped for that frame when its guards prove nothing reads the output. Works only while a
+    // pipeline builds (no cost with warm caches); cold A/B 11-18: 0 skipped, must-be-0 counts 0.
+    {"FRITCHII_ASYNC_COMPUTE_SKIP", "1"},
+#ifdef _WIN32
+    // Tested on Windows only (the Linux test builds ran without them).
+    {"FRITCHII_JIT_PIN", "1"},            {"FRITCHII_JIT_PIN_REGS", "x8,x0"},
+    {"FRITCHII_ONEF_PIN", "2"},           {"FRITCHII_GPU_PRIORITY", "2"},
+    {"FRITCHII_ZERO_TRIM_BATCH", "1"},    {"FRITCHII_ZERO_TRIM_CHUNK", "1"},
+    {"FRITCHII_ZERO_UPLOAD", "1"},        {"FRITCHII_REPORT_WAIT", "1"},
+    {"FRITCHII_FENCE_COPY_UNLOCKED", "1"},
+#endif
+};
+
+#ifndef _WIN32
+extern char** environ;
+#endif
+
+// Every test switch this launch runs with and where it came from, logged at each game start
+// ("Test switches:", main_window.cpp) so a stale one left in a file or a launcher's environment
+// can't skew a test unseen.
+static std::string g_switch_summary;
+// The same, one entry per source: source name, "A=1, B=2" (Tools > Switches).
+static std::vector<std::pair<std::string, std::string>> g_switch_groups;
+
+std::string Nx2SwitchSummary() {
+    return g_switch_summary;
+}
+
+std::vector<std::pair<std::string, std::string>> Nx2SwitchGroups() {
+    return g_switch_groups;
+}
+
+static bool IsTestSwitch(std::string_view name) {
+    return name.starts_with("FRITCHII_") || name.starts_with("EDEN_NX2_") ||
+           name.starts_with("LICHII_");
+}
+
+bool Nx2IsTestSwitch(std::string_view name) {
+    return IsTestSwitch(name);
+}
+
+// The player's switch file, in Fritchii's data folder: the one Tools > Switches writes.
+std::filesystem::path Nx2UserSwitchFile() {
+#ifdef _WIN32
+    const auto app_data = Common::FS::GetAppDataRoamingDirectory();
+#else
+    const auto app_data = Common::FS::GetDataDirectory("XDG_CONFIG_HOME");
+#endif
+    return app_data / EDEN_DIR / "nx2_switches.txt";
+}
+
+// Before the first launch's import has copied it, the player's file is still in the old folder
+// (Fritchii v5.8 moved from eden to fritchii): read, never written.
+std::filesystem::path Nx2LegacyUserSwitchFile() {
+    return Nx2UserSwitchFile().parent_path().parent_path() / EDEN_LEGACY_DIR / "nx2_switches.txt";
+}
+
+static void LoadNx2Switches(const char* argv0) {
+    // The test switches already in the real environment (a launcher script's), before the files
+    // add theirs.
+    std::map<std::string, std::string> from_environment;
+#ifdef _WIN32
+    char** const environment = _environ;
+#else
+    char** const environment = environ;
+#endif
+    for (char** it = environment; it != nullptr && *it != nullptr; ++it) {
+        const std::string_view entry{*it};
+        const auto eq = entry.find('=');
+        if (eq != std::string_view::npos && IsTestSwitch(entry.substr(0, eq))) {
+            from_environment.emplace(entry.substr(0, eq), entry.substr(eq + 1));
         }
     }
 
-    if (launch_room) {
-        LaunchRoom(argc, argv, true);
-        return 0;
+    // Later files overwrite earlier entries; the real environment is checked only at the end.
+    std::map<std::string, std::string> entries;
+    std::map<std::string, int> origin; // index into the source names below
+    const auto take = [&](std::map<std::string, std::string>&& file, int source) {
+        for (auto& [name, value] : file) {
+            origin.insert_or_assign(name, source);
+            entries.insert_or_assign(name, std::move(value));
+        }
+    };
+    for (const auto& [name, value] : BuiltinSwitches) {
+        entries.emplace(name, value);
+        origin.emplace(name, 3);
     }
-#endif
+    if (const auto exe_dir = GetSwitchExeDirectory(argv0); !exe_dir.empty()) {
+        std::map<std::string, std::string> file;
+        ParseSwitchFile(exe_dir / "nx2_switches.txt", file);
+        take(std::move(file), 2);
+    }
+    auto user_file = Nx2UserSwitchFile();
+    if (!std::filesystem::exists(user_file)) {
+        user_file = Nx2LegacyUserSwitchFile();
+    }
+    {
+        std::map<std::string, std::string> file;
+        ParseSwitchFile(user_file, file);
+        take(std::move(file), 1);
+    }
 
+    // Profiling mode (Help > Profiling Mode): its switches fill in what the files and the
+    // environment leave unset; they beat only a built-in value.
+    std::string profiling_applied;
+    if (ProfilingMode::OnAtLaunch()) {
+        for (const auto& [name, value] : ProfilingMode::Switches()) {
+            const auto it = origin.find(name);
+            if ((it == origin.end() || it->second == 3) && !from_environment.contains(name)) {
+                entries.insert_or_assign(name, value);
+                origin.insert_or_assign(name, 4);
+                profiling_applied +=
+                    fmt::format("{}{}={}", profiling_applied.empty() ? "" : ", ", name, value);
+            }
+        }
+    }
+    ProfilingMode::SetApplied(std::move(profiling_applied));
+
+    // "environment: A=1; user nx2_switches.txt: B=2; nx2_switches.txt next to the exe: C=1;
+    // built in: D=1, E=0; profiling mode: F=1". Anything else under these prefixes (a typo, a
+    // retired name) shows too, so it can be spotted.
+    constexpr const char* SourceNames[] = {"environment", "user nx2_switches.txt",
+                                           "nx2_switches.txt next to the exe", "built in",
+                                           "profiling mode"};
+    std::vector<std::string> groups(std::size(SourceNames));
+    const auto add = [&groups](int source, const std::string& name, const std::string& value) {
+        groups[source] += fmt::format("{}{}={}", groups[source].empty() ? "" : ", ", name, value);
+    };
+    for (const auto& [name, value] : from_environment) {
+        add(0, name, value);
+    }
+    for (const auto& [name, value] : entries) {
+        if (!from_environment.contains(name)) {
+            add(origin[name], name, value);
+        }
+    }
+    g_switch_summary.clear();
+    g_switch_groups.clear();
+    for (size_t i = 0; i < groups.size(); ++i) {
+        if (!groups[i].empty()) {
+            g_switch_summary += fmt::format("{}{}: {}", g_switch_summary.empty() ? "" : "; ",
+                                            SourceNames[i], groups[i]);
+            g_switch_groups.emplace_back(SourceNames[i], groups[i]);
+        }
+    }
+
+    for (const auto& [name, value] : entries) {
+        if (std::getenv(name.c_str()) != nullptr) {
+            continue;
+        }
+#ifdef _WIN32
+        _putenv_s(name.c_str(), value.c_str());
+#else
+        setenv(name.c_str(), value.c_str(), 1);
+#endif
+    }
+}
+
+int main(int argc, char* argv[]) {
+#ifdef ENABLE_UPDATE_CHECKER
+    // Before the switches are added to the environment, which a restart must not inherit.
+    Updater::PrepareLaunch();
+#endif
+    // Profiling mode's saved setting and the clean environment for its restart, before the
+    // switches are added.
+    ProfilingMode::ReadAtLaunch();
+    LoadNx2Switches(argv[0]);
+    // Fritchii: NVIDIA's driver shader cache must hold OoT's ~120,000 prepared pipelines. Its size
+    // is a Control Panel setting newer drivers no longer show ("Shader Cache Size"); the driver
+    // also reads these variables, for this process only (nothing system-wide changes). A value
+    // already set (the player's, or nx2_switches.txt) wins. Every Fritchii build, the classic UI
+    // (FRITCHII_CLASSIC_UI=1) included: the cache is about the game, not the interface.
+    if (std::string_view{Common::g_build_name} == "Jinra") {
+        if (!qEnvironmentVariableIsSet("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP")) {
+            qputenv("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1");
+        }
+        if (!qEnvironmentVariableIsSet("__GL_SHADER_DISK_CACHE_SIZE")) {
+            qputenv("__GL_SHADER_DISK_CACHE_SIZE", "10737418240"); // 10 GiB
+        }
+    }
     bool has_broken_vulkan = false;
     bool is_child = false;
     if (CheckEnvVars(&is_child)) {
@@ -169,8 +479,7 @@ int main(int argc, char* argv[]) {
     QGuiApplication::setDesktopFileName(QStringLiteral("io.github.JinWooPT.jinra"));
 #endif
 
-    auto rounding_policy = GetHighDpiRoundingPolicy();
-    QApplication::setHighDpiScaleFactorRoundingPolicy(rounding_policy);
+    QApplication::setHighDpiScaleFactorRoundingPolicy(GetHighDpiRoundingPolicy());
 
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
     // Disables the "?" button on all dialogs. Disabled by default on Qt6.
@@ -183,6 +492,16 @@ int main(int argc, char* argv[]) {
 #ifdef _WIN32
     QApplication::setStyle(QStringLiteral("windowsvista"));
 #endif
+
+    // Shutdown watch steps of the process exit (common/shutdown_watch.h), named as each object
+    // below goes: this one after the QApplication.
+    struct ExitStep {
+        const char* name;
+        ~ExitStep() {
+            Common::ShutdownWatch::Exiting(name);
+        }
+    };
+    const ExitStep after_app{"QApplication destroyed: static destructors, then the process exit"};
 
     QApplication app(argc, argv);
 
@@ -205,10 +524,16 @@ int main(int argc, char* argv[]) {
     // generating shaders
     setlocale(LC_ALL, "C");
 
-    MainWindow main_window{has_broken_vulkan};
-    // After settings have been loaded by GMainWindow, apply the filter
-    main_window.show();
-
-    app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window, &MainWindow::OnAppFocusStateChanged);
-    return app.exec();
+    try {
+        const ExitStep after_window{"main window destroyed: QApplication destructor (thread pool)"};
+        MainWindow main_window{has_broken_vulkan};
+        main_window.show();
+        app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window,
+                    &MainWindow::OnAppFocusStateChanged);
+        return app.exec();
+    } catch (const std::exception& exception) {
+        QMessageBox::critical(nullptr, QObject::tr("Jinra startup stopped"),
+                              QString::fromUtf8(exception.what()));
+        return EXIT_FAILURE;
+    }
 }

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #version 450
@@ -1095,19 +1094,22 @@ int FindLayout(uint mode) {
 }
 
 
-ivec2 output_extent;
-bool partial_block;
+// The image's size: a block at the right or bottom edge of an image whose size isn't a multiple
+// of the block size reaches past it. Storing those texels anyway is undefined; on AMD they landed
+// in other images' memory (black blocks and a crosshatch in Ocarina of Time on an RX 6750 XT, and
+// at last a GPU fault on an invalid write), where NVIDIA dropped them.
+ivec3 image_extent;
 
-void StoreTexel(ivec3 coord, vec4 value) {
-    if (!partial_block || all(lessThan(coord.xy, output_extent))) {
-        imageStore(dest_image, coord, value);
+void StoreTexel(ivec3 texel, vec4 value) {
+    if (all(lessThan(texel.xy, image_extent.xy))) {
+        imageStore(dest_image, texel, value);
     }
 }
 
 void FillError(ivec3 coord) {
     for (uint j = 0; j < block_dims.y; j++) {
         for (uint i = 0; i < block_dims.x; i++) {
-            StoreTexel(coord + ivec3(i, j, 0), vec4(0.0));
+            StoreTexel(coord + ivec3(i, j, 0), vec4(0.0, 0.0, 0.0, 0.0));
         }
     }
 }
@@ -1430,12 +1432,10 @@ void main() {
     offset += swizzle;
 
     const ivec3 coord = ivec3(gl_GlobalInvocationID * uvec3(block_dims, 1));
-    const ivec3 extent = imageSize(dest_image);
-    if (any(greaterThanEqual(coord, extent))) {
+    image_extent = imageSize(dest_image);
+    if (any(greaterThanEqual(coord, image_extent))) {
         return;
     }
-    output_extent = extent.xy;
-    partial_block = any(greaterThan(coord.xy + ivec2(block_dims), output_extent));
     local_buff = astc_data[offset / 16];
     DecompressBlock(coord);
 }

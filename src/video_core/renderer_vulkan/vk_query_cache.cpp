@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cstddef>
 #include <limits>
 #include <map>
@@ -13,17 +15,22 @@
 #include "common/container/unordered_map.h"
 #include <utility>
 #include <vector>
+#include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/memory_stage_link.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_cache.h"
+#include "video_core/rasterizer_download_area.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
+#include "video_core/one_follower.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -179,7 +186,7 @@ public:
 
         scheduler.Record([query_pool = current_query_pool,
                                  query_index = current_bank_slot](vk::CommandBuffer cmdbuf) {
-            const bool use_precise = Settings::IsGPULevelHigh();
+            const bool use_precise = VideoCore::Nx2Debug::AccuratePart(2);
             cmdbuf.BeginQuery(query_pool, static_cast<u32>(query_index),
                               use_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
         });
@@ -200,15 +207,25 @@ public:
     }
 
     void ResetCounter() override {
+        ResetCounterImpl(true);
+    }
+
+    bool ResetCounterWithoutOperation() override {
+        ResetCounterImpl(false);
+        return true;
+    }
+
+    /// `queue_amend_reset` false (EXP119): the caller queues ResetAmend in a report run, at the
+    /// place this operation would have taken.
+    void ResetCounterImpl(bool queue_amend_reset) {
         if (has_started) {
             PauseCounter();
         }
         AbandonCurrentQuery();
-        std::function<void()> func([this] {
-            amend_value = 0;
-            accumulation_value = 0;
-        });
-        rasterizer->SyncOperation(std::move(func));
+        if (queue_amend_reset) {
+            std::function<void()> func([this] { ResetAmend(); });
+            rasterizer->SyncOperation(std::move(func));
+        }
         accumulation_since_last_sync = false;
         first_accumulation_checkpoint = (std::min)(first_accumulation_checkpoint, num_slots_used);
         last_accumulation_checkpoint = (std::max)(last_accumulation_checkpoint, num_slots_used);
@@ -222,15 +239,22 @@ public:
         // submission and render pass, and the query keeps every bank it touches alive. Ocarina of
         // Time's title screen and file select reached 16,384 slots over 64 banks (its gameplay
         // windows span at most 36 slots). Past a bank, drop the count as a reset would.
-        if (current_query && current_query->size_slots > SamplesQueryBank::BANK_SIZE) {
-            // It drops a real count. Logged on the 1st, 2nd, 4th, 8th... drop, so a window this
-            // long during gameplay doesn't go unnoticed and a title screen doesn't flood the log.
-            ++bank_bound_resets;
-            if ((bank_bound_resets & (bank_bound_resets - 1)) == 0) {
-                LOG_WARNING(Render_Vulkan,
-                            "Samples query ran {} slots with no reset or report, dropped its "
-                            "count (drop {})",
-                            current_query->size_slots, bank_bound_resets);
+        // EDEN_NX2_EXP16=<slots> raises the limit (ported, for Ocarina's
+        // flickering water and windows; 16,384 hung AMD with the split GPU thread). Resets are
+        // logged every 5 s while they happen.
+        const int limit_setting = VideoCore::Nx2Debug::Experiment(16);
+        const size_t limit =
+            limit_setting > 0 ? static_cast<size_t>(limit_setting) : SamplesQueryBank::BANK_SIZE;
+        if (current_query && current_query->size_slots > limit) {
+            static u64 resets{};
+            static auto since = std::chrono::steady_clock::now();
+            ++resets;
+            if (const auto now = std::chrono::steady_clock::now();
+                now - since >= std::chrono::seconds{5}) {
+                LOG_INFO(Render_Vulkan, "Occlusion counter resets past {} slots: {} in {:.1f} s", limit,
+                         resets, std::chrono::duration<double>(now - since).count());
+                resets = 0;
+                since = now;
             }
             ResetCounter();
         }
@@ -274,6 +298,11 @@ public:
         size_t resolve_buffer_index = ObtainBuffer<true>(num_slots_used);
         resolve_buffers.push_back(resolve_buffer_index);
         size_t base_offset = 0;
+        // AMD's drivers wait on each query of a WAIT_BIT copy separately (3.8 us per query, ~5 ms
+        // a frame in Ocarina). Queries complete in order on the queue, so waiting for the newest
+        // one is enough before copying the range without the wait.
+        const bool wait_on_last =
+            driver_id == VK_DRIVER_ID_AMD_PROPRIETARY || driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE;
 
         ApplyBanksWideOp<true>(pending_sync, [&](SamplesQueryBank* bank, size_t start,
                                                  size_t amount) {
@@ -281,7 +310,7 @@ public:
             auto& resolve_buffer = buffers[resolve_buffer_index];
             VkQueryPool query_pool = bank->GetInnerPool();
             scheduler.RequestOutsideRenderPassOperationContext();
-            scheduler.Record([start, amount, base_offset, query_pool,
+            scheduler.Record([start, amount, base_offset, query_pool, wait_on_last,
                               buffer = *resolve_buffer](vk::CommandBuffer cmdbuf) {
                 const VkBufferMemoryBarrier copy_query_pool_barrier{
                     .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
@@ -295,10 +324,37 @@ public:
                     .size = amount * SamplesQueryBank::QUERY_SIZE,
                 };
 
-                cmdbuf.CopyQueryPoolResults(
-                    query_pool, static_cast<u32>(start), static_cast<u32>(amount), buffer,
-                    static_cast<u32>(base_offset), SamplesQueryBank::QUERY_SIZE,
-                    VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
+                if (!wait_on_last || amount == 1) {
+                    cmdbuf.CopyQueryPoolResults(
+                        query_pool, static_cast<u32>(start), static_cast<u32>(amount), buffer,
+                        static_cast<u32>(base_offset), SamplesQueryBank::QUERY_SIZE,
+                        VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
+                } else {
+                    const size_t last = amount - 1;
+                    const VkDeviceSize last_offset =
+                        base_offset + last * SamplesQueryBank::QUERY_SIZE;
+                    cmdbuf.CopyQueryPoolResults(query_pool, static_cast<u32>(start + last), 1,
+                                                buffer, last_offset, SamplesQueryBank::QUERY_SIZE,
+                                                VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
+                    // Orders the unwaited copy after the waited one.
+                    const VkBufferMemoryBarrier waited_barrier{
+                        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                        .pNext = nullptr,
+                        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .buffer = buffer,
+                        .offset = last_offset,
+                        .size = SamplesQueryBank::QUERY_SIZE,
+                    };
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, waited_barrier);
+                    cmdbuf.CopyQueryPoolResults(
+                        query_pool, static_cast<u32>(start), static_cast<u32>(last), buffer,
+                        static_cast<u32>(base_offset), SamplesQueryBank::QUERY_SIZE,
+                        VK_QUERY_RESULT_64_BIT);
+                }
                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
                                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, copy_query_pool_barrier);
             });
@@ -393,6 +449,10 @@ public:
 
     bool HasUnsyncedQueries() const override {
         return !pending_flush_queries.empty();
+    }
+
+    bool ReportMakesPendingSync() const override {
+        return current_query != nullptr; // WriteCounter's test (after its PauseCounter)
     }
 
     void PushUnsyncedQueries() override {
@@ -638,7 +698,6 @@ private:
     bool accumulation_since_last_sync{};
     VideoCommon::HostQueryBase* current_query;
     bool has_started{};
-    u64 bank_bound_resets{}; ///< Counts CloseCounter dropped once a query outgrew a bank.
     std::mutex flush_guard;
     std::optional<QueriesPrefixScanPass> queries_prefix_scan_pass;
 };
@@ -885,7 +944,8 @@ public:
     void PushUnsyncedQueries() override {
         CloseCounter();
         auto staging_ref = staging_pool.Request(
-            pending_flush_queries.size() * TFBQueryBank::QUERY_SIZE, MemoryUsage::Download, true);
+            pending_flush_queries.size() * TFBQueryBank::QUERY_SIZE, MemoryUsage::Download, true,
+            VideoCommon::BufferChurnStats::StagingCaller::Query);
         size_t offset_base = staging_ref.offset;
         for (auto q : pending_flush_queries) {
             auto* query = GetQuery(q);
@@ -1389,6 +1449,9 @@ struct QueryCacheRuntimeImpl {
     VkConditionalRenderingBeginInfoEXT hcr_setup;
     VkBuffer hcr_buffer;
     size_t hcr_offset;
+    /// The guest bytes hcr_setup reads when they are a guest buffer's, 0 when it reads the
+    /// resolve buffer. Each resume reads them again, in the submission it is recorded in.
+    DAddr hcr_guest_address{};
     bool hcr_is_set;
     bool is_hcr_running;
 
@@ -1419,6 +1482,7 @@ void QueryCacheRuntime::EndHostConditionalRendering() {
     impl->is_hcr_running = false;
     impl->hcr_buffer = VkBuffer{};
     impl->hcr_offset = 0;
+    impl->hcr_guest_address = 0;
 }
 
 void QueryCacheRuntime::PauseHostConditionalRendering() {
@@ -1437,6 +1501,11 @@ void QueryCacheRuntime::ResumeHostConditionalRendering() {
         return;
     }
     if (!impl->is_hcr_running) {
+        if (impl->hcr_guest_address != 0) {
+            // An upload of the predicate later in this submission must run after this read.
+            std::scoped_lock lk(impl->buffer_cache.mutex);
+            impl->buffer_cache.MarkUsed(impl->hcr_guest_address, 8);
+        }
         impl->scheduler.Record([hcr_setup = impl->hcr_setup](vk::CommandBuffer cmdbuf) {
             cmdbuf.BeginConditionalRenderingEXT(hcr_setup);
         });
@@ -1451,7 +1520,10 @@ void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::Lo
         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
         const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
         const auto [buffer, offset] =
-            impl->buffer_cache.ObtainCPUBuffer(object.address, 8, sync_info, post_op);
+            impl->buffer_cache.runtime.Seam().Ref(MemStage::Site::Query, [&] {
+                return impl->buffer_cache.ObtainCPUBuffer(object.address, 8, sync_info, post_op);
+            });
+        VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::QueryBuffer, 8);
         impl->hcr_buffer = buffer->Handle();
         impl->hcr_offset = offset;
     }
@@ -1467,6 +1539,7 @@ void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::Lo
     }
     impl->hcr_setup.buffer = impl->hcr_buffer;
     impl->hcr_setup.offset = impl->hcr_offset;
+    impl->hcr_guest_address = object.address;
     impl->hcr_setup.flags = is_equal ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT : 0;
     impl->hcr_is_set = true;
     impl->is_hcr_running = false;
@@ -1485,7 +1558,12 @@ void QueryCacheRuntime::HostConditionalRenderingCompareBCImpl(DAddr address, boo
         const auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
         const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
         const auto [buffer, offset] =
-            impl->buffer_cache.ObtainCPUBuffer(address, resolve_size, sync_info, post_op);
+            impl->buffer_cache.runtime.Seam().Ref(MemStage::Site::Query, [&] {
+                return impl->buffer_cache.ObtainCPUBuffer(address, resolve_size, sync_info,
+                                                          post_op);
+            });
+        VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::QueryBuffer,
+                                         resolve_size);
         to_resolve = buffer->Handle();
         to_resolve_offset = static_cast<u32>(offset);
     }
@@ -1496,6 +1574,7 @@ void QueryCacheRuntime::HostConditionalRenderingCompareBCImpl(DAddr address, boo
     impl->conditional_resolve_pass->Resolve(*impl->hcr_resolve_buffer, to_resolve,
                                             to_resolve_offset, compare_to_zero);
     impl->hcr_setup.buffer = *impl->hcr_resolve_buffer;
+    impl->hcr_guest_address = 0;
     impl->hcr_setup.offset = 0;
     impl->hcr_setup.flags = is_equal ? 0 : VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT;
     impl->hcr_is_set = true;
@@ -1706,21 +1785,115 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
     }
 
     // Vulkan part.
-    std::scoped_lock lk(impl->buffer_cache.mutex);
-    impl->buffer_cache.BufferOperations([&] {
-        impl->buffers_to_upload_to.clear();
-        for (auto& pair : impl->little_cache) {
-            static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
-            const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
-            const auto [buffer, offset] = impl->buffer_cache.ObtainCPUBuffer(
-                pair.first, static_cast<u32>(pair.second - pair.first), sync_info, post_op);
-            impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
+    // FRITCHII_MEMSTAGE_PASS bit 2 (fable_stage_p3 5.1): served, at an entry GPUMem passed with
+    // the sync resolved, the buffers come from its pass record. GPUMem made the sync's own
+    // lookups at the entry's place in the cache's order, where each was pure (an existing buffer,
+    // nothing to upload) and only marked the usage; the back copies into those buffers and does
+    // not enter the buffer cache (no lock, no bracket: nothing of the cache's is recorded here).
+    // A range none of the targets holds is a must-be-0 (PassSyncTarget): today's block then.
+    // One follower (fable_b 16.2): R outside a lent call syncs into the buffers E obtained for
+    // this posted fence and named in it; it never enters the buffer cache (E's, E running). A
+    // range none holds is a must-be-0: not copied, and fences post no more.
+    const bool from_onef = [&] {
+        if (!VideoCommon::OneFollower::OnRenderThread() ||
+            VideoCommon::OneFollower::RenderInLentCall()) [[likely]] {
+            return false;
         }
-    });
-    // The copies below are GPU writes the buffer cache doesn't record: reads taken before them
-    // must not keep the bytes they downloaded as the newest.
-    for (const auto& value : values) {
-        impl->buffer_cache.OutdateReadDownloads(value.address, value.size);
+        impl->buffers_to_upload_to.clear();
+        for (const auto& pair : impl->little_cache) {
+            OneFollowerSyncTarget* target = nullptr;
+            if (t_onef_sync_targets != nullptr) {
+                for (auto& candidate : *t_onef_sync_targets) {
+                    if (candidate.begin <= pair.first &&
+                        pair.second <= candidate.begin + candidate.bytes) {
+                        target = &candidate;
+                        break;
+                    }
+                }
+            }
+            if (target == nullptr) [[unlikely]] {
+                thread_local std::string note;
+                note = fmt::format("query values at {:#x}..{:#x} in a posted fence", pair.first,
+                                   pair.second);
+                VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::SyncTargetMissing,
+                                               note.c_str());
+                VideoCommon::OneFollower::StopPostFence("a query sync without its target");
+                impl->buffers_to_upload_to.clear();
+                return true;
+            }
+            target->used = true;
+            impl->buffers_to_upload_to.emplace_back(target->buffer,
+                                                    target->offset + (pair.first - target->begin));
+        }
+        return true;
+    }();
+    if (from_onef && impl->buffers_to_upload_to.size() != impl->little_cache.size()) {
+        return; // a missing target: nothing copied (counted above)
+    }
+    using Link = VideoCommon::MemoryStageLink;
+    const bool from_record = !from_onef && [&] {
+        if (!Link::BackServed()) [[likely]] {
+            return false;
+        }
+        Link& link = Link::Get();
+        const Link::PassRecord* const record = link.BackCurrentPassRecord();
+        if (record == nullptr || !record->sync) {
+            // Not a passed entry's sync (a read flush's own fence syncs here): today's block.
+            link.NoteP3BackSync(false);
+            return false;
+        }
+        impl->buffers_to_upload_to.clear();
+        for (const auto& pair : impl->little_cache) {
+            const auto target = std::ranges::find_if(record->targets, [&](const auto& t) {
+                return t.begin <= pair.first && pair.second <= t.begin + t.bytes;
+            });
+            if (target == record->targets.end()) [[unlikely]] {
+                Link::Note(Link::Check::PassSyncTarget, "QueryCacheRuntime::SyncValues");
+                impl->buffers_to_upload_to.clear();
+                return false;
+            }
+            VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::QueryBuffer,
+                                             pair.second - pair.first);
+            impl->buffers_to_upload_to.emplace_back(std::bit_cast<VkBuffer>(target->buffer),
+                                                    target->offset + (pair.first - target->begin));
+        }
+        link.NoteP3BackSync(true);
+        return true;
+    }();
+    if (!from_record && !from_onef) {
+        std::scoped_lock lk(impl->buffer_cache.mutex);
+        // The ranges' buffers: what they upload is played before the query cache's own copies.
+        std::optional<MemStage::FillPlay> seam{std::in_place, impl->buffer_cache.runtime.Seam(),
+                                               MemStage::Site::Query};
+        impl->buffer_cache.BufferOperations([&] {
+            impl->buffers_to_upload_to.clear();
+            for (auto& pair : impl->little_cache) {
+                static constexpr auto sync_info =
+                    VideoCommon::ObtainBufferSynchronize::FullSynchronize;
+                const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
+                const auto [buffer, offset] = impl->buffer_cache.ObtainCPUBuffer(
+                    pair.first, static_cast<u32>(pair.second - pair.first), sync_info, post_op);
+                VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::QueryBuffer,
+                                                 pair.second - pair.first);
+                impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
+            }
+        });
+        seam.reset();
+        // EDEN_NX2_EXP49: the copies below are GPU writes the buffer cache doesn't record. Read
+        // downloads taken before them must not keep the bytes they downloaded as the newest.
+        for (const auto& value : values) {
+            impl->buffer_cache.OutdateReadDownloads(value.address, value.size);
+        }
+    } else if (!from_onef &&
+               VideoCore::g_read_downloads.load(std::memory_order_acquire) != 0) [[unlikely]] {
+        // As above, only with a read download pending (the read download lists alone; the
+        // back is the cache's user for them under the lock, as at a fence commit). A posted
+        // fence's: E outdated them when it obtained the targets.
+        std::scoped_lock lk(impl->buffer_cache.mutex);
+        const Link::BackCacheScope back_cache;
+        for (const auto& value : values) {
+            impl->buffer_cache.OutdateReadDownloads(value.address, value.size);
+        }
     }
 
     VkBuffer src_buffer;
@@ -1728,7 +1901,8 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
     impl->copies_setup.clear();
     impl->copies_setup.resize(impl->little_cache.size());
     if constexpr (SyncValuesType::GeneratesBaseBuffer) {
-        ref = impl->staging_pool.Request(total_size, MemoryUsage::Upload);
+        ref = impl->staging_pool.Request(total_size, MemoryUsage::Upload, false,
+                                         VideoCommon::BufferChurnStats::StagingCaller::Query);
         size_t current_offset = ref.offset;
         size_t accumulated_size = 0;
         for (size_t i = 0; i < values.size(); i++) {

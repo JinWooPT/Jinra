@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -49,13 +48,11 @@ public:
 
     // Updates input on scheduled interval
     void UpdateInput();
-    void SetCompactLayout();
 
 protected:
     void paintEvent(QPaintEvent* event) override;
 
 private:
-    bool compact_layout{};
     enum class Direction : std::size_t {
         None,
         Up,

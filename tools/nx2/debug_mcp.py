@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""MCP server (stdio) for Jinra's in-process debug server (docs/nx2/debug-mcp.md).
+"""MCP server (stdio) for Fritchii's in-process debug server (docs/nx2/debug-mcp.md).
 
-Run Jinra with EDEN_NX2_DEBUG_SERVER=127.0.0.1:6545, then register this script as a stdio MCP
+Run Fritchii with EDEN_NX2_DEBUG_SERVER=127.0.0.1:6545, then register this script as a stdio MCP
 server for the agent:  python3 -I tools/nx2/debug_mcp.py [--server 127.0.0.1:6545]
 or run one request from a shell:
   python3 -I tools/nx2/debug_mcp.py --call '{"method":"screenshot","params":{}}' --out shot.png
@@ -14,7 +14,6 @@ be restarted between calls: the adapter reconnects on demand.
 import argparse
 import base64
 import json
-import math
 import os
 import socket
 import subprocess
@@ -38,19 +37,6 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {"fps_window_ms": {"type": "integer", "minimum": 0, "maximum": 5000}},
-        },
-    },
-    {
-        "name": "frame_times",
-        "description": "Guest-present frame intervals over seconds (default 5, max 60): mean, "
-                       "fps, percentiles, VSync interval shares (refresh_hz defaults to 60), "
-                       "stutters and the last 120 intervals. Reports ring overflow as truncated.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 60, "default": 5},
-                "refresh_hz": {"type": "number", "exclusiveMinimum": 0, "default": 60},
-            },
         },
     },
     {
@@ -153,6 +139,30 @@ TOOLS = [
         },
     },
     {
+        "name": "timeline",
+        "description": "Records what the emulator's threads (guest present, GPU front and back, "
+                       "Vulkan worker) do and wait for, for the given seconds, and writes a "
+                       "Chrome trace (open in ui.perfetto.dev) to the dump directory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"seconds": {"type": "number", "minimum": 0.1, "maximum": 30},
+                           "detail": {"type": "boolean",
+                                      "description": "Also per-draw stages and method calls (slows the GPU threads)"}},
+        },
+    },
+    {
+        "name": "switch",
+        "description": "Reads or sets a live experiment switch (EDEN_NX2_DMA_WAIT_WRITERS).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "value": {"type": "integer"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
         "name": "read_memory",
         "description": "Reads up to 64 KiB of the game's guest virtual memory, read only and "
                        "while it runs. 'as' formats it: hex (default), u32, u64 (hex strings) or "
@@ -246,6 +256,42 @@ TOOLS = [
             "required": ["steps"],
         },
     },
+    {
+        "name": "input_record",
+        "description": "Records what the game receives from player 1 (or the handheld controller): "
+                       "one sample per present of the buttons and sticks the injector can drive, "
+                       "run-length encoded. 'start' begins (refused while input is injected), "
+                       "'status' reports, 'stop' writes {version, controller, first_present, "
+                       "frames, missed, steps} to 'path' (default input_<ms>.json in the dump "
+                       "directory; relative paths are under it). Replay it with input_replay.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["start", "stop", "status"]},
+                "controller": {"type": "string", "enum": ["player1", "handheld"]},
+                "path": {"type": "string"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "input_replay",
+        "description": "Replays an input_record file (or any file with input_sequence 'steps') in "
+                       "one run, step N at present first+N, without input_sequence's step and "
+                       "frame limits (at most 864000 frames). Starts at the next present, or at "
+                       "absolute present count 'at_present'. Uses the file's controller unless "
+                       "'controller' is given. The server answers nothing else until it ends.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "at_present": {"type": "integer", "minimum": 1},
+                "controller": {"type": "string", "enum": ["player1", "handheld"]},
+                "timeout_s": {"type": "integer", "minimum": 1, "maximum": 86400},
+            },
+            "required": ["path"],
+        },
+    },
 ]
 
 TOOL_NAMES = {tool["name"] for tool in TOOLS}
@@ -295,7 +341,7 @@ class Emulator:
                 if isinstance(error, socket.timeout):
                     raise EmulatorError(f"no answer within {timeout} s") from error
                 raise EmulatorError(
-                    f"nothing listens on {self.host}:{self.port}: start Jinra with "
+                    f"nothing listens on {self.host}:{self.port}: start Fritchii with "
                     f"EDEN_NX2_DEBUG_SERVER={self.host}:{self.port} and boot a game") from error
             except OSError as error:
                 # A stale connection from an earlier boot: reconnect once.
@@ -311,13 +357,18 @@ def default_timeout(name, params):
     """The emulator's own timeout_s default, so the adapter waits at least as long."""
     if name == "capture_frame":
         return 120
-    if name == "frame_times":
-        return math.ceil(params.get("seconds", 5)) + 1
     if name == "sample":
         return int(params.get("seconds", 10)) + 90
+    if name == "timeline":
+        return int(params.get("seconds", 5)) + 60
     if name in ("input", "input_sequence"):
         steps = params.get("steps", []) if name == "input_sequence" else [params]
         return sum(int(step.get("frames", 0)) for step in steps) // 20 + 10
+    if name == "input_replay":
+        # The adapter does not know the file's length; the emulator times out on its own.
+        return 86400
+    if name == "input_record":
+        return 30
     return 5
 
 
@@ -387,7 +438,7 @@ class Adapter:
             reply["result"] = {
                 "protocolVersion": wanted if wanted in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "jinra-debug", "version": "1"},
+                "serverInfo": {"name": "lichii-debug", "version": "1"},
             }
         elif method == "ping":
             reply["result"] = {}
@@ -397,7 +448,7 @@ class Adapter:
             try:
                 content = self.call_tool(params.get("name"), params.get("arguments") or {})
                 reply["result"] = {"content": content, "isError": False}
-            except (EmulatorError, KeyError, ValueError, TypeError) as error:
+            except (EmulatorError, KeyError, ValueError) as error:
                 message_text = f"missing argument {error}" if isinstance(error, KeyError) else str(error)
                 reply["result"] = {"content": [text(message_text)], "isError": True}
         else:
@@ -443,7 +494,7 @@ def call_once(adapter, request_text, out, stdout):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--server", default=os.environ.get("JINRA_DEBUG_SERVER", DEFAULT_SERVER),
+    parser.add_argument("--server", default=os.environ.get("LICHII_DEBUG_SERVER", DEFAULT_SERVER),
                         help=f"host:port of EDEN_NX2_DEBUG_SERVER (default {DEFAULT_SERVER})")
     parser.add_argument("--call", metavar="JSON",
                         help='run one request and exit, e.g. \'{"method":"screenshot","params":{}}\'')

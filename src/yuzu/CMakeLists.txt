@@ -14,7 +14,6 @@ endif()
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/VERSION")
 file(STRINGS "${PROJECT_SOURCE_DIR}/VERSION" JINRA_VERSION LIMIT_COUNT 1)
 string(REGEX REPLACE "^([0-9]+)\\.([0-9]+)\\.([0-9]+).*" "\\1,\\2,\\3,0"
        JINRA_WINDOWS_VERSION "${JINRA_VERSION}")
@@ -170,7 +169,6 @@ add_executable(yuzu
     debugger/controller.h
 
     game/game_list.cpp game/game_list.h
-    game/shader_sync.cpp game/shader_sync.h
     game/game_grid.cpp game/game_grid.h
 
     game/game_tree.h game/game_tree.cpp
@@ -186,7 +184,6 @@ add_executable(yuzu
     loading_screen.ui
 
     main.cpp
-    nx2_switches.h
 
     multiplayer/chat_room.cpp
     multiplayer/chat_room.h
@@ -220,6 +217,32 @@ add_executable(yuzu
     util/clickable_label.h
     util/controller_navigation.cpp
     util/controller_navigation.h
+    fritchii/cache_cleanup.cpp
+    fritchii/cache_cleanup.h
+    fritchii/max_resolution.cpp
+    fritchii/max_resolution.h
+    fritchii/fritchii.qrc
+    fritchii/fritchii_ui.cpp
+    fritchii/fritchii_ui.h
+    fritchii/home.cpp
+    fritchii/home.h
+    fritchii/game_controls.cpp
+    fritchii/game_controls.h
+    fritchii/main_window_fritchii.cpp
+    fritchii/perf_overlay.cpp
+    fritchii/perf_overlay.h
+    fritchii/precompile_gate.cpp
+    fritchii/precompile_gate.h
+    fritchii/saves_window.cpp
+    fritchii/saves_window.h
+    fritchii/switches_window.cpp
+    fritchii/switches_window.h
+    fritchii/whats_new.cpp
+    fritchii/whats_new.h
+    util/export_log.cpp
+    util/export_log.h
+    util/profiling_mode.cpp
+    util/profiling_mode.h
     util/limitable_input_dialog.cpp
     util/limitable_input_dialog.h
     util/overlay_dialog.cpp
@@ -236,10 +259,17 @@ add_executable(yuzu
 
     user_data_migration.h user_data_migration.cpp
 
+    jinra_home.cpp jinra_home.h
+    jinra_home_audio.cpp jinra_home_audio.h
+    jinra_avatar.cpp jinra_avatar.h
+    jinra_home.cpp jinra_home.h
+    jinra_home_audio.cpp jinra_home_audio.h
+    jinra_avatar.cpp jinra_avatar.h
     yuzu.qrc
     yuzu.rc
     migration_dialog.h migration_dialog.cpp
     nup_dialogs.h nup_dialogs.cpp
+    shader_warm_dialog.h shader_warm_dialog.cpp
     migration_worker.h migration_worker.cpp
     libqt_common.h libqt_common.cpp
 
@@ -254,20 +284,22 @@ add_executable(yuzu
     configuration/system/profile_avatar_dialog.h configuration/system/profile_avatar_dialog.cpp
     configuration/addon/mod_select_dialog.h configuration/addon/mod_select_dialog.cpp configuration/addon/mod_select_dialog.ui
 
-    render/performance_overlay.h render/performance_overlay.cpp
-    jinra_home.cpp jinra_home.h
-    jinra_home_audio.cpp jinra_home_audio.h
-    jinra_avatar.cpp jinra_avatar.h
+    render/performance_overlay.h render/performance_overlay.cpp render/performance_overlay.ui
+    render/frame_budget_view.h
     updater/jinra_release.h updater/jinra_release.cpp
     updater/jinra_updater.h updater/jinra_updater.cpp
+    updater/update_dialog.h updater/update_dialog.cpp updater/update_dialog.ui
     game/common.h
     game/carousel.h game/carousel.cpp
 )
 
+# Windows: fritchii.exe since v6, with a small lichii.exe next to it (src/lichii_forwarder) that
+# starts it, for v5.x updaters (they require and restart lichii.exe) and old shortcuts. Linux keeps
+# bin/lichii for now (the AppImage packaging and its updater name it).
 set_target_properties(yuzu PROPERTIES OUTPUT_NAME "jinra")
 
 # Shipped next to the executable: the NX2 switches a GUI launch cannot set another way. Read at
-# startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\eden overrides it.
+# startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\lichii overrides it.
 add_custom_command(TARGET yuzu POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt" "$<TARGET_FILE_DIR:yuzu>/nx2_switches.txt"
@@ -296,108 +328,32 @@ endif()
 file(GLOB_RECURSE ICONS ${PROJECT_SOURCE_DIR}/dist/icons/*)
 file(GLOB_RECURSE THEMES ${PROJECT_SOURCE_DIR}/dist/qt_themes/*)
 
-if (ENABLE_UPDATE_CHECKER)
+if (ENABLE_UPDATE_CHECKER AND NOT WIN32)
     target_compile_definitions(yuzu PUBLIC ENABLE_UPDATE_CHECKER)
 endif()
+# fritchii/ includes ui_main.h, which AutoUic already generates for main_window.cpp.
+set_source_files_properties(fritchii/fritchii_ui.cpp fritchii/main_window_fritchii.cpp
+    PROPERTIES SKIP_AUTOUIC ON)
 
-if (ENABLE_QT_TRANSLATION)
-    set(YUZU_QT_LANGUAGES "${PROJECT_SOURCE_DIR}/dist/languages" CACHE PATH "Path to the translation bundle for the Qt frontend")
-    option(GENERATE_QT_TRANSLATION "Generate en.ts as the translation source file" OFF)
-    option(WORKAROUND_BROKEN_LUPDATE "Run lupdate directly through CMake if Qt's convenience wrappers don't work" OFF)
-
-    # Update source TS file if enabled
-    if (GENERATE_QT_TRANSLATION)
-        get_target_property(SRCS yuzu SOURCES)
-        # these calls to qt_create_translation also creates a rule to generate en.qm which conflicts with providing english plurals
-        # so we have to set a OUTPUT_LOCATION so that we don't have multiple rules to generate en.qm
-        set_source_files_properties(${YUZU_QT_LANGUAGES}/en.ts PROPERTIES OUTPUT_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/translations")
-        if (WORKAROUND_BROKEN_LUPDATE)
-            add_custom_command(OUTPUT ${YUZU_QT_LANGUAGES}/en.ts
-                COMMAND lupdate
-                    -source-language en_US
-                    -target-language en_US
-                    ${SRCS}
-                    ${UIS}
-                    -ts ${YUZU_QT_LANGUAGES}/en.ts
-                DEPENDS
-                    ${SRCS}
-                    ${UIS}
-                WORKING_DIRECTORY
-                    ${CMAKE_CURRENT_SOURCE_DIR})
-        else()
-            qt_create_translation(QM_FILES
-                ${SRCS}
-                ${UIS}
-                ${YUZU_QT_LANGUAGES}/en.ts
-            OPTIONS
-                -source-language en_US
-                -target-language en_US)
-        endif()
-
-        # Generate plurals into dist/english_plurals/generated_en.ts so it can be used to revise dist/english_plurals/en.ts
-        set(GENERATED_PLURALS_FILE ${PROJECT_SOURCE_DIR}/dist/english_plurals/generated_en.ts)
-        set_source_files_properties(${GENERATED_PLURALS_FILE} PROPERTIES OUTPUT_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/plurals")
-        if (WORKAROUND_BROKEN_LUPDATE)
-            add_custom_command(OUTPUT ${GENERATED_PLURALS_FILE}
-                COMMAND lupdate
-                    -source-language en_US
-                    -target-language en_US
-                    ${SRCS}
-                    ${UIS}
-                    -ts ${GENERATED_PLURALS_FILE}
-                DEPENDS
-                    ${SRCS}
-                    ${UIS}
-                WORKING_DIRECTORY
-                    ${CMAKE_CURRENT_SOURCE_DIR})
-        else()
-            qt_create_translation(QM_FILES ${SRCS} ${UIS} ${GENERATED_PLURALS_FILE} OPTIONS -pluralonly -source-language en_US -target-language en_US)
-        endif()
-
-        add_custom_target(translation ALL DEPENDS ${YUZU_QT_LANGUAGES}/en.ts ${GENERATED_PLURALS_FILE})
-    endif()
-
-    # Find all TS files except en.ts
-    file(GLOB_RECURSE LANGUAGES_TS ${YUZU_QT_LANGUAGES}/*.ts)
-    list(REMOVE_ITEM LANGUAGES_TS ${YUZU_QT_LANGUAGES}/en.ts)
-
-    # Compile TS files to QM files
-    qt_add_translation(LANGUAGES_QM ${LANGUAGES_TS})
-
-    # Compile english plurals TS file to en.qm
-    qt_add_translation(LANGUAGES_QM ${PROJECT_SOURCE_DIR}/dist/english_plurals/en.ts)
-
-    # Build a QRC file from the QM file list
-    set(LANGUAGES_QRC ${CMAKE_CURRENT_BINARY_DIR}/languages.qrc)
-    file(WRITE ${LANGUAGES_QRC} "<RCC><qresource prefix=\"languages\">\n")
-    foreach (QM ${LANGUAGES_QM})
-        get_filename_component(QM_FILE ${QM} NAME)
-        file(APPEND ${LANGUAGES_QRC} "<file>${QM_FILE}</file>\n")
-    endforeach (QM)
-    file(APPEND ${LANGUAGES_QRC} "</qresource></RCC>")
-
-    # Add the QRC file to package in all QM files
-    qt_add_resources(LANGUAGES ${LANGUAGES_QRC})
-else()
-    set(LANGUAGES)
-endif()
+# The updater unpacks the release zip (updater/update_dialog.cpp); Export Log writes one
+# (util/export_log.cpp).
+target_link_libraries(yuzu PRIVATE QuaZip::QuaZip)
 
 target_sources(yuzu
     PRIVATE
         ${ICONS}
-        ${LANGUAGES}
         ${THEMES})
 
-# TODO(crueter): Move Assets.car/icon/icns handling to its own Module.
+# TODO: Move icon/icns handling to its own Module.
 if (APPLE)
     target_sources(yuzu PRIVATE util/macos_sleep.cpp util/macos_sleep.h)
 
-    # Use the supplied Jinra artwork for all macOS generators.
+    # Use the supplied artwork for all macOS generators.
     set(_dist "${CMAKE_SOURCE_DIR}/dist")
-    set(_icons "${_dist}/jinra.icns")
+    set(_icons "${_dist}/lichii.icns")
     if (CMAKE_GENERATOR MATCHES "Xcode")
         set_target_properties(yuzu PROPERTIES
-            MACOSX_BUNDLE_ICON_FILE jinra.icns
+            MACOSX_BUNDLE_ICON_FILE lichii.icns
             # Also force xcode to manage signing for us.
             XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED ON
             XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED ON)
@@ -421,23 +377,27 @@ if (APPLE)
 elseif(WIN32)
     # compile as a win32 gui application instead of a console application
     target_link_libraries(yuzu PRIVATE Qt6::EntryPointPrivate)
+    # Every thread started without a stack size of its own (std::thread, the driver's own
+    # threads, the pipeline workers on which the Vulkan driver compiles) reserves 16 MiB of
+    # address space instead of the linker's 1 MiB. Only reserved: pages get memory as they are
+    # used. AMD's shader compiler overflowed 1 MiB on a task/mesh pipeline and the process
+    # vanished. In every configuration, as a target option (not the release linker flags).
     if(MSVC)
         target_link_libraries(yuzu PRIVATE version.lib)
         set_target_properties(yuzu PROPERTIES LINK_FLAGS_RELEASE "/SUBSYSTEM:WINDOWS")
+        target_link_options(yuzu PRIVATE "/STACK:16777216")
     elseif(MINGW)
         set_target_properties(yuzu PROPERTIES LINK_FLAGS_RELEASE "-Wl,--subsystem,windows")
         target_link_libraries(yuzu PRIVATE dwmapi)
+        target_link_options(yuzu PRIVATE "LINKER:--stack,16777216")
     endif()
 endif()
 
 target_link_libraries(yuzu PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(yuzu PRIVATE common core input_common frontend_common network video_core qt_common)
-target_link_libraries(yuzu PRIVATE Boost::headers Qt6::Widgets Qt6::Concurrent Qt6::Network)
+target_link_libraries(yuzu PRIVATE Boost::headers Qt6::Widgets Qt6::Charts Qt6::Concurrent Qt6::Network)
 # Unpacks NVIDIA's files from the Streamline release (nvidia_dlss_panel.cpp).
 target_link_libraries(yuzu PRIVATE ZLIB::ZLIB)
-if (WIN32)
-    target_link_libraries(yuzu PRIVATE QuaZip::QuaZip)
-endif()
 target_link_libraries(yuzu PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
 if (ENABLE_OPENGL)
     target_link_libraries(yuzu PRIVATE glad)
@@ -489,10 +449,6 @@ if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64)
     target_link_libraries(yuzu PRIVATE dynarmic::dynarmic)
 endif()
 
-if (YUZU_ROOM)
-    target_link_libraries(yuzu PRIVATE yuzu-room)
-endif()
-
 if (NOT MSVC AND (APPLE OR NOT YUZU_STATIC_BUILD))
     # needed for vma
     target_compile_options(yuzu PRIVATE
@@ -509,6 +465,6 @@ target_link_libraries(yuzu PRIVATE OpenSSL::SSL OpenSSL::Crypto SDL3::SDL3)
 if (TARGET nxformat::static_nozstd)
     target_sources(yuzu PRIVATE nx_tools.h nx_tools.cpp)
     target_link_libraries(yuzu PRIVATE nxformat::static_nozstd)
-    target_compile_definitions(yuzu PRIVATE JINRA_NX_TOOLS)
+    target_compile_definitions(yuzu PRIVATE LICHII_NX_TOOLS)
 endif()
 create_target_directory_groups(yuzu)

@@ -1,12 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <atomic>
+#include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
+#include "common/logging.h"
+#include "common/nx2_timeline.h"
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -16,6 +21,7 @@
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc/svc_nx2_oot_present.h"
 #include "core/hle/kernel/thread_startup_policy.h"
 
 namespace Kernel::Svc {
@@ -35,6 +41,23 @@ constexpr int32_t FoldExtraCoreId(int32_t core_id) {
 constexpr u64 FoldExtraCoreMask(u64 mask) {
     constexpr u64 low = (1ULL << Core::Hardware::NUM_CPU_CORES) - 1;
     return (mask & low) | ((mask >> Core::Hardware::NUM_CPU_CORES) & low);
+}
+
+// EDEN_NX2_OOT_WIDE_AFFINITY=1 (boot switch, off by default; ported).
+// Ocarina of Time's two main threads (priorities 55 and 47) may only run on two of cores 3-5,
+// where the per-core job workers (priority 44) keep preempting them while cores 0-2 sit idle
+// about 30% of the time. With the switch on, any affinity mask of more than one core that
+// Ocarina sets is widened to all of the process's cores, so an idle core can take a preempted
+// main thread. Pinned (single-core) threads and every other title are unchanged. Read once, on
+// the first SetThreadCoreMask (after main() applied nx2_switches.txt).
+bool WidenAffinity(const KProcess& process, u64 affinity_mask) {
+    constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_WIDE_AFFINITY");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled && std::popcount(affinity_mask) > 1 &&
+           process.GetProgramId() == OcarinaOfTimeProgramId;
 }
 
 } // Anonymous namespace
@@ -161,6 +184,51 @@ void ExitThread(Core::System& system) {
 }
 
 /// Sleep the current thread
+namespace {
+// EDEN_NX2_SLEEP_HIST=1 (read once; Fable answer_front 2): the sleep lengths guest threads ask
+// SleepThread for, bucketed, every 5 s ("Guest sleeps asked (5 s"). Shows whether the job
+// workers' 20 us idle quantum is what the game asks or a floor of ours.
+void NoteSleepAsked(s64 ns) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SLEEP_HIST");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static constexpr std::array<s64, 11> limits{0,  5'000,   10'000,  19'000,    21'000,  50'000,
+                                                100'000, 250'000, 1'000'000, 16'000'000, INT64_MAX};
+    static std::array<std::atomic<u64>, 11> counts{};
+    static std::atomic<s64> next_report{};
+    size_t bucket = 0;
+    while (bucket + 1 < limits.size() && ns > limits[bucket]) {
+        ++bucket;
+    }
+    counts[bucket].fetch_add(1, std::memory_order_relaxed);
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 next = next_report.load(std::memory_order_relaxed);
+    if (next == 0) {
+        next_report.compare_exchange_strong(next, now + 5'000'000'000);
+        return;
+    }
+    if (now < next || !next_report.compare_exchange_strong(next, now + 5'000'000'000)) {
+        return;
+    }
+    std::array<u64, 11> c{};
+    for (size_t i = 0; i < c.size(); ++i) {
+        c[i] = counts[i].exchange(0, std::memory_order_relaxed);
+    }
+    LOG_INFO(Kernel_SVC,
+             "Guest sleeps asked (5 s, per second): yields (0 or less) {:.0f}, <=5us {:.0f}, <=10us {:.0f}, "
+             "<=19us {:.0f}, 19-21us {:.0f}, <=50us {:.0f}, <=100us {:.0f}, <=250us {:.0f}, "
+             "<=1ms {:.0f}, <=16ms {:.0f}, more {:.0f}",
+             c[0] / 5.0, c[1] / 5.0, c[2] / 5.0, c[3] / 5.0, c[4] / 5.0, c[5] / 5.0, c[6] / 5.0,
+             c[7] / 5.0, c[8] / 5.0, c[9] / 5.0, c[10] / 5.0);
+}
+} // namespace
+
 void SleepThread(Core::System& system, s64 ns) {
     auto& kernel = system.Kernel();
     const auto yield_type = static_cast<Svc::YieldType>(ns);
@@ -168,7 +236,27 @@ void SleepThread(Core::System& system, s64 ns) {
     LOG_TRACE(Kernel_SVC, "called nanoseconds={}", ns);
 
     // When the input tick is positive, sleep.
+    NoteSleepAsked(ns); // EDEN_NX2_SLEEP_HIST: yields (ns <= 0) count in the first bucket
     if (ns > 0) {
+        // The timeline marks Ocarina of Time's present poll sleeps: a timer wait for the GPU's
+        // event, not guest work (tools/nx2/critical_path.py). Recorded on the host thread the
+        // guest thread resumes on. The span carries the poll's event object (its words are
+        // marked with the guest layer, for the GPU write that sets it).
+        u64 poll_object = 0;
+        const bool poll_span = Common::Nx2Timeline::Active() &&
+                               IsNx2OotPresentPollSleep(system, ns, &poll_object);
+        const u64 poll_begin = poll_span ? Common::Nx2Timeline::Now() : 0;
+        SCOPE_EXIT {
+            if (poll_span) {
+                Common::Nx2Timeline::Record("OoT: present poll sleep", poll_begin,
+                                            Common::Nx2Timeline::Now(), {"object", poll_object});
+            }
+        };
+        // Ocarina of Time's present poll waits for the GPU's write instead (EXP24, off by default).
+        if (SleepNx2OotPresentPoll(system, ns)) {
+            return;
+        }
+
         // Convert the timeout from nanoseconds to ticks.
         // NOTE: Nintendo does not use this conversion logic in WaitSynchronization...
         s64 timeout;
@@ -320,6 +408,9 @@ Result SetThreadCoreMask(Core::System& system, Handle thread_handle, s32 core_id
         // Validated against the real mask above; fold to the emulated cores from here on.
         affinity_mask = FoldExtraCoreMask(affinity_mask);
         core_id = FoldExtraCoreId(core_id);
+        if (WidenAffinity(GetCurrentProcess(system.Kernel()), affinity_mask)) {
+            affinity_mask = FoldExtraCoreMask(process_core_mask);
+        }
 
         // Validate the core id.
         if (IsValidVirtualCoreId(core_id)) {

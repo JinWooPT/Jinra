@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <vector>
@@ -16,6 +15,7 @@
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_graphics_extensions.h"
 #include "yuzu/configuration/shared_widget.h"
+#include "yuzu/fritchii/fritchii_ui.h"
 
 ConfigureGraphicsExtensions::ConfigureGraphicsExtensions(
     const Core::System& system_, std::shared_ptr<std::vector<ConfigurationShared::Tab*>> group_,
@@ -43,7 +43,7 @@ void ConfigureGraphicsExtensions::Setup(const ConfigurationShared::Builder& buil
          Settings::values.linkage.by_category[Settings::Category::RendererExtensions]) {
         ConfigurationShared::Widget* widget = [&]() {
             if (setting->Id() == Settings::values.sample_shading.Id()) {
-                // TODO(crueter): should support this natively perhaps?
+                // TODO: should support this natively perhaps?
                 return builder.BuildWidget(
                     setting, apply_funcs, ConfigurationShared::RequestType::Slider, true, 1.0f,
                     nullptr, tr("%", "Sample Shading percentage (e.g. 50%)"));
@@ -77,6 +77,25 @@ void ConfigureGraphicsExtensions::Setup(const ConfigurationShared::Builder& buil
 
     auto& hacks = *ui->hacks_target->layout();
     std::map<u32, QWidget*> hacks_hold{}; // A map will sort the data for us
+
+    if (FritchiiUi::Enabled()) {
+        // Where other builds have their "Pin GPU threads" toggle: players kept asking for it.
+        auto* pinning = new QLabel(tr("<b>GPU thread pinning is built in.</b><br>On automatically, nothing "
+                                      "to turn on. Fritchii had it first."),
+                                   this);
+        pinning->setObjectName(QStringLiteral("FritchiiSettingsNote"));
+        pinning->setWordWrap(true);
+        QFont font = pinning->font();
+        // A font sized in pixels (some Linux desktops) has no point size: scale its pixels.
+        if (font.pointSizeF() > 0) {
+            font.setPointSizeF(font.pointSizeF() * 1.35);
+        } else if (font.pixelSize() > 0) {
+            font.setPixelSize(static_cast<int>(font.pixelSize() * 1.35 + 0.5));
+        }
+        pinning->setFont(font);
+        pinning->setContentsMargins(0, 6, 0, 12);
+        hacks.addWidget(pinning);
+    }
 
     for (auto setting : Settings::values.linkage.by_category[Settings::Category::RendererHacks]) {
         auto* widget = builder.BuildWidget(setting, apply_funcs);

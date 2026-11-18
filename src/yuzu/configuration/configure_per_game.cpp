@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <set>
@@ -38,9 +38,9 @@
 #include <QNetworkRequest>
 #include <QPushButton>
 #include <QRegularExpression>
-#include <QScrollArea>
 #include <QStandardPaths>
 #include <QString>
+#include <QTabBar>
 #include <QTimer>
 #include <QUrl>
 #include <QtConcurrent/QtConcurrentRun>
@@ -76,6 +76,7 @@
 #include "yuzu/configuration/configure_per_game_addons.h"
 #include "yuzu/configuration/configure_system.h"
 #include "yuzu/util/util.h"
+#include "yuzu/fritchii/fritchii_ui.h"
 
 namespace {
 
@@ -259,7 +260,7 @@ std::optional<std::string> HttpGetUrl(const std::string& full_url, DetectionBudg
     QNetworkRequest request(url);
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                          QNetworkRequest::ManualRedirectPolicy);
-    request.setRawHeader("User-Agent", "Eden icon lookup");
+    request.setRawHeader("User-Agent", "Fritchii icon lookup");
     request.setRawHeader("Accept-Encoding", "identity");
 
     std::string body;
@@ -391,23 +392,32 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
 
     ui->setupUi(this);
 
-    ui->tabWidget->addTab(addons_tab.get(), tr("Add-Ons"));
-    ui->tabWidget->addTab(system_tab.get(), tr("System"));
-    ui->tabWidget->addTab(cpu_tab.get(), tr("CPU"));
-    auto* graphics_scroll = new QScrollArea(ui->tabWidget);
-    graphics_scroll->setFrameShape(QFrame::NoFrame);
-    graphics_scroll->setWidgetResizable(true);
-    graphics_scroll->setWidget(graphics_tab.get());
-    ui->tabWidget->addTab(graphics_scroll, tr("Graphics"));
-    ui->tabWidget->addTab(graphics_advanced_tab.get(), tr("Adv. Graphics"));
-    ui->tabWidget->addTab(graphics_extensions_tab.get(), tr("Ext. Graphics"));
-    ui->tabWidget->addTab(audio_tab.get(), tr("Audio"));
-    ui->tabWidget->addTab(input_tab.get(), tr("Input Profiles"));
-    ui->tabWidget->addTab(network_tab.get(), tr("Network"));
-    ui->tabWidget->addTab(applets_tab.get(), tr("Applets"));
+    // Fritchii: each tab scrolls (as in Settings), so the dialog fits a screen shorter than its
+    // tallest tab; before, the window could not be made smaller and only moved.
+    ui->tabWidget->addTab(FritchiiUi::SettingsPage(addons_tab.get()), tr("Add-Ons"));
+    ui->tabWidget->addTab(FritchiiUi::SettingsPage(system_tab.get()), tr("System"));
+    ui->tabWidget->addTab(FritchiiUi::SettingsPage(cpu_tab.get()), tr("CPU"));
+    ui->tabWidget->addTab(FritchiiUi::SettingsPage(graphics_tab.get()), tr("Graphics"));
+    ui->tabWidget->addTab(FritchiiUi::SettingsPage(graphics_advanced_tab.get()), tr("Adv. Graphics"));
+    ui->tabWidget->addTab(FritchiiUi::SettingsPage(graphics_extensions_tab.get()), tr("Ext. Graphics"));
+    ui->tabWidget->addTab(FritchiiUi::SettingsPage(audio_tab.get()), tr("Audio"));
+    ui->tabWidget->addTab(FritchiiUi::SettingsPage(input_tab.get()), tr("Input Profiles"));
+    ui->tabWidget->addTab(FritchiiUi::SettingsPage(network_tab.get()), tr("Network"));
+    ui->tabWidget->addTab(FritchiiUi::SettingsPage(applets_tab.get()), tr("Applets"));
+
+    // A tab's page is its scroll area in the Fritchii look.
+    const auto tab_index = [this](QWidget* tab) {
+        return ui->tabWidget->indexOf(FritchiiUi::SettingsPage(tab));
+    };
 
     setFocusPolicy(Qt::ClickFocus);
     setWindowTitle(tr("Properties"));
+    if (FritchiiUi::Enabled()) {
+        setWindowTitle(tr("Game Settings"));
+        ui->tabWidget->setTabText(tab_index(graphics_advanced_tab.get()), tr("Advanced Graphics"));
+        ui->tabWidget->setTabText(tab_index(graphics_extensions_tab.get()), tr("Graphics Extras"));
+        ui->tabWidget->setTabText(tab_index(input_tab.get()), tr("Controls"));
+    }
 
     addons_tab->SetTitleId(title_id);
 
@@ -726,7 +736,7 @@ void ConfigurePerGame::OnDetectNupIcon() {
                     return out;
                 }
 
-                // 2. Check Eden official boxart repository
+                // 2. Check the official boxart repository
                 if (!slug.empty()) {
                     std::vector<std::string> candidate_slugs{slug};
                     if (!slug.starts_with("the-legend-of-")) {

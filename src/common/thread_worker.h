@@ -1,25 +1,30 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <atomic>
-#include <algorithm>
 #include <condition_variable>
-#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
+#include <queue>
 
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "common/unique_function.h"
+
+#ifdef _WIN32
+namespace Common::Windows {
+// common/windows/crash_handler.h, declared here without its <filesystem>.
+void GuaranteeStackForCrashReport();
+} // namespace Common::Windows
+#endif
 
 namespace Common {
 
@@ -43,6 +48,11 @@ public:
         : workers_queued{num_workers}, thread_name{std::move(name)} {
         const auto lambda = [this, func, placement](std::stop_token stop_token) {
             Common::SetCurrentThreadName(thread_name.c_str());
+#ifdef _WIN32
+            // The pipeline workers translate shaders and the driver compiles pipelines on them,
+            // deep enough to overflow: the crash handler still has to be reached then.
+            Common::Windows::GuaranteeStackForCrashReport();
+#endif
             if (placement != ThreadPlacement::Default) {
                 Common::SetCurrentThreadPriority(ThreadPriority::Low);
             }
@@ -71,8 +81,8 @@ public:
                         if (stop_token.stop_requested()) {
                             break;
                         }
-                        task = std::move(requests.front().task);
-                        requests.pop_front();
+                        task = std::move(requests.front());
+                        requests.pop();
                     }
                     if constexpr (with_state) {
                         task(&state);
@@ -100,28 +110,13 @@ public:
     StatefulThreadWorker& operator=(StatefulThreadWorker&&) = delete;
     StatefulThreadWorker(StatefulThreadWorker&&) = delete;
 
-    size_t QueueWork(Task work) {
-        size_t ticket;
+    void QueueWork(Task work) {
         {
             std::unique_lock lock{queue_mutex};
-            ticket = Enqueue(std::move(work));
+            requests.emplace(std::move(work));
+            ++work_scheduled;
         }
         condition.notify_one();
-        return ticket;
-    }
-
-    bool PrioritizeWork(size_t ticket) {
-        std::scoped_lock lock{queue_mutex};
-        const auto first_normal = std::find_if(requests.begin(), requests.end(),
-                                               [](const auto& entry) { return !entry.priority; });
-        const auto found = std::find_if(first_normal, requests.end(),
-                                        [ticket](const auto& entry) { return entry.ticket == ticket; });
-        if (found == requests.end()) {
-            return false;
-        }
-        found->priority = true;
-        std::rotate(first_normal, found, found + 1);
-        return found != first_normal;
     }
 
     bool TryQueueWork(Task work) {
@@ -130,7 +125,8 @@ public:
             if (work_scheduled - work_done >= workers_queued) {
                 return false;
             }
-            Enqueue(std::move(work));
+            requests.emplace(std::move(work));
+            ++work_scheduled;
         }
         condition.notify_one();
         return true;
@@ -149,19 +145,7 @@ public:
     }
 
 private:
-    size_t Enqueue(Task work) {
-        const size_t ticket = work_scheduled.load(std::memory_order_relaxed) + 1;
-        requests.emplace_back(ticket, std::move(work));
-        work_scheduled.store(ticket, std::memory_order_relaxed);
-        return ticket;
-    }
-
-    struct QueuedTask {
-        size_t ticket;
-        Task task;
-        bool priority{};
-    };
-    std::deque<QueuedTask> requests;
+    std::queue<Task> requests;
     std::mutex queue_mutex;
     std::condition_variable_any condition;
     std::condition_variable wait_condition;
